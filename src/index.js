@@ -2,17 +2,7 @@ require('dotenv').config()
 const express = require('express')
 const app = express()
 
-app.use((req, res, next) => {
-  let data = ''
-  req.on('data', chunk => { data += chunk })
-  req.on('end', () => {
-    req.rawBody = data
-    try { req.body = data ? JSON.parse(data) : {} }
-    catch { req.body = {} }
-    next()
-  })
-})
-
+// Un solo parser — simple y limpio
 app.use(express.json())
 
 const smsRoutes = require('./routes/sms')
