@@ -4,6 +4,10 @@ const supabase = require('../supabase')
 const { verifySignature } = require('../utils/hmac')
 const { parseSms } = require('../utils/parser')
 
+router.post('/ingest', async (req, res) => {
+  console.log('📨 SMS recibido:', JSON.stringify(req.body))
+  console.log('🔑 Firma:', req.headers['x-signature'])
+  // ... resto del código
 /**
  * POST /api/sms/ingest
  * Recibe un SMS desde la app Android, valida el token y la firma,
