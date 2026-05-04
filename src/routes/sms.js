@@ -1,7 +1,3 @@
-router.post('/ingest', async (req, res) => {
-  console.log('📨 SMS recibido:', JSON.stringify(req.body))
-  console.log('🔑 Firma:', req.headers['x-signature'])
-
 const express = require('express')
 const router = express.Router()
 const supabase = require('../supabase')
@@ -104,4 +100,8 @@ async function sendWebhook(url, data) {
   }
 }
 
+router.post('/ingest', async (req, res) => {
+  console.log('📨 SMS recibido:', JSON.stringify(req.body))
+  console.log('🔑 Firma:', req.headers['x-signature'])
+  
 module.exports = router
