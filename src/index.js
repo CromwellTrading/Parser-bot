@@ -7,7 +7,8 @@ app.use(express.json())
 
 const smsRoutes = require('./routes/sms')
 const panelRoutes = require('./routes/panel')
-
+const authRoutes = require('./routes/auth')
+app.use('/api/auth', authRoutes)
 app.use('/api/sms', smsRoutes)
 app.use('/panel', panelRoutes)
 
