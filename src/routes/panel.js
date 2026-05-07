@@ -18,18 +18,28 @@ router.use('/api', adminAuth)
 router.get('/api/clients', async (req, res) => {
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, created_at, expires_at')
+    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, created_at, expires_at')
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
 })
 
 router.post('/api/clients', async (req, res) => {
-  const { name } = req.body
+  const { name, phone_number, card1, card2, card3, wallet, expires_at } = req.body
   if (!name) return res.status(400).json({ error: 'Nombre requerido' })
   const token = crypto.randomBytes(32).toString('hex')
+  const payload = {
+    name,
+    token,
+    phone_number: phone_number || null,
+    card1: card1 || null,
+    card2: card2 || null,
+    card3: card3 || null,
+    wallet: wallet || null,
+    expires_at: expires_at || null
+  }
   const { data, error } = await supabase
-    .from('clients').insert({ name, token }).select().single()
+    .from('clients').insert(payload).select().single()
   if (error) return res.status(500).json({ error: error.message })
   res.status(201).json(data)
 })
@@ -48,6 +58,31 @@ router.put('/api/clients/:id/webhooks', async (req, res) => {
     .from('clients')
     .update({ webhook_url: webhook_url || null, webhook_url_2: webhook_url_2 || null, webhook_url_3: webhook_url_3 || null })
     .eq('id', req.params.id).select().single()
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data)
+})
+
+router.put('/api/clients/:id/profile', async (req, res) => {
+  const { phone_number, card1, card2, card3, wallet, expires_at } = req.body
+  const patch = {
+    phone_number: phone_number || null,
+    card1: card1 || null,
+    card2: card2 || null,
+    card3: card3 || null,
+    wallet: wallet || null
+  }
+
+  if (expires_at !== undefined) {
+    patch.expires_at = expires_at || null
+  }
+
+  const { data, error } = await supabase
+    .from('clients')
+    .update(patch)
+    .eq('id', req.params.id)
+    .select()
+    .single()
+
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
 })
@@ -457,6 +492,7 @@ function showInfo(c) {
   const cards = [c.card1, c.card2, c.card3].filter(Boolean)
   document.getElementById('info-body').innerHTML = \`
     <div>📱 Monedero: \${c.phone_number || '—'}</div>
+    <div>👛 Wallet: \${c.wallet || '—'}</div>
     <div>💳 Tarjetas: \${cards.length ? cards.join(', ') : '—'}</div>
     <div>🔗 Webhook 1: \${c.webhook_url || '—'}</div>
     <div>🔗 Webhook 2: \${c.webhook_url_2 || '—'}</div>
