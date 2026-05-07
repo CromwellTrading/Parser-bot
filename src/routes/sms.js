@@ -2,75 +2,44 @@ const express = require('express')
 const router = express.Router()
 const supabase = require('../supabase')
 const { verifySignature } = require('../utils/hmac')
-const { parseSms } = require('../utils/parser')
-const { pushInbox, patchInbox, listInbox } = require('../utils/inboxStore')
-
-router.get('/inbox', (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || '50', 10) || 50, 200)
-  res.json(listInbox(limit))
-})
+const { parseSms, matchesCard } = require('../utils/parser')
 
 router.post('/ingest', async (req, res) => {
-  const signature = req.headers['x-signature']
-  const inboxId = pushInbox({
-    status: 'received',
-    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress || null,
-    userAgent: req.headers['user-agent'] || null,
-    payload: req.body,
-    signature: signature || null
-  })
-
   try {
-    if (!signature) {
-      patchInbox(inboxId, { status: 'rejected', error: 'Firma requerida' })
-      return res.status(401).json({ error: 'Firma requerida' })
-    }
+    console.log('📨 SMS recibido:', JSON.stringify(req.body))
+    const signature = req.headers['x-signature']
+    if (!signature) return res.status(401).json({ error: 'Firma requerida' })
 
-    // El payload es el body como string para verificar firma
-    const rawBody = JSON.stringify(req.body)
     const { sender, body, receivedAt, token } = req.body
-
     if (!sender || !body || !receivedAt || !token) {
-      patchInbox(inboxId, { status: 'rejected', error: 'Datos incompletos' })
       return res.status(400).json({ error: 'Datos incompletos' })
     }
 
-    // 1. Buscar cliente por token
+    // 1. Buscar cliente con sus tarjetas
     const { data: client, error: clientError } = await supabase
       .from('clients')
       .select('*')
       .eq('token', token)
       .single()
 
-    if (clientError || !client) {
-      patchInbox(inboxId, { status: 'rejected', error: 'Token inválido', sender, body, receivedAt })
-      return res.status(401).json({ error: 'Token inválido' })
-    }
-
-    // 2. Verificar que el cliente está activo
-    if (!client.active) {
-      patchInbox(inboxId, { status: 'rejected', error: 'Licencia inactiva', clientName: client.name, sender, body, receivedAt })
-      return res.status(403).json({ error: 'Licencia inactiva' })
-    }
-
-    // 3. Verificar licencia no expirada
+    if (clientError || !client) return res.status(401).json({ error: 'Token inválido' })
+    if (!client.active) return res.status(403).json({ error: 'Licencia inactiva' })
     if (client.expires_at && new Date(client.expires_at) < new Date()) {
-      patchInbox(inboxId, { status: 'rejected', error: 'Licencia expirada', clientName: client.name, sender, body, receivedAt })
       return res.status(403).json({ error: 'Licencia expirada' })
     }
 
-    // 4. Verificar firma HMAC
-    const validSignature = verifySignature(rawBody, token, signature)
-    if (!validSignature) {
-      patchInbox(inboxId, { status: 'rejected', error: 'Firma inválida', clientName: client.name, sender, body, receivedAt })
+    // 2. Verificar firma HMAC
+    const rawBody = JSON.stringify(req.body)
+    if (!verifySignature(rawBody, token, signature)) {
       return res.status(401).json({ error: 'Firma inválida' })
     }
 
-    // 5. Parsear el SMS
+    // 3. Parsear SMS
     const parsed = parseSms(sender, body)
+    console.log('🔍 Parseado:', JSON.stringify(parsed))
 
-    // 6. Guardar en Supabase
-    const { error: insertError } = await supabase
+    // 4. Guardar en BD
+    const { data: log, error: insertError } = await supabase
       .from('sms_logs')
       .insert({
         client_id: client.id,
@@ -79,40 +48,39 @@ router.post('/ingest', async (req, res) => {
         received_at: new Date(receivedAt).toISOString(),
         parsed
       })
+      .select()
+      .single()
 
     if (insertError) {
-      patchInbox(inboxId, { status: 'db_error', error: insertError.message, clientName: client.name, sender, body, receivedAt, parsed })
       console.error('Error guardando SMS:', insertError)
       return res.status(500).json({ error: 'Error interno' })
     }
 
-    // 7. Reenviar al webhook del cliente si tiene configurado
-    if (client.webhook_url) {
-      sendWebhook(client.webhook_url, { parsed, sender, receivedAt, raw: req.body })
+    // 5. Enviar a webhooks del cliente (hasta 3)
+    const webhooks = [client.webhook_url, client.webhook_url_2, client.webhook_url_3].filter(Boolean)
+    if (webhooks.length > 0) {
+      const webhookPayload = {
+        event: 'SMS_RECEIVED',
+        client: client.name,
+        parsed,
+        sender,
+        received_at: new Date(receivedAt).toISOString(),
+        log_id: log?.id
+      }
+      for (const url of webhooks) {
+        sendWebhook(url, webhookPayload)
+      }
     }
 
-    patchInbox(inboxId, {
-      status: 'stored',
-      clientName: client.name,
-      sender,
-      body,
-      receivedAt,
-      parsed
-    })
-
-    console.log(`✅ SMS recibido de cliente "${client.name}" | Tipo: ${parsed.type} | Monto: ${parsed.amount} ${parsed.currency}`)
-    console.log('📦 RAW ENTRANTE:', JSON.stringify(req.body))
-
-    return res.status(200).json({ ok: true, parsed, inboxId, raw: req.body })
+    console.log(`✅ SMS de "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount} ${parsed.currency}`)
+    return res.status(200).json({ ok: true, parsed })
 
   } catch (err) {
-    patchInbox(inboxId, { status: 'error', error: err.message })
     console.error('Error en /ingest:', err)
     return res.status(500).json({ error: 'Error interno' })
   }
 })
 
-// Envío de webhook en background (no bloquea la respuesta)
 async function sendWebhook(url, data) {
   try {
     await fetch(url, {
@@ -120,9 +88,10 @@ async function sendWebhook(url, data) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
     })
+    console.log(`📤 Webhook enviado a ${url}`)
   } catch (err) {
-    console.error('Error enviando webhook:', err.message)
+    console.error(`❌ Error webhook ${url}:`, err.message)
   }
 }
-  
+
 module.exports = router
