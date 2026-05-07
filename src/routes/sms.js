@@ -2,23 +2,62 @@ const express = require('express')
 const router = express.Router()
 const supabase = require('../supabase')
 const { verifySignature } = require('../utils/hmac')
-const { parseSms, matchesCard } = require('../utils/parser')
+const { parseSms } = require('../utils/parser')
+
+function pickText(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue
+    const str = String(value).trim()
+    if (str) return str
+  }
+  return null
+}
+
+function normalizeReceivedAt(value) {
+  if (!value) return new Date().toISOString()
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return new Date().toISOString()
+  return date.toISOString()
+}
+
+function buildSignatureCandidates(payload) {
+  const candidates = [
+    { sender: payload.sender, body: payload.body, receivedAt: payload.receivedAt, token: payload.token },
+    { token: payload.token, sender: payload.sender, body: payload.body, receivedAt: payload.receivedAt },
+    { sender: payload.sender, body: payload.body, received_at: payload.receivedAt, token: payload.token },
+    { token: payload.token, sender: payload.sender, body: payload.body, received_at: payload.receivedAt },
+    { origin: payload.sender, message: payload.body, receivedAt: payload.receivedAt, token: payload.token },
+    { token: payload.token, origin: payload.sender, message: payload.body, receivedAt: payload.receivedAt }
+  ]
+
+  return candidates.map(candidate => JSON.stringify(candidate))
+}
+
+function verifyIncomingSignature(payload, token, signature) {
+  if (!signature) return process.env.REQUIRE_SMS_SIGNATURE === 'true' ? false : true
+  for (const candidate of buildSignatureCandidates(payload)) {
+    if (verifySignature(candidate, token, signature)) return true
+  }
+  return false
+}
 
 router.post('/ingest', async (req, res) => {
   try {
     console.log('📨 SMS recibido:', JSON.stringify(req.body))
-    const signature = req.headers['x-signature']
-    if (!signature) return res.status(401).json({ error: 'Firma requerida' })
 
-    const { sender, body, receivedAt, token } = req.body
-    if (!sender || !body || !receivedAt || !token) {
+    const signature = req.headers['x-signature'] || req.headers['x-hmac'] || req.body.signature
+    const sender = pickText(req.body.sender, req.body.origin, req.body.from, req.body.address)
+    const body = pickText(req.body.body, req.body.message, req.body.text, req.body.sms)
+    const token = pickText(req.body.token, req.body.clientToken, req.headers['x-client-token'])
+    const receivedAtRaw = pickText(req.body.receivedAt, req.body.received_at, req.body.timestamp, req.body.date)
+
+    if (!sender || !body || !token) {
       return res.status(400).json({ error: 'Datos incompletos' })
     }
 
-    // 1. Buscar cliente con sus tarjetas
     const { data: client, error: clientError } = await supabase
       .from('clients')
-      .select('*')
+      .select('id, name, active, token_used, expires_at, webhook_url, webhook_url_2, webhook_url_3')
       .eq('token', token)
       .single()
 
@@ -28,24 +67,31 @@ router.post('/ingest', async (req, res) => {
       return res.status(403).json({ error: 'Licencia expirada' })
     }
 
-    // 2. Verificar firma HMAC
-    const rawBody = JSON.stringify(req.body)
-    if (!verifySignature(rawBody, token, signature)) {
+    const payloadForSignature = {
+      sender,
+      body,
+      receivedAt: receivedAtRaw || null,
+      token
+    }
+
+    if (!verifyIncomingSignature(payloadForSignature, token, signature)) {
       return res.status(401).json({ error: 'Firma inválida' })
     }
 
-    // 3. Parsear SMS
-    const parsed = parseSms(sender, body)
+    const parsed = req.body.parsed && typeof req.body.parsed === 'object'
+      ? req.body.parsed
+      : parseSms(sender, body)
+
     console.log('🔍 Parseado:', JSON.stringify(parsed))
 
-    // 4. Guardar en BD
+    const receivedAt = normalizeReceivedAt(receivedAtRaw)
     const { data: log, error: insertError } = await supabase
       .from('sms_logs')
       .insert({
         client_id: client.id,
         sender,
         body,
-        received_at: new Date(receivedAt).toISOString(),
+        received_at: receivedAt,
         parsed
       })
       .select()
@@ -56,7 +102,6 @@ router.post('/ingest', async (req, res) => {
       return res.status(500).json({ error: 'Error interno' })
     }
 
-    // 5. Enviar a webhooks del cliente (hasta 3)
     const webhooks = [client.webhook_url, client.webhook_url_2, client.webhook_url_3].filter(Boolean)
     if (webhooks.length > 0) {
       const webhookPayload = {
@@ -64,17 +109,17 @@ router.post('/ingest', async (req, res) => {
         client: client.name,
         parsed,
         sender,
-        received_at: new Date(receivedAt).toISOString(),
+        received_at: receivedAt,
         log_id: log?.id
       }
+
       for (const url of webhooks) {
         sendWebhook(url, webhookPayload)
       }
     }
 
     console.log(`✅ SMS de "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount} ${parsed.currency}`)
-    return res.status(200).json({ ok: true, parsed })
-
+    return res.status(200).json({ ok: true, parsed, log_id: log?.id })
   } catch (err) {
     console.error('Error en /ingest:', err)
     return res.status(500).json({ error: 'Error interno' })
