@@ -18,25 +18,33 @@ router.use('/api', adminAuth)
 router.get('/api/clients', async (req, res) => {
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, created_at, expires_at')
+    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at')
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
 })
 
 router.post('/api/clients', async (req, res) => {
-  const { name, phone_number, card1, card2, card3, wallet, expires_at } = req.body
+  const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days } = req.body
   if (!name) return res.status(400).json({ error: 'Nombre requerido' })
   const token = crypto.randomBytes(32).toString('hex')
+  const days = Number.isFinite(Number(expires_in_days)) ? Number(expires_in_days) : (plan === 'trial' ? 3 : 30)
+  const defaultExpiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
   const payload = {
     name,
     token,
+    webhook_url: webhook_url || null,
+    webhook_url_2: webhook_url_2 || null,
+    webhook_url_3: webhook_url_3 || null,
     phone_number: phone_number || null,
     card1: card1 || null,
     card2: card2 || null,
     card3: card3 || null,
     wallet: wallet || null,
-    expires_at: expires_at || null
+    device_id: device_id || null,
+    expires_at: expires_at || defaultExpiresAt,
+    active: true,
+    token_used: false,
   }
   const { data, error } = await supabase
     .from('clients').insert(payload).select().single()
@@ -63,35 +71,30 @@ router.put('/api/clients/:id/webhooks', async (req, res) => {
 })
 
 router.put('/api/clients/:id/profile', async (req, res) => {
-  const { phone_number, card1, card2, card3, wallet, expires_at } = req.body
+  const { phone_number, card1, card2, card3, wallet, device_id } = req.body
   const patch = {
     phone_number: phone_number || null,
     card1: card1 || null,
     card2: card2 || null,
     card3: card3 || null,
-    wallet: wallet || null
+    wallet: wallet || null,
+    device_id: device_id || null,
   }
-
-  if (expires_at !== undefined) {
-    patch.expires_at = expires_at || null
-  }
-
   const { data, error } = await supabase
     .from('clients')
     .update(patch)
-    .eq('id', req.params.id)
-    .select()
-    .single()
-
+    .eq('id', req.params.id).select().single()
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
 })
 
 router.put('/api/clients/:id/renew-token', async (req, res) => {
   const newToken = crypto.randomBytes(32).toString('hex')
+  const expiresInDays = Number.isFinite(Number(req.body?.expires_in_days)) ? Number(req.body.expires_in_days) : 30
+  const expiresAt = req.body?.expires_at || new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
   const { data, error } = await supabase
     .from('clients')
-    .update({ token: newToken, token_used: false })
+    .update({ token: newToken, token_used: false, device_id: null, expires_at: expiresAt })
     .eq('id', req.params.id).select().single()
   if (error) return res.status(500).json({ error: error.message })
   console.log(`🔄 Token renovado para cliente ${data.name}`)
@@ -455,7 +458,7 @@ function renderClients(clients) {
 async function createClient() {
   const name = document.getElementById('new-name').value.trim()
   if (!name) return toast('Nombre requerido', true)
-  const c = await api('/clients', { method:'POST', body:JSON.stringify({name}) })
+  const c = await api('/clients', { method:'POST', body: JSON.stringify({ name }) })
   if (c.error) return toast(c.error, true)
   copyT(c.token, false)
   toast('Cliente creado — token copiado')
@@ -491,12 +494,12 @@ function showInfo(c) {
   document.getElementById('info-name').textContent = c.name
   const cards = [c.card1, c.card2, c.card3].filter(Boolean)
   document.getElementById('info-body').innerHTML = \`
-    <div>📱 Monedero: \${c.phone_number || '—'}</div>
-    <div>👛 Wallet: \${c.wallet || '—'}</div>
+    <div>📱 Monedero: \${c.wallet || c.phone_number || '—'}</div>
     <div>💳 Tarjetas: \${cards.length ? cards.join(', ') : '—'}</div>
     <div>🔗 Webhook 1: \${c.webhook_url || '—'}</div>
     <div>🔗 Webhook 2: \${c.webhook_url_2 || '—'}</div>
     <div>🔗 Webhook 3: \${c.webhook_url_3 || '—'}</div>
+    <div>🆔 Dispositivo: \${c.device_id || '—'}</div>
     <div>📅 Creado: \${new Date(c.created_at).toLocaleString('es')}</div>
     <div>⏳ Vence: \${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
   \`
