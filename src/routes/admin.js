@@ -3,7 +3,6 @@ const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
 
-// Middleware: solo tú puedes acceder al panel admin
 function adminAuth(req, res, next) {
   const secret = req.headers['x-admin-secret']
   if (secret !== process.env.ADMIN_SECRET) {
@@ -14,95 +13,117 @@ function adminAuth(req, res, next) {
 
 router.use(adminAuth)
 
-/**
- * GET /api/admin/clients
- * Lista todos los clientes con su estado
- */
 router.get('/clients', async (req, res) => {
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, token, active, webhook_url, created_at, expires_at')
+    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at')
     .order('created_at', { ascending: false })
 
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
 })
 
-/**
- * POST /api/admin/clients
- * Crear nuevo cliente y generar token único
- * Body: { name, webhook_url (opcional), expires_at (opcional) }
- */
 router.post('/clients', async (req, res) => {
-  const { name, webhook_url, expires_at } = req.body
+  const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days } = req.body
 
   if (!name) return res.status(400).json({ error: 'Nombre requerido' })
 
-  // Generar token único de 32 bytes
   const token = crypto.randomBytes(32).toString('hex')
+  const days = Number.isFinite(Number(expires_in_days)) ? Number(expires_in_days) : (plan === 'trial' ? 3 : 30)
+  const defaultExpiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
 
   const { data, error } = await supabase
     .from('clients')
-    .insert({ name, token, webhook_url, expires_at })
+    .insert({
+      name,
+      token,
+      webhook_url: webhook_url || null,
+      webhook_url_2: webhook_url_2 || null,
+      webhook_url_3: webhook_url_3 || null,
+      phone_number: phone_number || null,
+      card1: card1 || null,
+      card2: card2 || null,
+      card3: card3 || null,
+      wallet: wallet || null,
+      device_id: device_id || null,
+      expires_at: expires_at || defaultExpiresAt,
+      active: true,
+      token_used: false,
+    })
     .select()
     .single()
 
   if (error) return res.status(500).json({ error: error.message })
-
   console.log(`✅ Cliente creado: ${name} | Token: ${token}`)
   res.status(201).json(data)
 })
 
-/**
- * PUT /api/admin/clients/:id/toggle
- * Activar o desactivar un cliente
- */
 router.put('/clients/:id/toggle', async (req, res) => {
-  const { id } = req.params
-
-  // Obtener estado actual
   const { data: client, error: fetchError } = await supabase
     .from('clients')
     .select('active, name')
-    .eq('id', id)
+    .eq('id', req.params.id)
     .single()
 
   if (fetchError || !client) return res.status(404).json({ error: 'Cliente no encontrado' })
 
-  // Invertir estado
   const { data, error } = await supabase
     .from('clients')
     .update({ active: !client.active })
-    .eq('id', id)
+    .eq('id', req.params.id)
     .select()
     .single()
 
   if (error) return res.status(500).json({ error: error.message })
-
   console.log(`🔄 Cliente "${client.name}" → ${data.active ? 'ACTIVO' : 'INACTIVO'}`)
   res.json(data)
 })
 
-/**
- * DELETE /api/admin/clients/:id
- * Eliminar cliente
- */
-router.delete('/clients/:id', async (req, res) => {
-  const { id } = req.params
+router.put('/clients/:id/profile', async (req, res) => {
+  const { phone_number, card1, card2, card3, wallet, device_id } = req.body
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('clients')
-    .delete()
-    .eq('id', id)
+    .update({
+      phone_number: phone_number || null,
+      card1: card1 || null,
+      card2: card2 || null,
+      card3: card3 || null,
+      wallet: wallet || null,
+      device_id: device_id || null,
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single()
 
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data)
+})
+
+router.put('/clients/:id/renew-token', async (req, res) => {
+  const newToken = crypto.randomBytes(32).toString('hex')
+  const expiresInDays = Number.isFinite(Number(req.body?.expires_in_days)) ? Number(req.body.expires_in_days) : 30
+  const expiresAt = req.body?.expires_at || new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
+
+  const { data, error } = await supabase
+    .from('clients')
+    .update({ token: newToken, token_used: false, device_id: null, expires_at: expiresAt })
+    .eq('id', req.params.id)
+    .select()
+    .single()
+
+  if (error) return res.status(500).json({ error: error.message })
+  console.log(`🔄 Token renovado para cliente ${data.name}`)
+  res.json(data)
+})
+
+router.delete('/clients/:id', async (req, res) => {
+  await supabase.from('sms_logs').delete().eq('client_id', req.params.id)
+  const { error } = await supabase.from('clients').delete().eq('id', req.params.id)
   if (error) return res.status(500).json({ error: error.message })
   res.json({ ok: true })
 })
 
-/**
- * GET /api/admin/logs
- * Ver SMS recibidos (con filtro opcional por cliente)
- */
 router.get('/logs', async (req, res) => {
   const { client_id, limit = 50 } = req.query
 
