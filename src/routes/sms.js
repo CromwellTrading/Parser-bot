@@ -1,100 +1,97 @@
 const express = require('express')
 const router = express.Router()
+const crypto = require('crypto')
 const supabase = require('../supabase')
 const { verifySignature } = require('../utils/hmac')
 const { parseSms } = require('../utils/parser')
 
-function pickText(...values) {
-  for (const value of values) {
-    if (value === undefined || value === null) continue
-    const str = String(value).trim()
-    if (str) return str
+function digestFallback(sender, body, receivedAt, token) {
+  return crypto
+    .createHash('sha256')
+    .update(`${token}::${sender}::${receivedAt}::${body}`)
+    .digest('hex')
+}
+
+async function sendWebhook(url, data) {
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    })
+    console.log(`📤 Webhook enviado a ${url}`)
+  } catch (error) {
+    console.error(`❌ Error webhook ${url}:`, error.message)
   }
-  return null
-}
-
-function normalizeReceivedAt(value) {
-  if (!value) return new Date().toISOString()
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return new Date().toISOString()
-  return date.toISOString()
-}
-
-function buildSignatureCandidates(payload) {
-  const candidates = [
-    { sender: payload.sender, body: payload.body, receivedAt: payload.receivedAt, token: payload.token },
-    { token: payload.token, sender: payload.sender, body: payload.body, receivedAt: payload.receivedAt },
-    { sender: payload.sender, body: payload.body, received_at: payload.receivedAt, token: payload.token },
-    { token: payload.token, sender: payload.sender, body: payload.body, received_at: payload.receivedAt },
-    { origin: payload.sender, message: payload.body, receivedAt: payload.receivedAt, token: payload.token },
-    { token: payload.token, origin: payload.sender, message: payload.body, receivedAt: payload.receivedAt }
-  ]
-
-  return candidates.map(candidate => JSON.stringify(candidate))
-}
-
-function verifyIncomingSignature(payload, token, signature) {
-  if (!signature) return process.env.REQUIRE_SMS_SIGNATURE === 'true' ? false : true
-  for (const candidate of buildSignatureCandidates(payload)) {
-    if (verifySignature(candidate, token, signature)) return true
-  }
-  return false
 }
 
 router.post('/ingest', async (req, res) => {
   try {
-    console.log('📨 SMS recibido:', JSON.stringify(req.body))
+    const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {})
+    console.log('📨 SMS recibido:', rawBody)
 
-    const signature = req.headers['x-signature'] || req.headers['x-hmac'] || req.body.signature
-    const sender = pickText(req.body.sender, req.body.origin, req.body.from, req.body.address)
-    const body = pickText(req.body.body, req.body.message, req.body.text, req.body.sms)
-    const token = pickText(req.body.token, req.body.clientToken, req.headers['x-client-token'])
-    const receivedAtRaw = pickText(req.body.receivedAt, req.body.received_at, req.body.timestamp, req.body.date)
+    const signature = req.headers['x-signature']
+    if (!signature) return res.status(401).json({ error: 'Firma requerida' })
 
-    if (!sender || !body || !token) {
+    const { sender, body, receivedAt, token, messageId, smsId, deviceId } = req.body || {}
+    if (!sender || !body || !receivedAt || !token) {
       return res.status(400).json({ error: 'Datos incompletos' })
     }
 
     const { data: client, error: clientError } = await supabase
       .from('clients')
-      .select('id, name, active, token_used, expires_at, webhook_url, webhook_url_2, webhook_url_3')
+      .select('id, name, token, active, token_used, device_id, expires_at, webhook_url, webhook_url_2, webhook_url_3')
       .eq('token', token)
-      .single()
+      .maybeSingle()
 
-    if (clientError || !client) return res.status(401).json({ error: 'Token inválido' })
+    if (clientError) {
+      console.error('Error buscando cliente:', clientError)
+      return res.status(500).json({ error: 'Error interno' })
+    }
+
+    if (!client) return res.status(401).json({ error: 'Token inválido' })
     if (!client.active) return res.status(403).json({ error: 'Licencia inactiva' })
     if (client.expires_at && new Date(client.expires_at) < new Date()) {
       return res.status(403).json({ error: 'Licencia expirada' })
     }
 
-    const payloadForSignature = {
-      sender,
-      body,
-      receivedAt: receivedAtRaw || null,
-      token
+    if (client.device_id && deviceId && client.device_id !== deviceId) {
+      return res.status(403).json({ error: 'Dispositivo no autorizado' })
     }
 
-    if (!verifyIncomingSignature(payloadForSignature, token, signature)) {
+    if (!verifySignature(rawBody, token, signature)) {
       return res.status(401).json({ error: 'Firma inválida' })
     }
 
-    const parsed = req.body.parsed && typeof req.body.parsed === 'object'
-      ? req.body.parsed
-      : parseSms(sender, body)
+    const parsed = parseSms(sender, body)
+    const receivedIso = new Date(receivedAt).toISOString()
+    const smsHash = messageId || smsId || digestFallback(sender, body, receivedIso, token)
 
-    console.log('🔍 Parseado:', JSON.stringify(parsed))
+    const { data: existing } = await supabase
+      .from('sms_logs')
+      .select('id')
+      .eq('client_id', client.id)
+      .eq('sender', sender)
+      .eq('body', body)
+      .eq('received_at', receivedIso)
+      .maybeSingle()
 
-    const receivedAt = normalizeReceivedAt(receivedAtRaw)
+    if (existing) {
+      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, status: 'SENT' })
+    }
+
+    const payload = {
+      client_id: client.id,
+      sender,
+      body,
+      received_at: receivedIso,
+      parsed,
+    }
+
     const { data: log, error: insertError } = await supabase
       .from('sms_logs')
-      .insert({
-        client_id: client.id,
-        sender,
-        body,
-        received_at: receivedAt,
-        parsed
-      })
-      .select()
+      .insert(payload)
+      .select('id, created_at')
       .single()
 
     if (insertError) {
@@ -103,40 +100,28 @@ router.post('/ingest', async (req, res) => {
     }
 
     const webhooks = [client.webhook_url, client.webhook_url_2, client.webhook_url_3].filter(Boolean)
-    if (webhooks.length > 0) {
+    if (webhooks.length) {
       const webhookPayload = {
         event: 'SMS_RECEIVED',
         client: client.name,
+        client_id: client.id,
         parsed,
         sender,
-        received_at: receivedAt,
-        log_id: log?.id
+        received_at: receivedIso,
+        log_id: log?.id,
+        message_id: smsHash,
       }
-
       for (const url of webhooks) {
         sendWebhook(url, webhookPayload)
       }
     }
 
-    console.log(`✅ SMS de "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount} ${parsed.currency}`)
-    return res.status(200).json({ ok: true, parsed, log_id: log?.id })
-  } catch (err) {
-    console.error('Error en /ingest:', err)
+    console.log(`✅ SMS de "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount ?? '—'} ${parsed.currency ?? ''}`)
+    return res.status(200).json({ ok: true, parsed, log_id: log?.id, status: 'SENT' })
+  } catch (error) {
+    console.error('Error en /ingest:', error)
     return res.status(500).json({ error: 'Error interno' })
   }
 })
-
-async function sendWebhook(url, data) {
-  try {
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    })
-    console.log(`📤 Webhook enviado a ${url}`)
-  } catch (err) {
-    console.error(`❌ Error webhook ${url}:`, err.message)
-  }
-}
 
 module.exports = router
