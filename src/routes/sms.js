@@ -34,16 +34,24 @@ async function sendTelegramAlert(parsed, sender, clientName, receivedIso) {
   const amount = parsed.amount != null
     ? `💰 *${parsed.amount.toFixed(2)} ${parsed.currency ?? 'CUP'}*`
     : ''
-  const type   = parsed.type?.replace(/_/g, ' → ') ?? 'DESCONOCIDO'
-  const date   = new Date(receivedIso).toLocaleString('es-CU', { timeZone: 'America/Havana' })
+  const type = parsed.type?.replace(/_/g, ' → ') ?? 'DESCONOCIDO'
+  const date = new Date(receivedIso).toLocaleString('es-CU', { timeZone: 'America/Havana' })
 
-  const text = [
+  // ← aquí está el fix: sender_phone y receiver_phone con guión bajo
+  const remitente = parsed.sender_phone ?? null
+  const receptor  = parsed.receiver_phone ?? parsed.receiver_account ?? null
+
+  const lines = [
     `${dir} — ${type}`,
     amount,
-    `👤 Remitente: \`${parsed.senderPhone ?? sender}\``,
+    remitente ? `👤 De: \`${remitente}\`` : null,
+    receptor  ? `👤 Para: \`${receptor}\`` : null,
+    parsed.transaction_id ? `🔖 TX: \`${parsed.transaction_id}\`` : null,
     `🏪 Cliente: ${clientName}`,
     `🕐 ${date}`,
-  ].filter(Boolean).join('\n')
+  ]
+
+  const text = lines.filter(Boolean).join('\n')
 
   try {
     await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
