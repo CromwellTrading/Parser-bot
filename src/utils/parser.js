@@ -87,7 +87,7 @@ function parseSms(sender, body) {
     }
   }
 
-  // 3. RECIBIDO: Tarjeta→Monedero
+  // 3. RECIBIDO: Tarjeta→Monedero (recarga desde tarjeta)
   if (upper.includes('RECARGADO CON') || (upper.includes('RECARGA DE LA CUENTA') && upper.includes('MONEDERO'))) {
     const amount  = clean.match(/(?:recargado con|Importe Recargado)[:\s]+([\d.]+)\s*CUP/i)?.[1]
     const txId    = clean.match(/Id Transaccion[:\s]+(\w+)/i)?.[1]
@@ -102,51 +102,80 @@ function parseSms(sender, body) {
     }
   }
 
-  // 4. ENVIADO: Monedero→Monedero
-  if (upper.includes('LA TRANSFERENCIA FUE COMPLETADA') && upper.includes('ORDENANTE')) {
-    const amount  = clean.match(/Monto[:\s]+([\d.]+)\s*CUP/i)?.[1]
-    const benef   = clean.match(/Beneficiario[:\s]+(\d+)/i)?.[1]
-    const txId    = clean.match(/Nro\.?\s*Transaccion[:\s]+(\w+)/i)?.[1]
-    const balance = clean.match(/Saldo restante[:\s]+([\d.]+)\s*CUP/i)?.[1]
+  // 4. ENVIADO: Monedero→Monedero (Mi Transfer, con Ordenante)
+  if (
+    upper.includes('LA TRANSFERENCIA FUE COMPLETADA') &&
+    upper.includes('ORDENANTE') &&
+    upper.includes('BENEFICIARIO')
+  ) {
+    const amount    = clean.match(/Monto[:\s]+([\d.]+)/i)?.[1]
+    const benef     = clean.match(/Beneficiario[:\s]+(\d+)/i)?.[1]
+    const ordenante = clean.match(/Ordenante[:\s]+(\d+)/i)?.[1]
+    const txId      = clean.match(/Nro\.?\s*Transaccion[:\s]+(\w+)/i)?.[1]
+    const comision  = clean.match(/cobro de comision de\s+([\d.]+)\s*CUP/i)?.[1]
+    const balance   = clean.match(/Saldo restante[:\s]+([\d.]+)\s*CUP/i)?.[1]
+    const totalGasto = (amount && comision)
+      ? parseFloat(amount) + parseFloat(comision)
+      : amount ? parseFloat(amount) : null
     return {
       direction: 'ENVIADO', type: 'MONEDERO_MONEDERO', network: 'PAGOMOVIL',
-      amount: amount ? parseFloat(amount) : null, currency: 'CUP',
-      sender_phone: null, receiver_phone: normalizePhone(benef),
+      amount: totalGasto, currency: 'CUP',
+      sender_phone: normalizePhone(ordenante),
+      receiver_phone: normalizePhone(benef),
       receiver_account: null, transaction_id: txId,
-      balance_after: balance ? parseFloat(balance) : null, raw: body
-    }
-  }
-
-  // 5. ENVIADO: Monedero→Tarjeta
-  if (upper.includes('LA TRANSFERENCIA FUE COMPLETADA') && upper.includes('BENEFICIARIO') && !upper.includes('ORDENANTE')) {
-    const amount  = clean.match(/Monto[:\s]+([\d.]+)\s*CUP/i)?.[1]
-    const benef   = clean.match(/Beneficiario[:\s]+([\dX]+)/i)?.[1]
-    const txId    = clean.match(/Nro\.?\s*Transaccion[:\s]+(\w+)/i)?.[1]
-    const balance = clean.match(/Saldo cuenta CUP[:\s]+([\d.]+)/i)?.[1]
-    return {
-      direction: 'ENVIADO', type: 'MONEDERO_TARJETA', network: 'PAGOMOVIL',
-      amount: amount ? parseFloat(amount) : null, currency: 'CUP',
-      sender_phone: null, receiver_phone: null, receiver_account: benef,
-      transaction_id: txId, balance_after: balance ? parseFloat(balance) : null,
+      commission: comision ? parseFloat(comision) : null,
+      balance_after: balance ? parseFloat(balance) : null,
       raw: body
     }
   }
 
-  // 6. ENVIADO: Tarjeta→Monedero (Banco Bandec)
+  // 5. ENVIADO: Monedero→Tarjeta (Mi Transfer, sin Ordenante)
+  if (
+    upper.includes('LA TRANSFERENCIA FUE COMPLETADA') &&
+    upper.includes('BENEFICIARIO') &&
+    !upper.includes('ORDENANTE')
+  ) {
+    const amount     = clean.match(/Monto[:\s]+([\d.]+)/i)?.[1]
+    const benef      = clean.match(/Beneficiario[:\s]+([\dX]+)/i)?.[1]
+    const txId       = clean.match(/Nro\.?\s*Transaccion[:\s]+(\w+)/i)?.[1]
+    const comision   = clean.match(/cobro de comision de\s+([\d.]+)\s*CUP/i)?.[1]
+    const balanceCup = clean.match(/Saldo cuenta CUP[:\s]+([\d.]+)/i)?.[1]
+    const balanceUsd = clean.match(/Saldo cuenta USD[:\s]+([\d.]+)/i)?.[1]
+    const totalGasto = (amount && comision)
+      ? parseFloat(amount) + parseFloat(comision)
+      : amount ? parseFloat(amount) : null
+    return {
+      direction: 'ENVIADO', type: 'MONEDERO_TARJETA', network: 'PAGOMOVIL',
+      amount: totalGasto, currency: 'CUP',
+      sender_phone: null, receiver_phone: null, receiver_account: benef,
+      transaction_id: txId,
+      commission: comision ? parseFloat(comision) : null,
+      balance_after: balanceCup ? parseFloat(balanceCup) : null,
+      balance_usd_after: balanceUsd ? parseFloat(balanceUsd) : null,
+      raw: body
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // BANCO BANDEC
+  // ══════════════════════════════════════════════════════════════════
+
+  // 6. ENVIADO: Tarjeta→Monedero (Bandec)
   if (upper.includes('BANCO BANDEC') && upper.includes('MOVIL DEL MONEDERO')) {
     const amount  = clean.match(/Importe Recargado[:\s]+([\d.]+)\s*CUP/i)?.[1]
+    const phone   = clean.match(/movil del monedero[:\s]+(\d+)/i)?.[1]
     const txId    = clean.match(/Id Transaccion[:\s]+(\w+)/i)?.[1]
     const balance = clean.match(/Saldo Restante[:\s]+([\d.]+)\s*CUP/i)?.[1]
     return {
       direction: 'ENVIADO', type: 'TARJETA_MONEDERO', network: 'PAGOMOVIL',
       amount: amount ? parseFloat(amount) : null, currency: 'CUP',
-      sender_phone: null, receiver_phone: null, receiver_account: null,
-      transaction_id: txId, balance_after: balance ? parseFloat(balance) : null,
-      raw: body
+      sender_phone: null, receiver_phone: normalizePhone(phone),
+      receiver_account: null, transaction_id: txId,
+      balance_after: balance ? parseFloat(balance) : null, raw: body
     }
   }
 
-  // 7. ENVIADO: Tarjeta→Tarjeta (Banco Bandec)
+  // 7. ENVIADO: Tarjeta→Tarjeta (Bandec)
   if (upper.includes('BANCO BANDEC') && upper.includes('LA TRANSFERENCIA FUE COMPLETADA')) {
     const amount  = clean.match(/Monto[:\s]+([\d.]+)\s*CUP/i)?.[1]
     const benef   = clean.match(/Beneficiario[:\s]+([\dX]+)/i)?.[1]
@@ -161,6 +190,46 @@ function parseSms(sender, body) {
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════
+  // BANCO POPULAR DE AHORRO (BPA)
+  // ══════════════════════════════════════════════════════════════════
+
+  // 8. ENVIADO: Tarjeta→Monedero (BPA)
+  if (upper.includes('BANCO POPULAR DE AHORRO') && upper.includes('MOVIL DEL MONEDERO')) {
+    const amount  = clean.match(/Importe Recargado[:\s]+([\d.]+)\s*CUP/i)?.[1]
+    const phone   = clean.match(/movil del monedero[:\s]+(\d+)/i)?.[1]
+    const txId    = clean.match(/Id Transaccion[:\s]+(\w+)/i)?.[1]
+    const idMon   = clean.match(/Id Monedero[:\s]+(\w+)/i)?.[1]
+    const balance = clean.match(/Saldo Restante[:\s]+([\d.]+)\s*CUP/i)?.[1]
+    return {
+      direction: 'ENVIADO', type: 'TARJETA_MONEDERO', network: 'PAGOMOVIL',
+      amount: amount ? parseFloat(amount) : null, currency: 'CUP',
+      sender_phone: null, receiver_phone: normalizePhone(phone),
+      receiver_account: null,
+      transaction_id: txId ?? idMon,
+      balance_after: balance ? parseFloat(balance) : null,
+      raw: body
+    }
+  }
+
+  // 9. ENVIADO: Tarjeta→Tarjeta (BPA)
+  if (upper.includes('BANCO POPULAR DE AHORRO') && upper.includes('LA TRANSFERENCIA FUE COMPLETADA')) {
+    const amount  = clean.match(/Monto[:\s]+([\d.]+)\s*CUP/i)?.[1]
+    const benef   = clean.match(/Beneficiario[:\s]+([\dX]+)/i)?.[1]
+    const txId    = clean.match(/Nro\.?\s*Transaccion[:\s]+(\w+)/i)?.[1]
+    const balance = clean.match(/Saldo restante[:\s]+(?:CR\s+)?([\d.]+)\s*CUP/i)?.[1]
+    return {
+      direction: 'ENVIADO', type: 'TARJETA_TARJETA', network: 'PAGOMOVIL',
+      amount: amount ? parseFloat(amount) : null, currency: 'CUP',
+      sender_phone: null, receiver_phone: null, receiver_account: benef,
+      transaction_id: txId, balance_after: balance ? parseFloat(balance) : null,
+      raw: body
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // DESCONOCIDO
+  // ══════════════════════════════════════════════════════════════════
   return {
     direction: 'DESCONOCIDO', type: 'DESCONOCIDO', network: 'DESCONOCIDO',
     amount: null, currency: null, sender_phone: null,
