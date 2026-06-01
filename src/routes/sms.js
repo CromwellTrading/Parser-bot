@@ -25,6 +25,42 @@ async function sendWebhook(url, data) {
   }
 }
 
+async function sendTelegramAlert(parsed, sender, clientName, receivedIso) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN
+  const chatId   = process.env.TELEGRAM_CHAT_ID
+  if (!botToken || !chatId) return
+
+  const dir    = parsed.direction === 'RECIBIDO' ? '⬇️ RECIBIDO' : '⬆️ ENVIADO'
+  const amount = parsed.amount != null
+    ? `💰 *${parsed.amount.toFixed(2)} ${parsed.currency ?? 'CUP'}*`
+    : ''
+  const type   = parsed.type?.replace(/_/g, ' → ') ?? 'DESCONOCIDO'
+  const date   = new Date(receivedIso).toLocaleString('es-CU', { timeZone: 'America/Havana' })
+
+  const text = [
+    `${dir} — ${type}`,
+    amount,
+    `👤 Remitente: \`${parsed.senderPhone ?? sender}\``,
+    `🏪 Cliente: ${clientName}`,
+    `🕐 ${date}`,
+  ].filter(Boolean).join('\n')
+
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: 'Markdown',
+      }),
+    })
+    console.log(`📬 Telegram notificado`)
+  } catch (err) {
+    console.error('❌ Error Telegram:', err.message)
+  }
+}
+
 router.post('/ingest', async (req, res) => {
   try {
     const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {})
@@ -115,6 +151,9 @@ router.post('/ingest', async (req, res) => {
         sendWebhook(url, webhookPayload)
       }
     }
+
+    // Notificación Telegram
+    sendTelegramAlert(parsed, sender, client.name, receivedIso)
 
     console.log(`✅ SMS de "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount ?? '—'} ${parsed.currency ?? ''}`)
     return res.status(200).json({ ok: true, parsed, log_id: log?.id, status: 'SENT' })
