@@ -226,7 +226,21 @@ function parseSms(sender, body) {
       raw: body
     }
   }
-
+  
+// RECIBIDO: Recarga al monedero Mi Transfer
+if (upper.includes('MONEDERO MITRANSFER') && upper.includes('HA SIDO RECARGADO CON')) {
+  const amount = clean.match(/recargado con[:\s]+([\d.]+)\s*CUP/i)?.[1]
+  const txId   = clean.match(/Id Transaccion[:\s]+(\w+)/i)?.[1]
+  return {
+    direction: 'RECIBIDO', type: 'TARJETA_MONEDERO', network: 'PAGOMOVIL',
+    amount: amount ? parseFloat(amount) : null, currency: 'CUP',
+    sender_phone: null, receiver_phone: null, receiver_account: null,
+    transaction_id: txId, balance_after: null,
+    note: 'Recarga recibida en monedero Mi Transfer',
+    raw: body
+  }
+}
+  
   // ══════════════════════════════════════════════════════════════════
   // DESCONOCIDO
   // ══════════════════════════════════════════════════════════════════
