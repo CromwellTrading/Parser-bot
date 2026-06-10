@@ -87,11 +87,6 @@ bot.onText(/\/panel/, async (msg) => {
             id,
             name,
             active,
-            token_used,
-            phone_number,
-            wallet,
-            device_id,
-            created_at,
             expires_at
         `)
         .order("created_at", { ascending: false });
@@ -106,111 +101,31 @@ bot.onText(/\/panel/, async (msg) => {
     const activeCount =
         clients.filter(c => c.active).length;
 
-    let text =
+    const keyboard = clients.map(client => [
+        {
+            text: `${client.active ? "🟢" : "🔴"} ${client.name}`,
+            callback_data: `client_${client.id}`
+        }
+    ]);
+
+    await bot.sendMessage(
+        msg.chat.id,
 `📊 PANEL ADMIN
 
 🟢 Activas: ${activeCount}
 👥 Total: ${clients.length}
 
-`;
-
-    clients.slice(0,10).forEach(client => {
-
-        text +=
-`👤 ${client.name}
-📅 Expira: ${
-client.expires_at
-? new Date(client.expires_at)
-.toLocaleDateString()
-: "Sin fecha"
-}
-🟢 Estado: ${
-client.active ? "Activo" : "Inactivo"
-}
-
-`;
-    });
-
-    await bot.sendMessage(
-        msg.chat.id,
-        text
+Selecciona un cliente:`,
+        {
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
+        }
     );
 
 });
 
-bot.onText(/\/cliente (.+)/, async (msg, match) => {
 
-    if (!isAdmin(msg.from.id)) {
-        return denyAccess(msg.chat.id);
-    }
-
-    const clientId = match[1];
-
-    const { data: client } = await supabase
-        .from("clients")
-        .select("*")
-        .eq("id", clientId)
-        .single();
-
-    if (!client) {
-        return bot.sendMessage(
-            msg.chat.id,
-            "❌ Cliente no encontrado"
-        );
-    }
-
-    await bot.sendMessage(
-        msg.chat.id,
-
-`👤 ${client.name}
-
-🆔 ID: ${client.id}
-
-📱 Teléfono:
-${client.phone_number || "No definido"}
-
-💳 Tarjeta 1:
-${client.card1 || "No definida"}
-
-💳 Tarjeta 2:
-${client.card2 || "No definida"}
-
-💳 Tarjeta 3:
-${client.card3 || "No definida"}
-
-👛 Wallet:
-${client.wallet || "No definida"}
-
-📲 Device:
-${client.device_id || "No registrado"}
-
-📅 Creado:
-${client.created_at}
-
-⏳ Expira:
-${client.expires_at || "Sin fecha"}`
-,
-{
-reply_markup:{
-inline_keyboard:[
-[
-{
-text:"🔄 Activar/Desactivar",
-callback_data:`toggle_${client.id}`
-}
-],
-[
-{
-text:"🗑 Eliminar",
-callback_data:`delete_${client.id}`
-}
-]
-]
-}
-}
-);
-
-});
 
 bot.on("callback_query", async (query) => {
 
@@ -275,42 +190,109 @@ bot.on("callback_query", async (query) => {
         return;
     }
 
-});
+    if (data.startsWith("client_")) {
 
+    const id = data.replace("client_", "");
 
+    const { data: client } = await supabase
+        .from("clients")
+        .select("*")
+        .eq("id", id)
+        .single();
 
-// ====================
-// BOTONES INLINE
-// ====================
-
-bot.on("callback_query", async (query) => {
-
-    if (!isAdmin(query.from.id)) {
-
-        await bot.answerCallbackQuery(
-            query.id,
-            {
-                text: "Acceso denegado",
-                show_alert: true
-            }
-        );
-
+    if (!client) {
         return;
     }
 
-    console.log(
-        "Botón pulsado:",
-        query.data
-    );
+    await bot.editMessageText(
+`👤 ${client.name}
 
-    await bot.answerCallbackQuery(
-        query.id,
+🆔 ID: ${client.id}
+
+📱 ${client.phone_number || "No definido"}
+
+💳 Tarjeta 1:
+${client.card1 || "No definida"}
+
+💳 Tarjeta 2:
+${client.card2 || "No definida"}
+
+💳 Tarjeta 3:
+${client.card3 || "No definida"}
+
+👛 Wallet:
+${client.wallet || "No definida"}
+
+📲 Device:
+${client.device_id || "No registrado"}
+
+📅 Expira:
+${client.expires_at || "Sin fecha"}
+
+🟢 Estado:
+${client.active ? "Activo" : "Inactivo"}`,
+{
+chat_id: query.message.chat.id,
+message_id: query.message.message_id,
+reply_markup:{
+inline_keyboard:[
+[
+{
+text:"🔄 Activar/Desactivar",
+callback_data:`toggle_${client.id}`
+}
+],
+[
+{
+text:"🗑 Eliminar",
+callback_data:`delete_${client.id}`
+}
+],
+[
+{
+text:"⬅️ Volver",
+callback_data:"back_panel"
+}
+]
+]
+}
+}
+);
+
+return;
+    }
+    if (data === "back_panel") {
+
+    const { data: clients } = await supabase
+        .from("clients")
+        .select("id,name,active")
+        .order("created_at", { ascending: false });
+
+    const keyboard = clients.map(client => [
         {
-            text: "OK"
+            text: `${client.active ? "🟢" : "🔴"} ${client.name}`,
+            callback_data: `client_${client.id}`
+        }
+    ]);
+
+    await bot.editMessageText(
+        "📊 CLIENTES",
+        {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id,
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
         }
     );
 
+    return;
+    }
+
 });
+
+
+
 
 // ====================
 // ERRORES
