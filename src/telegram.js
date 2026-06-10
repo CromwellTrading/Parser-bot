@@ -67,7 +67,8 @@ ID: ${userId}
 Comandos disponibles:
 
 /panel
-/ping`
+/cliente
+`
     );
 
 });
@@ -276,39 +277,7 @@ bot.on("callback_query", async (query) => {
 
 });
 
-// ====================
-// PANEL
-// ====================
 
-bot.onText(/\/panel/, async (msg) => {
-
-    if (!isAdmin(msg.from.id)) {
-        return denyAccess(msg.chat.id);
-    }
-
-    await bot.sendMessage(
-        msg.chat.id,
-        "✅ Panel abierto."
-    );
-
-});
-
-// ====================
-// PING
-// ====================
-
-bot.onText(/\/ping/, async (msg) => {
-
-    if (!isAdmin(msg.from.id)) {
-        return denyAccess(msg.chat.id);
-    }
-
-    await bot.sendMessage(
-        msg.chat.id,
-        "🏓 Pong"
-    );
-
-});
 
 // ====================
 // BOTONES INLINE
