@@ -67,7 +67,7 @@ ID: ${userId}
 Comandos disponibles:
 
 /panel
-/cliente
+
 `
     );
 
