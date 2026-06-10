@@ -1,8 +1,8 @@
 const TelegramBot = require("node-telegram-bot-api");
+const crypto = require("crypto");
+const supabase = require("./supabase");
 
-// ====================
-// CONFIGURACIÓN
-// ====================
+const pendingCreates = new Map();
 
 const ADMINS = [
     5387882635,
@@ -106,6 +106,12 @@ bot.onText(/\/panel/, async (msg) => {
             text: `${client.active ? "🟢" : "🔴"} ${client.name}`,
             callback_data: `client_${client.id}`
         }
+        [
+   {
+      text:"➕ Crear licencia",
+      callback_data:"create_license"
+   }
+]
     ]);
 
     await bot.sendMessage(
@@ -125,7 +131,130 @@ Selecciona un cliente:`,
 
 });
 
+const crypto = require("crypto");
 
+bot.onText(/\/nuevo (.+)/, async (msg, match) => {
+
+    if (!isAdmin(msg.from.id)) {
+        return denyAccess(msg.chat.id);
+    }
+
+    const name = match[1].trim();
+
+    if (!name) {
+        return bot.sendMessage(
+            msg.chat.id,
+            "❌ Debes indicar un nombre."
+        );
+    }
+
+    const token = crypto
+        .randomBytes(32)
+        .toString("hex");
+
+    const expiresAt = new Date(
+        Date.now() + 30 * 24 * 60 * 60 * 1000
+    ).toISOString();
+
+    const { data, error } = await supabase
+        .from("clients")
+        .insert({
+            name,
+            token,
+            active: true,
+            token_used: false,
+            expires_at: expiresAt
+        })
+        .select()
+        .single();
+
+    if (error) {
+
+        return bot.sendMessage(
+            msg.chat.id,
+            `❌ ${error.message}`
+        );
+
+    }
+
+    await bot.sendMessage(
+        msg.chat.id,
+
+`✅ Cliente creado
+
+👤 ${data.name}
+
+🆔 ${data.id}
+
+🔑 Token:
+${data.token}
+
+📅 Expira:
+${new Date(data.expires_at).toLocaleDateString()}`
+    );
+
+});
+
+bot.on("message", async (msg) => {
+
+    if (!isAdmin(msg.from.id)) {
+        return;
+    }
+
+    if (!pendingCreates.has(msg.from.id)) {
+        return;
+    }
+
+    pendingCreates.delete(msg.from.id);
+
+    const name = msg.text.trim();
+
+    const token = crypto
+        .randomBytes(32)
+        .toString("hex");
+
+    const expiresAt = new Date(
+        Date.now() + 30 * 24 * 60 * 60 * 1000
+    ).toISOString();
+
+    const { data, error } = await supabase
+        .from("clients")
+        .insert({
+            name,
+            token,
+            active: true,
+            token_used: false,
+            expires_at: expiresAt
+        })
+        .select()
+        .single();
+
+    if (error) {
+
+        return bot.sendMessage(
+            msg.chat.id,
+            `❌ ${error.message}`
+        );
+
+    }
+
+    await bot.sendMessage(
+        msg.chat.id,
+
+`✅ Licencia creada
+
+👤 ${data.name}
+
+🆔 ${data.id}
+
+🔑 Token:
+${data.token}
+
+📅 Expira:
+${new Date(data.expires_at).toLocaleDateString()}`
+    );
+
+});
 
 bot.on("callback_query", async (query) => {
 
@@ -287,6 +416,19 @@ return;
     );
 
     return;
+    }
+
+    if (data === "create_license") {
+
+    pendingCreates.set(
+        query.from.id,
+        true
+    );
+
+    return bot.sendMessage(
+        query.message.chat.id,
+        "📝 Envía el nombre del cliente."
+    );
     }
 
 });
