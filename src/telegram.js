@@ -2,29 +2,20 @@ const TelegramBot = require("node-telegram-bot-api");
 const crypto = require("crypto");
 const supabase = require("./supabase");
 
+// Mapa para flujo de creación desde el botón "Crear licencia"
 const pendingCreates = new Map();
 
-const ADMINS = [
-    5387882635,
-    5376388604
-];
+// IDs de administradores permitidos
+const ADMINS = [5387882635, 5376388604];
 
+// Verificar token
 if (!process.env.TELEGRAM_BOT_TOKEN) {
-    console.error("❌ TELEGRAM_BOT_TOKEN no configurado");
-    process.exit(1);
+  console.error("❌ TELEGRAM_BOT_TOKEN no configurado");
+  process.exit(1);
 }
 
-// ====================
-// BOT
-// ====================
-
-const bot = new TelegramBot(
-    process.env.TELEGRAM_BOT_TOKEN,
-    {
-        polling: true
-    }
-);
-
+// Inicializar bot con polling
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 console.log("✅ Bot de Telegram iniciado");
 
 // ====================
@@ -32,426 +23,269 @@ console.log("✅ Bot de Telegram iniciado");
 // ====================
 
 function isAdmin(userId) {
-    return ADMINS.includes(Number(userId));
+  return ADMINS.includes(Number(userId));
 }
 
 async function denyAccess(chatId) {
-    return bot.sendMessage(
-        chatId,
-        "⛔ Acceso denegado."
-    );
+  return bot.sendMessage(chatId, "⛔ Acceso denegado.");
 }
 
 // ====================
-// COMANDO START
+// COMANDOS
 // ====================
 
+// /start
 bot.onText(/\/start/, async (msg) => {
+  const userId = msg.from.id;
+  console.log(`📩 /start recibido de ${userId}`);
 
-    const userId = msg.from.id;
+  if (!isAdmin(userId)) return denyAccess(msg.chat.id);
 
-    console.log(
-        `📩 /start recibido de ${userId}`
-    );
-
-    if (!isAdmin(userId)) {
-        return denyAccess(msg.chat.id);
-    }
-
-    await bot.sendMessage(
-        msg.chat.id,
-        `🛠 Panel de Administración
-
-ID: ${userId}
-
-Comandos disponibles:
-
-/panel
-
-`
-    );
-
+  await bot.sendMessage(
+    msg.chat.id,
+    `🛠 Panel de Administración\n\nID: ${userId}\n\nComandos disponibles:\n/panel`
+  );
 });
 
-const supabase = require("./supabase");
-
+// /panel
 bot.onText(/\/panel/, async (msg) => {
+  if (!isAdmin(msg.from.id)) return denyAccess(msg.chat.id);
 
-    if (!isAdmin(msg.from.id)) {
-        return denyAccess(msg.chat.id);
+  const { data: clients, error } = await supabase
+    .from("clients")
+    .select("id, name, active, expires_at")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    return bot.sendMessage(msg.chat.id, `❌ Error:\n${error.message}`);
+  }
+
+  const activeCount = clients.filter((c) => c.active).length;
+
+  // Construir teclado: una fila por cliente
+  const keyboard = clients.map((client) => [
+    {
+      text: `${client.active ? "🟢" : "🔴"} ${client.name}`,
+      callback_data: `client_${client.id}`,
+    },
+  ]);
+
+  // Añadir fila extra para crear licencia
+  keyboard.push([
+    { text: "➕ Crear licencia", callback_data: "create_license" },
+  ]);
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `📊 PANEL ADMIN\n\n🟢 Activas: ${activeCount}\n👥 Total: ${clients.length}\n\nSelecciona un cliente:`,
+    {
+      reply_markup: {
+        inline_keyboard: keyboard,
+      },
     }
-
-    const { data: clients, error } = await supabase
-        .from("clients")
-        .select(`
-            id,
-            name,
-            active,
-            expires_at
-        `)
-        .order("created_at", { ascending: false });
-
-    if (error) {
-        return bot.sendMessage(
-            msg.chat.id,
-            `❌ Error:\n${error.message}`
-        );
-    }
-
-    const activeCount =
-        clients.filter(c => c.active).length;
-
-    const keyboard = clients.map(client => [
-        {
-            text: `${client.active ? "🟢" : "🔴"} ${client.name}`,
-            callback_data: `client_${client.id}`
-        }
-        [
-   {
-      text:"➕ Crear licencia",
-      callback_data:"create_license"
-   }
-]
-    ]);
-
-    await bot.sendMessage(
-        msg.chat.id,
-`📊 PANEL ADMIN
-
-🟢 Activas: ${activeCount}
-👥 Total: ${clients.length}
-
-Selecciona un cliente:`,
-        {
-            reply_markup: {
-                inline_keyboard: keyboard
-            }
-        }
-    );
-
+  );
 });
 
-const crypto = require("crypto");
-
+// /nuevo <nombre>
 bot.onText(/\/nuevo (.+)/, async (msg, match) => {
+  if (!isAdmin(msg.from.id)) return denyAccess(msg.chat.id);
 
-    if (!isAdmin(msg.from.id)) {
-        return denyAccess(msg.chat.id);
-    }
+  const name = match[1].trim();
+  if (!name) {
+    return bot.sendMessage(msg.chat.id, "❌ Debes indicar un nombre.");
+  }
 
-    const name = match[1].trim();
+  const token = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(
+    Date.now() + 30 * 24 * 60 * 60 * 1000
+  ).toISOString();
 
-    if (!name) {
-        return bot.sendMessage(
-            msg.chat.id,
-            "❌ Debes indicar un nombre."
-        );
-    }
+  const { data, error } = await supabase
+    .from("clients")
+    .insert({
+      name,
+      token,
+      active: true,
+      token_used: false,
+      expires_at: expiresAt,
+    })
+    .select()
+    .single();
 
-    const token = crypto
-        .randomBytes(32)
-        .toString("hex");
+  if (error) {
+    return bot.sendMessage(msg.chat.id, `❌ ${error.message}`);
+  }
 
-    const expiresAt = new Date(
-        Date.now() + 30 * 24 * 60 * 60 * 1000
-    ).toISOString();
-
-    const { data, error } = await supabase
-        .from("clients")
-        .insert({
-            name,
-            token,
-            active: true,
-            token_used: false,
-            expires_at: expiresAt
-        })
-        .select()
-        .single();
-
-    if (error) {
-
-        return bot.sendMessage(
-            msg.chat.id,
-            `❌ ${error.message}`
-        );
-
-    }
-
-    await bot.sendMessage(
-        msg.chat.id,
-
-`✅ Cliente creado
-
-👤 ${data.name}
-
-🆔 ${data.id}
-
-🔑 Token:
-${data.token}
-
-📅 Expira:
-${new Date(data.expires_at).toLocaleDateString()}`
-    );
-
+  await bot.sendMessage(
+    msg.chat.id,
+    `✅ Cliente creado\n\n👤 ${data.name}\n🆔 ${data.id}\n🔑 Token:\n${data.token}\n📅 Expira:\n${new Date(data.expires_at).toLocaleDateString()}`
+  );
 });
+
+// ====================
+// MANEJO DE MENSAJES (para el flujo del botón "Crear licencia")
+// ====================
 
 bot.on("message", async (msg) => {
+  // Solo procesar si no es un comando y el usuario está en pendingCreates
+  if (!msg.text || msg.text.startsWith("/")) return;
+  if (!isAdmin(msg.from.id)) return;
+  if (!pendingCreates.has(msg.from.id)) return;
 
-    if (!isAdmin(msg.from.id)) {
-        return;
-    }
+  // Limpiar estado
+  pendingCreates.delete(msg.from.id);
 
-    if (!pendingCreates.has(msg.from.id)) {
-        return;
-    }
+  const name = msg.text.trim();
+  const token = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(
+    Date.now() + 30 * 24 * 60 * 60 * 1000
+  ).toISOString();
 
-    pendingCreates.delete(msg.from.id);
+  const { data, error } = await supabase
+    .from("clients")
+    .insert({
+      name,
+      token,
+      active: true,
+      token_used: false,
+      expires_at: expiresAt,
+    })
+    .select()
+    .single();
 
-    const name = msg.text.trim();
+  if (error) {
+    return bot.sendMessage(msg.chat.id, `❌ ${error.message}`);
+  }
 
-    const token = crypto
-        .randomBytes(32)
-        .toString("hex");
-
-    const expiresAt = new Date(
-        Date.now() + 30 * 24 * 60 * 60 * 1000
-    ).toISOString();
-
-    const { data, error } = await supabase
-        .from("clients")
-        .insert({
-            name,
-            token,
-            active: true,
-            token_used: false,
-            expires_at: expiresAt
-        })
-        .select()
-        .single();
-
-    if (error) {
-
-        return bot.sendMessage(
-            msg.chat.id,
-            `❌ ${error.message}`
-        );
-
-    }
-
-    await bot.sendMessage(
-        msg.chat.id,
-
-`✅ Licencia creada
-
-👤 ${data.name}
-
-🆔 ${data.id}
-
-🔑 Token:
-${data.token}
-
-📅 Expira:
-${new Date(data.expires_at).toLocaleDateString()}`
-    );
-
+  await bot.sendMessage(
+    msg.chat.id,
+    `✅ Licencia creada\n\n👤 ${data.name}\n🆔 ${data.id}\n🔑 Token:\n${data.token}\n📅 Expira:\n${new Date(data.expires_at).toLocaleDateString()}`
+  );
 });
 
+// ====================
+// CALLBACK QUERIES
+// ====================
+
 bot.on("callback_query", async (query) => {
+  if (!isAdmin(query.from.id)) return;
 
-    if (!isAdmin(query.from.id)) {
-        return;
-    }
+  const data = query.data;
+  const chatId = query.message.chat.id;
+  const messageId = query.message.message_id;
 
-    const data = query.data;
+  // Eliminar cliente
+  if (data.startsWith("delete_")) {
+    const id = data.replace("delete_", "");
 
-    if (data.startsWith("delete_")) {
+    await supabase.from("sms_logs").delete().eq("client_id", id);
+    await supabase.from("clients").delete().eq("id", id);
 
-        const id =
-            data.replace("delete_","");
+    await bot.editMessageText("🗑 Cliente eliminado", {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+    return;
+  }
 
-        await supabase
-            .from("sms_logs")
-            .delete()
-            .eq("client_id", id);
+  // Activar/Desactivar
+  if (data.startsWith("toggle_")) {
+    const id = data.replace("toggle_", "");
 
-        await supabase
-            .from("clients")
-            .delete()
-            .eq("id", id);
+    const { data: client } = await supabase
+      .from("clients")
+      .select("active")
+      .eq("id", id)
+      .single();
 
-        await bot.editMessageText(
-            "🗑 Cliente eliminado",
-            {
-                chat_id: query.message.chat.id,
-                message_id: query.message.message_id
-            }
-        );
+    await supabase
+      .from("clients")
+      .update({ active: !client.active })
+      .eq("id", id);
 
-        return;
-    }
+    await bot.answerCallbackQuery(query.id, { text: "Estado actualizado" });
+    return;
+  }
 
-    if (data.startsWith("toggle_")) {
-
-        const id =
-            data.replace("toggle_","");
-
-        const { data: client } =
-            await supabase
-                .from("clients")
-                .select("active")
-                .eq("id", id)
-                .single();
-
-        await supabase
-            .from("clients")
-            .update({
-                active: !client.active
-            })
-            .eq("id", id);
-
-        await bot.answerCallbackQuery(
-            query.id,
-            {
-                text:"Estado actualizado"
-            }
-        );
-
-        return;
-    }
-
-    if (data.startsWith("client_")) {
-
+  // Ver detalle de cliente
+  if (data.startsWith("client_")) {
     const id = data.replace("client_", "");
 
     const { data: client } = await supabase
-        .from("clients")
-        .select("*")
-        .eq("id", id)
-        .single();
+      .from("clients")
+      .select("*")
+      .eq("id", id)
+      .single();
 
-    if (!client) {
-        return;
-    }
+    if (!client) return;
 
-    await bot.editMessageText(
-`👤 ${client.name}
+    const messageText = `👤 ${client.name}\n\n🆔 ID: ${client.id}\n📱 ${client.phone_number || "No definido"}\n💳 Tarjeta 1:\n${client.card1 || "No definida"}\n💳 Tarjeta 2:\n${client.card2 || "No definida"}\n💳 Tarjeta 3:\n${client.card3 || "No definida"}\n👛 Wallet:\n${client.wallet || "No definida"}\n📲 Device:\n${client.device_id || "No registrado"}\n📅 Expira:\n${client.expires_at || "Sin fecha"}\n🟢 Estado:\n${client.active ? "Activo" : "Inactivo"}`;
 
-🆔 ID: ${client.id}
+    const options = {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "🔄 Activar/Desactivar",
+              callback_data: `toggle_${client.id}`,
+            },
+          ],
+          [{ text: "🗑 Eliminar", callback_data: `delete_${client.id}` }],
+          [{ text: "⬅️ Volver", callback_data: "back_panel" }],
+        ],
+      },
+    };
 
-📱 ${client.phone_number || "No definido"}
+    await bot.editMessageText(messageText, options);
+    return;
+  }
 
-💳 Tarjeta 1:
-${client.card1 || "No definida"}
-
-💳 Tarjeta 2:
-${client.card2 || "No definida"}
-
-💳 Tarjeta 3:
-${client.card3 || "No definida"}
-
-👛 Wallet:
-${client.wallet || "No definida"}
-
-📲 Device:
-${client.device_id || "No registrado"}
-
-📅 Expira:
-${client.expires_at || "Sin fecha"}
-
-🟢 Estado:
-${client.active ? "Activo" : "Inactivo"}`,
-{
-chat_id: query.message.chat.id,
-message_id: query.message.message_id,
-reply_markup:{
-inline_keyboard:[
-[
-{
-text:"🔄 Activar/Desactivar",
-callback_data:`toggle_${client.id}`
-}
-],
-[
-{
-text:"🗑 Eliminar",
-callback_data:`delete_${client.id}`
-}
-],
-[
-{
-text:"⬅️ Volver",
-callback_data:"back_panel"
-}
-]
-]
-}
-}
-);
-
-return;
-    }
-    if (data === "back_panel") {
-
+  // Volver al panel
+  if (data === "back_panel") {
     const { data: clients } = await supabase
-        .from("clients")
-        .select("id,name,active")
-        .order("created_at", { ascending: false });
+      .from("clients")
+      .select("id, name, active")
+      .order("created_at", { ascending: false });
 
-    const keyboard = clients.map(client => [
-        {
-            text: `${client.active ? "🟢" : "🔴"} ${client.name}`,
-            callback_data: `client_${client.id}`
-        }
+    const keyboard = clients.map((client) => [
+      {
+        text: `${client.active ? "🟢" : "🔴"} ${client.name}`,
+        callback_data: `client_${client.id}`,
+      },
     ]);
 
-    await bot.editMessageText(
-        "📊 CLIENTES",
-        {
-            chat_id: query.message.chat.id,
-            message_id: query.message.message_id,
-            reply_markup: {
-                inline_keyboard: keyboard
-            }
-        }
-    );
+    // Añadir opción de crear
+    keyboard.push([
+      { text: "➕ Crear licencia", callback_data: "create_license" },
+    ]);
 
+    await bot.editMessageText("📊 CLIENTES", {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: keyboard },
+    });
     return;
-    }
+  }
 
-    if (data === "create_license") {
-
-    pendingCreates.set(
-        query.from.id,
-        true
-    );
-
-    return bot.sendMessage(
-        query.message.chat.id,
-        "📝 Envía el nombre del cliente."
-    );
-    }
-
+  // Iniciar creación de licencia (botón "Crear licencia")
+  if (data === "create_license") {
+    pendingCreates.set(query.from.id, true);
+    return bot.sendMessage(chatId, "📝 Envía el nombre del cliente.");
+  }
 });
-
-
-
 
 // ====================
 // ERRORES
 // ====================
 
 bot.on("polling_error", (err) => {
-    console.error(
-        "❌ Polling Error:",
-        err.message
-    );
+  console.error("❌ Polling Error:", err.message);
 });
 
 bot.on("error", (err) => {
-    console.error(
-        "❌ Telegram Error:",
-        err.message
-    );
+  console.error("❌ Telegram Error:", err.message);
 });
 
 // ====================
