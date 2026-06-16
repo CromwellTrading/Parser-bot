@@ -19,10 +19,11 @@ router.get('/api/clients', async (req, res) => {
   const { data, error } = await supabase
     .from('clients')
     .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role')
-    .order('created_at', {ascending: false}),
-    if (error) return res.status(500).json({ error: error.message })
-  res.json(data)
-})
+    .order('created_at', { ascending: false }); // <- sin coma, punto y coma
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
 
 router.post('/api/clients', async (req, res) => {
   const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days, role } = req.body
@@ -468,7 +469,7 @@ function renderClients(clients) {
   if (!clients.length) { tb.innerHTML='<tr><td colspan="7"><div class="empty">Sin clientes</div></td></tr>'; return }
   tb.innerHTML = clients.map(c => {
     const roleLabel = c.role === 'admin' ? 'Admin' : 'Cliente'
-    return ``
+    return `
     <tr>
       <td><strong>${c.name}</strong></td>
       <td><span class="badge badge-role">${roleLabel}</span></td>
@@ -486,7 +487,7 @@ function renderClients(clients) {
         </div>
       </td>
     </tr>
-  ``}).join('')
+  `}).join('')
   }
 
 async function createClient() {
@@ -529,7 +530,7 @@ function showInfo(c) {
   document.getElementById('info-name').textContent = c.name
   const cards = [c.card1, c.card2, c.card3].filter(Boolean)
   const roleLabel = c.role === 'admin' ? 'Administrador' : 'Cliente'
-  document.getElementById('info-body').innerHTML = ``
+  document.getElementById('info-body').innerHTML = `
     <div>👤 Rol: ${roleLabel}</div>
     <div>📱 Monedero: ${c.wallet || c.phone_number || '—'}</div>
     <div>💳 Tarjetas: ${cards.length ? cards.join(', ') : '—'}</div>
@@ -539,7 +540,7 @@ function showInfo(c) {
     <div>🆔 Dispositivo: ${c.device_id || '—'}</div>
     <div>📅 Creado: ${new Date(c.created_at).toLocaleString('es')}</div>
     <div>⏳ Vence: ${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
-  ``
+  `
   document.getElementById('info-modal').classList.add('open')
 }
 
