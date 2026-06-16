@@ -471,24 +471,24 @@ function renderClients(clients) {
     const roleLabel = c.role === 'admin' ? 'Admin' : 'Cliente'
     return \`
     <tr>
-      <td><strong>${c.name}</strong></td>
-      <td><span class="badge badge-role">${roleLabel}</span></td>
-      <td><div class="token-cell" onclick="copyT('${c.token}')" title="Click para copiar">${c.token.slice(0,12)}...</div></td>
-      <td><span class="badge ${c.active?'badge-on':'badge-off'}">${c.active?'● ACTIVO':'○ INACTIVO'}</span></td>
-      <td><span class="badge ${c.token_used?'badge-used':'badge-on'}">${c.token_used?'EN USO':'LIBRE'}</span></td>
-      <td style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted)">${new Date(c.created_at).toLocaleDateString('es')}</td>
+      <td><strong>\${c.name}</strong></td>
+      <td><span class="badge badge-role">\${roleLabel}</span></td>
+      <td><div class="token-cell" onclick="copyT('\${c.token}')" title="Click para copiar">\${c.token.slice(0,12)}...</div></td>
+      <td><span class="badge \${c.active?'badge-on':'badge-off'}">\${c.active?'● ACTIVO':'○ INACTIVO'}</span></td>
+      <td><span class="badge \${c.token_used?'badge-used':'badge-on'}">\${c.token_used?'EN USO':'LIBRE'}</span></td>
+      <td style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted)">\${new Date(c.created_at).toLocaleDateString('es')}</td>
       <td>
         <div class="acts">
-          <button class="btn btn-sm ${c.active?'btn-red':'btn-green'}" onclick="toggle('${c.id}')">${c.active?'Desactivar':'Activar'}</button>
-          <button class="btn btn-sm btn-blue" onclick="openWebhooks(${JSON.stringify(c).replace(/"/g,'&quot;')})">Webhooks</button>
-          <button class="btn btn-sm btn-purple" onclick="renewToken('${c.id}','${c.name}')">↺ Token</button>
-          <button class="btn btn-sm btn-blue" onclick="showInfo(${JSON.stringify(c).replace(/"/g,'&quot;')})">Info</button>
-          <button class="btn btn-sm btn-red" onclick="deleteClient('${c.id}','${c.name}')">Eliminar</button>
+          <button class="btn btn-sm \${c.active?'btn-red':'btn-green'}" onclick="toggle('\${c.id}')">\${c.active?'Desactivar':'Activar'}</button>
+          <button class="btn btn-sm btn-blue" onclick="openWebhooks(\${JSON.stringify(c).replace(/"/g,'&quot;')})">Webhooks</button>
+          <button class="btn btn-sm btn-purple" onclick="renewToken('\${c.id}','\${c.name}')">↺ Token</button>
+          <button class="btn btn-sm btn-blue" onclick="showInfo(\${JSON.stringify(c).replace(/"/g,'&quot;')})">Info</button>
+          <button class="btn btn-sm btn-red" onclick="deleteClient('\${c.id}','\${c.name}')">Eliminar</button>
         </div>
       </td>
     </tr>
   \`}).join('')
-  }
+}
 
 async function createClient() {
   const name = document.getElementById('new-name').value.trim()
@@ -527,19 +527,20 @@ async function deleteClient(id, name) {
 }
 
 function showInfo(c) {
+function showInfo(c) {
   document.getElementById('info-name').textContent = c.name
   const cards = [c.card1, c.card2, c.card3].filter(Boolean)
   const roleLabel = c.role === 'admin' ? 'Administrador' : 'Cliente'
   document.getElementById('info-body').innerHTML = \`
-    <div>👤 Rol: ${roleLabel}</div>
-    <div>📱 Monedero: ${c.wallet || c.phone_number || '—'}</div>
-    <div>💳 Tarjetas: ${cards.length ? cards.join(', ') : '—'}</div>
-    <div>🔗 Webhook 1: ${c.webhook_url || '—'}</div>
-    <div>🔗 Webhook 2: ${c.webhook_url_2 || '—'}</div>
-    <div>🔗 Webhook 3: ${c.webhook_url_3 || '—'}</div>
-    <div>🆔 Dispositivo: ${c.device_id || '—'}</div>
-    <div>📅 Creado: ${new Date(c.created_at).toLocaleString('es')}</div>
-    <div>⏳ Vence: ${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
+    <div>👤 Rol: \${roleLabel}</div>
+    <div>📱 Monedero: \${c.wallet || c.phone_number || '—'}</div>
+    <div>💳 Tarjetas: \${cards.length ? cards.join(', ') : '—'}</div>
+    <div>🔗 Webhook 1: \${c.webhook_url || '—'}</div>
+    <div>🔗 Webhook 2: \${c.webhook_url_2 || '—'}</div>
+    <div>🔗 Webhook 3: \${c.webhook_url_3 || '—'}</div>
+    <div>🆔 Dispositivo: \${c.device_id || '—'}</div>
+    <div>📅 Creado: \${new Date(c.created_at).toLocaleString('es')}</div>
+    <div>⏳ Vence: \${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
   \`
   document.getElementById('info-modal').classList.add('open')
 }
