@@ -527,7 +527,6 @@ async function deleteClient(id, name) {
 }
 
 function showInfo(c) {
-function showInfo(c) {
   document.getElementById('info-name').textContent = c.name
   const cards = [c.card1, c.card2, c.card3].filter(Boolean)
   const roleLabel = c.role === 'admin' ? 'Administrador' : 'Cliente'
