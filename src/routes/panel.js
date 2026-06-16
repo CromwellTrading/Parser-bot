@@ -222,6 +222,26 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 
 main{padding:24px;max-width:1100px;margin:0 auto}
 
+
+input, select {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 14px 16px;
+  font-family: 'Space Mono', monospace;
+  font-size: 13px;
+  outline: none;
+  transition: border-color .2s;
+  border-radius: 4px;
+}
+input:focus, select:focus {
+  border-color: var(--red);
+}
+input::placeholder {
+  color: var(--muted);
+}
+
 /* TABS */
 .tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:28px}
 .tab{padding:12px 20px;font-size:11px;font-weight:700;letter-spacing:1.5px;
