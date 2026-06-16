@@ -18,18 +18,29 @@ router.use('/api', adminAuth)
 router.get('/api/clients', async (req, res) => {
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at')
-    .order('created_at', { ascending: false })
-  if (error) return res.status(500).json({ error: error.message })
+    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role')
+    .order('created_at', {ascending: false}),
+    if (error) return res.status(500).json({ error: error.message })
   res.json(data)
 })
 
 router.post('/api/clients', async (req, res) => {
-  const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days } = req.body
+  const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days, role } = req.body
   if (!name) return res.status(400).json({ error: 'Nombre requerido' })
+
   const token = crypto.randomBytes(32).toString('hex')
-  const days = Number.isFinite(Number(expires_in_days)) ? Number(expires_in_days) : (plan === 'trial' ? 3 : 30)
-  const defaultExpiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
+  
+  // Determinar expiración según rol
+  const userRole = role || 'client' // por defecto cliente
+  let finalExpiresAt = null
+  if (userRole === 'admin') {
+    // Administradores nunca expiran
+    finalExpiresAt = null
+  } else {
+    const days = Number.isFinite(Number(expires_in_days)) ? Number(expires_in_days) : (plan === 'trial' ? 3 : 30)
+    finalExpiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
+  }
+
   const payload = {
     name,
     token,
@@ -42,10 +53,12 @@ router.post('/api/clients', async (req, res) => {
     card3: card3 || null,
     wallet: wallet || null,
     device_id: device_id || null,
-    expires_at: expires_at || defaultExpiresAt,
+    expires_at: finalExpiresAt,
     active: true,
     token_used: false,
+    role: userRole,
   }
+
   const { data, error } = await supabase
     .from('clients').insert(payload).select().single()
   if (error) return res.status(500).json({ error: error.message })
@@ -89,9 +102,20 @@ router.put('/api/clients/:id/profile', async (req, res) => {
 })
 
 router.put('/api/clients/:id/renew-token', async (req, res) => {
+  // Obtener rol actual
+  const { data: client } = await supabase.from('clients').select('role').eq('id', req.params.id).single()
+  if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
+
   const newToken = crypto.randomBytes(32).toString('hex')
   const expiresInDays = Number.isFinite(Number(req.body?.expires_in_days)) ? Number(req.body.expires_in_days) : 30
-  const expiresAt = req.body?.expires_at || new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
+
+  let expiresAt = null
+  if (client.role === 'admin') {
+    expiresAt = null // admin nunca caduca
+  } else {
+    expiresAt = req.body?.expires_at || new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
+  }
+
   const { data, error } = await supabase
     .from('clients')
     .update({ token: newToken, token_used: false, device_id: null, expires_at: expiresAt })
@@ -150,7 +174,7 @@ const PANEL_HTML = `<!DOCTYPE html>
   --text:#e8e8f0;--muted:#555570;--text2:#9999bb;
 }
 body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh}
-
+.badge-role{background:#0088ff22;color:#4db8ff}
 /* LOGIN */
 #login{min-height:100vh;display:flex;align-items:center;justify-content:center;
   background:radial-gradient(ellipse at 50% 0%,#cc003318 0%,transparent 60%)}
@@ -324,22 +348,29 @@ tr:hover td{background:#ffffff04}
       </div>
 
       <div class="form-panel" id="new-form">
-        <div class="form-row">
-          <div class="inp-group" style="margin:0">
-            <label>Nombre del cliente</label>
-            <input type="text" id="new-name" placeholder="Ej: Juan Pérez" />
-          </div>
-          <button class="btn btn-primary btn-sm" style="margin:0;width:auto" onclick="createClient()">Crear</button>
-        </div>
-      </div>
+  <div class="form-row">
+    <div class="inp-group" style="margin:0">
+      <label>Nombre del cliente</label>
+      <input type="text" id="new-name" placeholder="Ej: Juan Pérez" />
+    </div>
+    <div class="inp-group" style="margin:0">
+      <label>Rol</label>
+      <select id="new-role">
+        <option value="client">Cliente</option>
+        <option value="admin">Administrador</option>
+      </select>
+    </div>
+    <button class="btn btn-primary btn-sm" style="margin:0;width:auto" onclick="createClient()">Crear</button>
+  </div>
+</div>
 
       <div class="tbl-wrap">
         <table>
           <thead><tr>
-            <th>Cliente</th><th>Token</th><th>Estado</th><th>Token</th><th>Creado</th><th>Acciones</th>
+            <th>Cliente</th><th>Rol</th><th>Token</th><th>Estado</th><th>Token</th><th>Creado</th><th>Acciones</th>
           </tr></thead>
-          <tbody id="clients-tb"><tr><td colspan="6"><div class="loading">Cargando...</div></td></tr></tbody>
-        </table>
+          <<tbody id="clients-tb"><tr><td colspan="7"><div class="loading">Cargando...</div></td></tr></tbody>
+          </table>
       </div>
     </div>
 
@@ -434,31 +465,35 @@ async function loadLogs() {
 // ── Clients ───────────────────────────────────────────────────────────────────
 function renderClients(clients) {
   const tb = document.getElementById('clients-tb')
-  if (!clients.length) { tb.innerHTML='<tr><td colspan="6"><div class="empty">Sin clientes</div></td></tr>'; return }
-  tb.innerHTML = clients.map(c => \`
+  if (!clients.length) { tb.innerHTML='<tr><td colspan="7"><div class="empty">Sin clientes</div></td></tr>'; return }
+  tb.innerHTML = clients.map(c => {
+    const roleLabel = c.role === 'admin' ? 'Admin' : 'Cliente'
+    return ``
     <tr>
-      <td><strong>\${c.name}</strong></td>
-      <td><div class="token-cell" onclick="copyT('\${c.token}')" title="Click para copiar">\${c.token.slice(0,12)}...</div></td>
-      <td><span class="badge \${c.active?'badge-on':'badge-off'}">\${c.active?'● ACTIVO':'○ INACTIVO'}</span></td>
-      <td><span class="badge \${c.token_used?'badge-used':'badge-on'}">\${c.token_used?'EN USO':'LIBRE'}</span></td>
-      <td style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted)">\${new Date(c.created_at).toLocaleDateString('es')}</td>
+      <td><strong>${c.name}</strong></td>
+      <td><span class="badge badge-role">${roleLabel}</span></td>
+      <td><div class="token-cell" onclick="copyT('${c.token}')" title="Click para copiar">${c.token.slice(0,12)}...</div></td>
+      <td><span class="badge ${c.active?'badge-on':'badge-off'}">${c.active?'● ACTIVO':'○ INACTIVO'}</span></td>
+      <td><span class="badge ${c.token_used?'badge-used':'badge-on'}">${c.token_used?'EN USO':'LIBRE'}</span></td>
+      <td style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted)">${new Date(c.created_at).toLocaleDateString('es')}</td>
       <td>
         <div class="acts">
-          <button class="btn btn-sm \${c.active?'btn-red':'btn-green'}" onclick="toggle('\${c.id}')">\${c.active?'Desactivar':'Activar'}</button>
-          <button class="btn btn-sm btn-blue" onclick="openWebhooks(\${JSON.stringify(c).replace(/"/g,'&quot;')})">Webhooks</button>
-          <button class="btn btn-sm btn-purple" onclick="renewToken('\${c.id}','\${c.name}')">↺ Token</button>
-          <button class="btn btn-sm btn-blue" onclick="showInfo(\${JSON.stringify(c).replace(/"/g,'&quot;')})">Info</button>
-          <button class="btn btn-sm btn-red" onclick="deleteClient('\${c.id}','\${c.name}')">Eliminar</button>
+          <button class="btn btn-sm ${c.active?'btn-red':'btn-green'}" onclick="toggle('${c.id}')">${c.active?'Desactivar':'Activar'}</button>
+          <button class="btn btn-sm btn-blue" onclick="openWebhooks(${JSON.stringify(c).replace(/"/g,'&quot;')})">Webhooks</button>
+          <button class="btn btn-sm btn-purple" onclick="renewToken('${c.id}','${c.name}')">↺ Token</button>
+          <button class="btn btn-sm btn-blue" onclick="showInfo(${JSON.stringify(c).replace(/"/g,'&quot;')})">Info</button>
+          <button class="btn btn-sm btn-red" onclick="deleteClient('${c.id}','${c.name}')">Eliminar</button>
         </div>
       </td>
     </tr>
-  \`).join('')
-}
+  ``}).join('')
+  }
 
 async function createClient() {
   const name = document.getElementById('new-name').value.trim()
   if (!name) return toast('Nombre requerido', true)
-  const c = await api('/clients', { method:'POST', body: JSON.stringify({ name }) })
+  const role = document.getElementById('new-role').value
+  const c = await api('/clients', { method:'POST', body: JSON.stringify({ name, role }) })
   if (c.error) return toast(c.error, true)
   copyT(c.token, false)
   toast('Cliente creado — token copiado')
@@ -493,16 +528,18 @@ async function deleteClient(id, name) {
 function showInfo(c) {
   document.getElementById('info-name').textContent = c.name
   const cards = [c.card1, c.card2, c.card3].filter(Boolean)
-  document.getElementById('info-body').innerHTML = \`
-    <div>📱 Monedero: \${c.wallet || c.phone_number || '—'}</div>
-    <div>💳 Tarjetas: \${cards.length ? cards.join(', ') : '—'}</div>
-    <div>🔗 Webhook 1: \${c.webhook_url || '—'}</div>
-    <div>🔗 Webhook 2: \${c.webhook_url_2 || '—'}</div>
-    <div>🔗 Webhook 3: \${c.webhook_url_3 || '—'}</div>
-    <div>🆔 Dispositivo: \${c.device_id || '—'}</div>
-    <div>📅 Creado: \${new Date(c.created_at).toLocaleString('es')}</div>
-    <div>⏳ Vence: \${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
-  \`
+  const roleLabel = c.role === 'admin' ? 'Administrador' : 'Cliente'
+  document.getElementById('info-body').innerHTML = ``
+    <div>👤 Rol: ${roleLabel}</div>
+    <div>📱 Monedero: ${c.wallet || c.phone_number || '—'}</div>
+    <div>💳 Tarjetas: ${cards.length ? cards.join(', ') : '—'}</div>
+    <div>🔗 Webhook 1: ${c.webhook_url || '—'}</div>
+    <div>🔗 Webhook 2: ${c.webhook_url_2 || '—'}</div>
+    <div>🔗 Webhook 3: ${c.webhook_url_3 || '—'}</div>
+    <div>🆔 Dispositivo: ${c.device_id || '—'}</div>
+    <div>📅 Creado: ${new Date(c.created_at).toLocaleString('es')}</div>
+    <div>⏳ Vence: ${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
+  ``
   document.getElementById('info-modal').classList.add('open')
 }
 
