@@ -370,7 +370,7 @@ tr:hover td{background:#ffffff04}
           <thead><tr>
             <th>Cliente</th><th>Rol</th><th>Token</th><th>Estado</th><th>Token</th><th>Creado</th><th>Acciones</th>
           </tr></thead>
-          <<tbody id="clients-tb"><tr><td colspan="7"><div class="loading">Cargando...</div></td></tr></tbody>
+          <tbody id="clients-tb"><tr><td colspan="7"><div class="loading">Cargando...</div></td></tr></tbody>
           </table>
       </div>
     </div>
@@ -469,7 +469,7 @@ function renderClients(clients) {
   if (!clients.length) { tb.innerHTML='<tr><td colspan="7"><div class="empty">Sin clientes</div></td></tr>'; return }
   tb.innerHTML = clients.map(c => {
     const roleLabel = c.role === 'admin' ? 'Admin' : 'Cliente'
-    return `
+    return \`
     <tr>
       <td><strong>${c.name}</strong></td>
       <td><span class="badge badge-role">${roleLabel}</span></td>
@@ -487,7 +487,7 @@ function renderClients(clients) {
         </div>
       </td>
     </tr>
-  `}).join('')
+  \`}).join('')
   }
 
 async function createClient() {
@@ -530,7 +530,7 @@ function showInfo(c) {
   document.getElementById('info-name').textContent = c.name
   const cards = [c.card1, c.card2, c.card3].filter(Boolean)
   const roleLabel = c.role === 'admin' ? 'Administrador' : 'Cliente'
-  document.getElementById('info-body').innerHTML = `
+  document.getElementById('info-body').innerHTML = \`
     <div>👤 Rol: ${roleLabel}</div>
     <div>📱 Monedero: ${c.wallet || c.phone_number || '—'}</div>
     <div>💳 Tarjetas: ${cards.length ? cards.join(', ') : '—'}</div>
@@ -540,7 +540,7 @@ function showInfo(c) {
     <div>🆔 Dispositivo: ${c.device_id || '—'}</div>
     <div>📅 Creado: ${new Date(c.created_at).toLocaleString('es')}</div>
     <div>⏳ Vence: ${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
-  `
+  \`
   document.getElementById('info-modal').classList.add('open')
 }
 
