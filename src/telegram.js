@@ -3,7 +3,7 @@ const crypto = require("crypto");
 const supabase = require("./supabase");
 
 // Mapa para flujo de creación desde el botón "Crear licencia"
-const pendingCreates = new Map();
+const pendingCreates = new Map(); 
 
 // IDs de administradores permitidos
 const ADMINS = [5387882635, 5376388604];
@@ -53,7 +53,7 @@ bot.onText(/\/panel/, async (msg) => {
 
   const { data: clients, error } = await supabase
     .from("clients")
-    .select("id, name, active, expires_at")
+    .select("id, name, active, expires_at, role")
     .order("created_at", { ascending: false });
 
   if (error) {
@@ -88,17 +88,29 @@ bot.onText(/\/panel/, async (msg) => {
 
 // /nuevo <nombre>
 bot.onText(/\/nuevo (.+)/, async (msg, match) => {
+bot.onText(/\/nuevo (.+)/, async (msg, match) => {
   if (!isAdmin(msg.from.id)) return denyAccess(msg.chat.id);
 
-  const name = match[1].trim();
+  const parts = match[1].trim().split(/\s+/);
+  let name = parts[0];
+  let role = 'client';
+  if (parts.length >= 2) {
+    const last = parts[parts.length - 1].toLowerCase();
+    if (last === 'admin' || last === 'client') {
+      role = last;
+      name = parts.slice(0, -1).join(' ');
+    }
+  }
+
   if (!name) {
     return bot.sendMessage(msg.chat.id, "❌ Debes indicar un nombre.");
   }
 
   const token = crypto.randomBytes(32).toString("hex");
-  const expiresAt = new Date(
-    Date.now() + 30 * 24 * 60 * 60 * 1000
-  ).toISOString();
+  let expiresAt = null;
+  if (role === 'client') {
+    expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  }
 
   const { data, error } = await supabase
     .from("clients")
@@ -108,6 +120,7 @@ bot.onText(/\/nuevo (.+)/, async (msg, match) => {
       active: true,
       token_used: false,
       expires_at: expiresAt,
+      role: role,
     })
     .select()
     .single();
@@ -118,49 +131,40 @@ bot.onText(/\/nuevo (.+)/, async (msg, match) => {
 
   await bot.sendMessage(
     msg.chat.id,
-    `✅ Cliente creado\n\n👤 ${data.name}\n🆔 ${data.id}\n🔑 Token:\n${data.token}\n📅 Expira:\n${new Date(data.expires_at).toLocaleDateString()}`
+    `✅ Cliente creado\n\n👤 ${data.name}\n🆔 ${data.id}\n🔑 Token:\n${data.token}\n📅 Expira:\n${data.expires_at ? new Date(data.expires_at).toLocaleDateString() : 'Sin límite (Admin)'}\n👑 Rol: ${role === 'admin' ? 'Administrador' : 'Cliente'}`
   );
 });
-
 // ====================
 // MANEJO DE MENSAJES (para el flujo del botón "Crear licencia")
 // ====================
 
 bot.on("message", async (msg) => {
-  // Solo procesar si no es un comando y el usuario está en pendingCreates
   if (!msg.text || msg.text.startsWith("/")) return;
   if (!isAdmin(msg.from.id)) return;
-  if (!pendingCreates.has(msg.from.id)) return;
 
-  // Limpiar estado
-  pendingCreates.delete(msg.from.id);
+  const userId = msg.from.id;
+  const pending = pendingCreates.get(userId);
+  if (!pending) return;
 
-  const name = msg.text.trim();
-  const token = crypto.randomBytes(32).toString("hex");
-  const expiresAt = new Date(
-    Date.now() + 30 * 24 * 60 * 60 * 1000
-  ).toISOString();
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
 
-  const { data, error } = await supabase
-    .from("clients")
-    .insert({
-      name,
-      token,
-      active: true,
-      token_used: false,
-      expires_at: expiresAt,
-    })
-    .select()
-    .single();
-
-  if (error) {
-    return bot.sendMessage(msg.chat.id, `❌ ${error.message}`);
+  // Paso 1: esperando nombre
+  if (pending.step === 'name') {
+    pendingCreates.set(userId, { step: 'role', name: text });
+    await bot.sendMessage(chatId, "Selecciona el rol:", {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "👤 Cliente", callback_data: "role_client" },
+            { text: "👑 Administrador", callback_data: "role_admin" }
+          ]
+        ]
+      }
+    });
+    return;
   }
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `✅ Licencia creada\n\n👤 ${data.name}\n🆔 ${data.id}\n🔑 Token:\n${data.token}\n📅 Expira:\n${new Date(data.expires_at).toLocaleDateString()}`
-  );
+  // Si está en otro paso, no hacer nada
 });
 
 // ====================
@@ -219,8 +223,8 @@ bot.on("callback_query", async (query) => {
 
     if (!client) return;
 
-    const messageText = `👤 ${client.name}\n\n🆔 ID: ${client.id}\n📱 ${client.phone_number || "No definido"}\n💳 Tarjeta 1:\n${client.card1 || "No definida"}\n💳 Tarjeta 2:\n${client.card2 || "No definida"}\n💳 Tarjeta 3:\n${client.card3 || "No definida"}\n👛 Wallet:\n${client.wallet || "No definida"}\n📲 Device:\n${client.device_id || "No registrado"}\n📅 Expira:\n${client.expires_at || "Sin fecha"}\n🟢 Estado:\n${client.active ? "Activo" : "Inactivo"}`;
-
+    const messageText = `👤 ${client.name}\n\n🆔 ID: ${client.id}\n👑 Rol: ${client.role === 'admin' ? 'Administrador' : 'Cliente'}\n📱 ${client.phone_number || "No definido"}\n💳 Tarjeta 1:\n${client.card1 || "No definida"}\n💳 Tarjeta 2:\n${client.card2 || "No definida"}\n💳 Tarjeta 3:\n${client.card3 || "No definida"}\n👛 Wallet:\n${client.wallet || "No definida"}\n📲 Device:\n${client.device_id || "No registrado"}\n📅 Expira:\n${client.expires_at ? new Date(client.expires_at).toLocaleDateString() : 'Sin límite (Admin)'}\n🟢 Estado:\n${client.active ? "Activo" : "Inactivo"}`;
+    
     const options = {
       chat_id: chatId,
       message_id: messageId,
@@ -245,8 +249,8 @@ bot.on("callback_query", async (query) => {
   // Volver al panel
   if (data === "back_panel") {
     const { data: clients } = await supabase
-      .from("clients")
-      .select("id, name, active")
+    .from("clients")
+    .select("id, name, active, role")
       .order("created_at", { ascending: false });
 
     const keyboard = clients.map((client) => [
@@ -269,9 +273,55 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
+  // Selección de rol para nueva licencia
+if (data === "role_client" || data === "role_admin") {
+  const userId = query.from.id;
+  const pending = pendingCreates.get(userId);
+  if (!pending || pending.step !== 'role') {
+    return bot.answerCallbackQuery(query.id, { text: "Error: no hay solicitud pendiente" });
+  }
+
+  const name = pending.name;
+  const role = data === "role_admin" ? "admin" : "client";
+  const token = crypto.randomBytes(32).toString("hex");
+  let expiresAt = null;
+  if (role === "client") {
+    expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  const { data: client, error } = await supabase
+    .from("clients")
+    .insert({
+      name,
+      token,
+      active: true,
+      token_used: false,
+      expires_at: expiresAt,
+      role: role,
+    })
+    .select()
+    .single();
+
+  pendingCreates.delete(userId);
+
+  if (error) {
+    await bot.sendMessage(chatId, `❌ ${error.message}`);
+    return;
+  }
+
+  await bot.sendMessage(
+    chatId,
+    `✅ Licencia creada\n\n👤 ${client.name}\n🆔 ${client.id}\n🔑 Token:\n${client.token}\n📅 Expira:\n${client.expires_at ? new Date(client.expires_at).toLocaleDateString() : 'Sin límite (Admin)'}\n👑 Rol: ${role === 'admin' ? 'Administrador' : 'Cliente'}`
+  );
+
+  // Eliminar el mensaje del botón
+  await bot.deleteMessage(chatId, messageId);
+  return;
+}
+
   // Iniciar creación de licencia (botón "Crear licencia")
   if (data === "create_license") {
-    pendingCreates.set(query.from.id, true);
+    pendingCreates.set(query.from.id, { step: 'name' });
     return bot.sendMessage(chatId, "📝 Envía el nombre del cliente.");
   }
 });
