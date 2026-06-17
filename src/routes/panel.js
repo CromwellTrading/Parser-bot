@@ -128,12 +128,40 @@ router.put('/api/clients/:id/renew-token', async (req, res) => {
   res.json(data)
 })
 
-router.delete('/api/clients/:id', async (req, res) => {
-  await supabase.from('sms_logs').delete().eq('client_id', req.params.id)
-  const { error } = await supabase.from('clients').delete().eq('id', req.params.id)
-  if (error) return res.status(500).json({ error: error.message })
-  res.json({ ok: true })
-})
+router.delete('/clients/:id', async (req, res) => {
+  try {
+    // 1. Obtener el token del cliente antes de eliminarlo
+    const { data: client } = await supabase
+      .from('clients')
+      .select('token')
+      .eq('id', req.params.id)
+      .single();
+
+    // 2. Invalidar el token en la blacklist
+    if (client?.token) {
+      await supabase
+        .from('token_blacklist')
+        .insert({ token: client.token });
+    }
+
+    // 3. Eliminar logs del cliente
+    await supabase
+      .from('sms_logs')
+      .delete()
+      .eq('client_id', req.params.id);
+
+    // 4. Eliminar el cliente
+    const { error } = await supabase
+      .from('clients')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 router.get('/api/logs', async (req, res) => {
   const { client_id, limit = 50 } = req.query
