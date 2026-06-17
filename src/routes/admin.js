@@ -117,20 +117,26 @@ router.put('/clients/:id/renew-token', async (req, res) => {
   res.json(data)
 })
 
-router.delete('/clients/:id', async (req, res) => {
+router.delete('/api/clients/:id', async (req, res) => {
   try {
-    // 1. Obtener el token del cliente antes de eliminarlo
+    // 1. Obtener el token del cliente
     const { data: client } = await supabase
       .from('clients')
       .select('token')
       .eq('id', req.params.id)
       .single();
 
-    // 2. Invalidar el token en la blacklist
+    // 2. Invalidar el token (guardarlo en blacklist)
     if (client?.token) {
-      await supabase
+      const { error: blacklistError } = await supabase
         .from('token_blacklist')
-        .insert({ token: client.token });
+        .insert({ token: client.token, invalidated_at: new Date().toISOString() });
+      
+      if (blacklistError) {
+        console.error('Error al invalidar token:', blacklistError);
+      } else {
+        console.log(`✅ Token invalidado para cliente ${req.params.id}`);
+      }
     }
 
     // 3. Eliminar logs del cliente
@@ -140,14 +146,17 @@ router.delete('/clients/:id', async (req, res) => {
       .eq('client_id', req.params.id);
 
     // 4. Eliminar el cliente
-    const { error } = await supabase
+    const { error: deleteError } = await supabase
       .from('clients')
       .delete()
       .eq('id', req.params.id);
 
-    if (error) throw error;
-    res.json({ ok: true });
+    if (deleteError) throw deleteError;
+
+    console.log(`✅ Cliente ${req.params.id} eliminado correctamente`);
+    res.json({ ok: true, message: 'Cliente eliminado y token invalidado' });
   } catch (error) {
+    console.error('Error al eliminar cliente:', error);
     res.status(500).json({ error: error.message });
   }
 });
