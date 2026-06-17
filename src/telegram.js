@@ -339,4 +339,4 @@ bot.on("error", (err) => {
 // EXPORTAR
 // ====================
 
-module.exports = bot;
+module.exports = { bot, ADMINS };
