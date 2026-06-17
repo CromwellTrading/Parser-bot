@@ -88,7 +88,6 @@ bot.onText(/\/panel/, async (msg) => {
 
 // /nuevo <nombre>
 bot.onText(/\/nuevo (.+)/, async (msg, match) => {
-bot.onText(/\/nuevo (.+)/, async (msg, match) => {
   if (!isAdmin(msg.from.id)) return denyAccess(msg.chat.id);
 
   const parts = match[1].trim().split(/\s+/);
