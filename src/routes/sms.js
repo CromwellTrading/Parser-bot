@@ -75,70 +75,6 @@ async function sendTelegramAlert(parsed, sender, clientName, receivedIso) {
   }
 }
 
-const express = require('express')
-const router = express.Router()
-const crypto = require('crypto')
-const supabase = require('../supabase')
-const { bot, ADMINS } = require('../telegram');
-const { verifySignature } = require('../utils/hmac')
-const { parseSms } = require('../utils/parser')
-
-function digestFallback(sender, body, receivedAt, token) {
-  return crypto
-    .createHash('sha256')
-    .update(`${token}::${sender}::${receivedAt}::${body}`)
-    .digest('hex')
-}
-
-async function sendWebhook(url, data) {
-  try {
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    })
-    console.log(`📤 Webhook enviado a ${url}`)
-  } catch (error) {
-    console.error(`❌ Error webhook ${url}:`, error.message)
-  }
-}
-
-async function sendTelegramAlert(parsed, sender, clientName, receivedIso) {
-  // Solo notificar si hay monto (es una transacción financiera)
-  if (parsed.amount == null) return;
-
-  const dir = parsed.direction === 'RECIBIDO' ? '📥 RECIBIDO' : '📤 ENVIADO';
-  const amount = parsed.amount != null
-    ? `💰 *${parsed.amount.toFixed(2)} ${parsed.currency ?? 'CUP'}*`
-    : '';
-  const type = parsed.type?.replace(/_/g, ' → ') ?? 'DESCONOCIDO';
-  const date = new Date(receivedIso).toLocaleString('es-CU', { timeZone: 'America/Havana' });
-
-  const remitente = parsed.sender_phone ?? null;
-  const receptor = parsed.receiver_phone ?? parsed.receiver_account ?? null;
-
-  const lines = [
-    `${dir} — ${type}`,
-    amount,
-    remitente ? `👤 De: \`${remitente}\`` : null,
-    receptor ? `👤 Para: \`${receptor}\`` : null,
-    parsed.transaction_id ? `🔖 TX: \`${parsed.transaction_id}\`` : null,
-    `🏪 Cliente: ${clientName}`,
-    `🕐 ${date}`,
-  ];
-
-  const text = lines.filter(Boolean).join('\n');
-
-  // Enviar a cada administrador
-  for (const adminId of ADMINS) {
-    try {
-      await bot.sendMessage(adminId, text, { parse_mode: 'Markdown' });
-    } catch (err) {
-      console.error(`Error enviando a admin ${adminId}:`, err.message);
-    }
-  }
-}
-
 router.post('/ingest', async (req, res) => {
   try {
     const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {})
@@ -276,7 +212,7 @@ router.post('/ingest', async (req, res) => {
         message_id: smsHash,
       }
       for (const url of webhooks) {
-        sendWebhook(url, webhookPayload)
+        sendWebhook(url, webhookPayload, client.webhook_secret)
       }
     }
 
