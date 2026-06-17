@@ -234,6 +234,11 @@ input, select {
   outline: none;
   transition: border-color .2s;
   border-radius: 4px;
+  appearance: none;
+  -webkit-appearance: none;
+  height: auto;
+  line-height: normal;
+  cursor: pointer;
 }
 input:focus, select:focus {
   border-color: var(--red);
@@ -265,7 +270,8 @@ input::placeholder {
 .form-panel{background:var(--surface);border:1px solid var(--border);border-radius:4px;
   padding:20px;margin-bottom:20px;display:none}
 .form-panel.open{display:block}
-.form-row{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end}
+.form-row{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:stretch}
+.form-row .btn-primary { align-self: center; }
 @media(max-width:600px){.form-row{grid-template-columns:1fr}}
 label{display:block;font-size:9px;letter-spacing:2px;color:var(--muted);
   font-family:'Space Mono',monospace;margin-bottom:6px;text-transform:uppercase}
