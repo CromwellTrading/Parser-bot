@@ -18,7 +18,7 @@ router.use('/api', adminAuth)
 router.get('/api/clients', async (req, res) => {
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role')
+    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret')
     .order('created_at', { ascending: false }); // <- sin coma, punto y coma
 
   if (error) return res.status(500).json({ error: error.message });
@@ -30,6 +30,7 @@ router.post('/api/clients', async (req, res) => {
   if (!name) return res.status(400).json({ error: 'Nombre requerido' })
 
   const token = crypto.randomBytes(32).toString('hex')
+  const webhookSecret = crypto.randomBytes(32).toString('hex')
   
   // Determinar expiración según rol
   const userRole = role || 'client' // por defecto cliente
@@ -45,6 +46,7 @@ router.post('/api/clients', async (req, res) => {
   const payload = {
     name,
     token,
+    webhook_secret: webhookSecret,
     webhook_url: webhook_url || null,
     webhook_url_2: webhook_url_2 || null,
     webhook_url_3: webhook_url_3 || null,
@@ -563,6 +565,7 @@ function showInfo(c) {
     <div>🔗 Webhook 1: \${c.webhook_url || '—'}</div>
     <div>🔗 Webhook 2: \${c.webhook_url_2 || '—'}</div>
     <div>🔗 Webhook 3: \${c.webhook_url_3 || '—'}</div>
+    <div>🔐 Webhook Secret: ${c.webhook_secret || 'No generado'}</div>
     <div>🆔 Dispositivo: \${c.device_id || '—'}</div>
     <div>📅 Creado: \${new Date(c.created_at).toLocaleString('es')}</div>
     <div>⏳ Vence: \${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
