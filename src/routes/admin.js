@@ -117,7 +117,7 @@ router.put('/clients/:id/renew-token', async (req, res) => {
   res.json(data)
 })
 
-router.delete('/api/clients/:id', async (req, res) => {
+router.delete('/clients/:id', async (req, res) => {  // ← RUTA CORREGIDA
   try {
     // 1. Obtener el token del cliente
     const { data: client } = await supabase
