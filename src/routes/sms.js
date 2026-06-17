@@ -2,7 +2,7 @@ const express = require('express')
 const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
-const bot = require('../telegram'); 
+const { bot, ADMINS } = require('../telegram');
 const { verifySignature } = require('../utils/hmac')
 const { parseSms } = require('../utils/parser')
 
@@ -27,46 +27,38 @@ async function sendWebhook(url, data) {
 }
 
 async function sendTelegramAlert(parsed, sender, clientName, receivedIso) {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN
-  const chatId   = process.env.TELEGRAM_CHAT_ID
-  if (!botToken || !chatId) return
+  // Solo notificar si hay monto (es una transacción financiera)
+  if (parsed.amount == null) return;
 
-  const dir    = parsed.direction === 'RECIBIDO' ? '⬇️ RECIBIDO' : '⬆️ ENVIADO'
+  const dir = parsed.direction === 'RECIBIDO' ? '📥 RECIBIDO' : '📤 ENVIADO';
   const amount = parsed.amount != null
     ? `💰 *${parsed.amount.toFixed(2)} ${parsed.currency ?? 'CUP'}*`
-    : ''
-  const type = parsed.type?.replace(/_/g, ' → ') ?? 'DESCONOCIDO'
-  const date = new Date(receivedIso).toLocaleString('es-CU', { timeZone: 'America/Havana' })
+    : '';
+  const type = parsed.type?.replace(/_/g, ' → ') ?? 'DESCONOCIDO';
+  const date = new Date(receivedIso).toLocaleString('es-CU', { timeZone: 'America/Havana' });
 
-  // ← aquí está el fix: sender_phone y receiver_phone con guión bajo
-  const remitente = parsed.sender_phone ?? null
-  const receptor  = parsed.receiver_phone ?? parsed.receiver_account ?? null
+  const remitente = parsed.sender_phone ?? null;
+  const receptor = parsed.receiver_phone ?? parsed.receiver_account ?? null;
 
   const lines = [
     `${dir} — ${type}`,
     amount,
     remitente ? `👤 De: \`${remitente}\`` : null,
-    receptor  ? `👤 Para: \`${receptor}\`` : null,
+    receptor ? `👤 Para: \`${receptor}\`` : null,
     parsed.transaction_id ? `🔖 TX: \`${parsed.transaction_id}\`` : null,
     `🏪 Cliente: ${clientName}`,
     `🕐 ${date}`,
-  ]
+  ];
 
-  const text = lines.filter(Boolean).join('\n')
+  const text = lines.filter(Boolean).join('\n');
 
-  try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: 'Markdown',
-      }),
-    })
-    console.log(`📬 Telegram notificado`)
-  } catch (err) {
-    console.error('❌ Error Telegram:', err.message)
+  // Enviar a cada administrador
+  for (const adminId of ADMINS) {
+    try {
+      await bot.sendMessage(adminId, text, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error(`Error enviando a admin ${adminId}:`, err.message);
+    }
   }
 }
 
