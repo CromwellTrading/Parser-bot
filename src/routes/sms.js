@@ -105,6 +105,19 @@ router.post('/ingest', async (req, res) => {
       return res.status(403).json({ error: 'Licencia expirada' })
     }
 
+  
+
+// Verificar si el token está en la blacklist
+const { data: blacklisted } = await supabase
+  .from('token_blacklist')
+  .select('token')
+  .eq('token', token)
+  .maybeSingle();
+
+if (blacklisted) {
+  return res.status(403).json({ error: 'Token revocado' });
+}
+
     if (client.device_id && deviceId && client.device_id !== deviceId) {
       return res.status(403).json({ error: 'Dispositivo no autorizado' })
     }
