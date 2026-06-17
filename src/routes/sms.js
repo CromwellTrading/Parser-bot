@@ -13,16 +13,29 @@ function digestFallback(sender, body, receivedAt, token) {
     .digest('hex')
 }
 
-async function sendWebhook(url, data) {
+async function sendWebhook(url, data, secret) {
   try {
+    const payload = JSON.stringify(data);
+    let headers = { 'Content-Type': 'application/json' };
+    
+    if (secret) {
+      const signature = crypto
+        .createHmac('sha256', secret)
+        .update(payload)
+        .digest('hex');
+      headers['X-Webhook-Signature'] = signature;
+    } else {
+      console.warn(`⚠️ Webhook sin secreto para ${url}, enviando sin firma`);
+    }
+
     await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    })
-    console.log(`📤 Webhook enviado a ${url}`)
+      headers,
+      body: payload,
+    });
+    console.log(`📤 Webhook enviado a ${url}`);
   } catch (error) {
-    console.error(`❌ Error webhook ${url}:`, error.message)
+    console.error(`❌ Error webhook ${url}:`, error.message);
   }
 }
 
@@ -77,7 +90,7 @@ router.post('/ingest', async (req, res) => {
 
     const { data: client, error: clientError } = await supabase
       .from('clients')
-      .select('id, name, token, active, token_used, device_id, expires_at, webhook_url, webhook_url_2, webhook_url_3')
+      .select('id, name, token, active, token_used, device_id, expires_at, webhook_url, webhook_url_2, webhook_url_3, webhook_secret')
       .eq('token', token)
       .maybeSingle()
 
@@ -149,7 +162,7 @@ router.post('/ingest', async (req, res) => {
         message_id: smsHash,
       }
       for (const url of webhooks) {
-        sendWebhook(url, webhookPayload)
+         sendWebhook(url, webhookPayload, client.webhook_secret)
       }
     }
 
