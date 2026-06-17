@@ -565,7 +565,7 @@ function showInfo(c) {
     <div>🔗 Webhook 1: \${c.webhook_url || '—'}</div>
     <div>🔗 Webhook 2: \${c.webhook_url_2 || '—'}</div>
     <div>🔗 Webhook 3: \${c.webhook_url_3 || '—'}</div>
-    <div>🔐 Webhook Secret: ${c.webhook_secret || 'No generado'}</div>
+    <div>🔐 Webhook Secret: \${c.webhook_secret || 'No generado'}</div>
     <div>🆔 Dispositivo: \${c.device_id || '—'}</div>
     <div>📅 Creado: \${new Date(c.created_at).toLocaleString('es')}</div>
     <div>⏳ Vence: \${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
