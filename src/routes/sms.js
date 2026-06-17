@@ -2,6 +2,7 @@ const express = require('express')
 const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
+const bot = require('../telegram'); 
 const { verifySignature } = require('../utils/hmac')
 const { parseSms } = require('../utils/parser')
 
