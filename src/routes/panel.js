@@ -105,9 +105,18 @@ router.put('/api/clients/:id/profile', async (req, res) => {
 })
 
 router.put('/api/clients/:id/renew-token', async (req, res) => {
-  // Obtener rol actual
-  const { data: client } = await supabase.from('clients').select('role').eq('id', req.params.id).single()
+  // Obtener rol actual y token viejo
+  const { data: client } = await supabase.from('clients').select('role, token').eq('id', req.params.id).single()
   if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
+
+  // 🔒 Invalidar el token viejo en la blacklist ANTES de reemplazarlo
+  if (client.token) {
+    const { error: blacklistError } = await supabase
+      .from('token_blacklist')
+      .insert({ token: client.token, invalidated_at: new Date().toISOString() })
+    if (blacklistError) console.error('Error al invalidar token viejo:', blacklistError)
+    else console.log(`🚫 Token viejo invalidado para cliente ${req.params.id}`)
+  }
 
   const newToken = crypto.randomBytes(32).toString('hex')
   const expiresInDays = Number.isFinite(Number(req.body?.expires_in_days)) ? Number(req.body.expires_in_days) : 30
@@ -188,11 +197,17 @@ router.get('/api/logs', async (req, res) => {
 router.post('/api/auth/verify', async (req, res) => {
   const { token } = req.body
   if (!token) return res.status(400).json({ error: 'Token requerido' })
+
+  // 🔒 Verificar si el token fue invalidado (renovado o eliminado)
+  const { data: blacklisted } = await supabase
+    .from('token_blacklist').select('token').eq('token', token).maybeSingle()
+  if (blacklisted) return res.status(403).json({ error: 'Token revocado', status: 'REVOKED' })
+
   const { data, error } = await supabase
     .from('clients').select('id, active, token_used').eq('token', token).single()
-  if (error || !data) return res.status(401).json({ error: 'Token inválido' })
-  if (!data.active) return res.status(403).json({ error: 'Licencia inactiva' })
-  if (data.token_used) return res.status(403).json({ error: 'Token en uso' })
+  if (error || !data) return res.status(404).json({ error: 'Token inválido', status: 'REVOKED' })
+  if (!data.active) return res.status(403).json({ error: 'Licencia inactiva', status: 'REVOKED' })
+  if (data.token_used) return res.status(403).json({ error: 'Token en uso', status: 'USED' })
   await supabase.from('clients').update({ token_used: true }).eq('token', token)
   res.status(200).json({ ok: true })
 })
