@@ -69,9 +69,24 @@ router.post('/api/clients', async (req, res) => {
 })
 
 router.put('/api/clients/:id/toggle', async (req, res) => {
-  const { data: client } = await supabase.from('clients').select('active').eq('id', req.params.id).single()
+  const { data: client } = await supabase.from('clients').select('active, token').eq('id', req.params.id).single()
   if (!client) return res.status(404).json({ error: 'No encontrado' })
-  const { data, error } = await supabase.from('clients').update({ active: !client.active }).eq('id', req.params.id).select().single()
+
+  const nowActive = !client.active
+
+  if (!nowActive && client.token) {
+    // Desactivando → meter token en blacklist (suspensión temporal)
+    await supabase.from('token_blacklist')
+      .insert({ token: client.token, invalidated_at: new Date().toISOString() })
+    console.log(`🔴 Token suspendido para cliente ${req.params.id}`)
+  } else if (nowActive && client.token) {
+    // Activando → sacar token de blacklist para restaurar acceso
+    await supabase.from('token_blacklist')
+      .delete().eq('token', client.token)
+    console.log(`🟢 Token restaurado para cliente ${req.params.id}`)
+  }
+
+  const { data, error } = await supabase.from('clients').update({ active: nowActive }).eq('id', req.params.id).select().single()
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
 })
@@ -109,13 +124,11 @@ router.put('/api/clients/:id/renew-token', async (req, res) => {
   const { data: client } = await supabase.from('clients').select('role, token').eq('id', req.params.id).single()
   if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
 
-  // 🔒 Invalidar el token viejo en la blacklist ANTES de reemplazarlo
+  // 🔒 Meter token viejo en blacklist antes de reemplazarlo
   if (client.token) {
-    const { error: blacklistError } = await supabase
-      .from('token_blacklist')
+    await supabase.from('token_blacklist')
       .insert({ token: client.token, invalidated_at: new Date().toISOString() })
-    if (blacklistError) console.error('Error al invalidar token viejo:', blacklistError)
-    else console.log(`🚫 Token viejo invalidado para cliente ${req.params.id}`)
+    console.log(`🚫 Token viejo invalidado para cliente ${req.params.id}`)
   }
 
   const newToken = crypto.randomBytes(32).toString('hex')
@@ -198,7 +211,7 @@ router.post('/api/auth/verify', async (req, res) => {
   const { token } = req.body
   if (!token) return res.status(400).json({ error: 'Token requerido' })
 
-  // 🔒 Verificar si el token fue invalidado (renovado o eliminado)
+  // 🔒 Verificar blacklist (tokens eliminados, renovados o suspendidos)
   const { data: blacklisted } = await supabase
     .from('token_blacklist').select('token').eq('token', token).maybeSingle()
   if (blacklisted) return res.status(403).json({ error: 'Token revocado', status: 'REVOKED' })
