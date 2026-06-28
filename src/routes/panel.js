@@ -124,30 +124,34 @@ router.put('/api/clients/:id/profile', async (req, res) => {
 })
 
 router.put('/api/clients/:id/renew-token', async (req, res) => {
-  // Obtener rol actual y token viejo
   const { data: client } = await supabase.from('clients').select('role, token').eq('id', req.params.id).single()
   if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
 
-  // 🔒 Meter token viejo en blacklist antes de reemplazarlo
+  // 1. Desactivar primero (igual que toggle → esto sí funciona en la app)
+  await supabase.from('clients').update({ active: false }).eq('id', req.params.id)
+  console.log(`🔴 Cliente desactivado antes de renovar ${req.params.id}`)
+
+  // 2. Meter token viejo en blacklist
   if (client.token) {
     await supabase.from('token_blacklist')
       .insert({ token: client.token, invalidated_at: new Date().toISOString() })
     console.log(`🚫 Token viejo invalidado para cliente ${req.params.id}`)
   }
 
+  // 3. Generar nuevo token y reactivar
   const newToken = crypto.randomBytes(32).toString('hex')
   const expiresInDays = Number.isFinite(Number(req.body?.expires_in_days)) ? Number(req.body.expires_in_days) : 30
 
   let expiresAt = null
   if (client.role === 'admin') {
-    expiresAt = null // admin nunca caduca
+    expiresAt = null
   } else {
     expiresAt = req.body?.expires_at || new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
   }
 
   const { data, error } = await supabase
     .from('clients')
-    .update({ token: newToken, token_used: false, device_id: null, expires_at: expiresAt })
+    .update({ token: newToken, token_used: false, device_id: null, expires_at: expiresAt, active: true })
     .eq('id', req.params.id).select().single()
   if (error) return res.status(500).json({ error: error.message })
   console.log(`🔄 Token renovado para cliente ${data.name}`)
@@ -163,7 +167,11 @@ router.delete('/api/clients/:id', async (req, res) => {
       .eq('id', req.params.id)
       .single();
 
-    // 2. Invalidar el token (guardarlo en blacklist)
+    // 2. Desactivar primero (igual que toggle → esto sí funciona en la app)
+    await supabase.from('clients').update({ active: false }).eq('id', req.params.id)
+    console.log(`🔴 Cliente desactivado antes de eliminar ${req.params.id}`)
+
+    // 3. Invalidar el token en blacklist
     if (client?.token) {
       const { error: blacklistError } = await supabase
         .from('token_blacklist')
@@ -176,13 +184,13 @@ router.delete('/api/clients/:id', async (req, res) => {
       }
     }
 
-    // 3. Eliminar logs del cliente
+    // 4. Eliminar logs del cliente
     await supabase
       .from('sms_logs')
       .delete()
       .eq('client_id', req.params.id);
 
-    // 4. Eliminar el cliente
+    // 5. Eliminar el cliente
     const { error: deleteError } = await supabase
       .from('clients')
       .delete()
