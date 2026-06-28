@@ -11,7 +11,11 @@ function adminAuth(req, res, next) {
   next()
 }
 
-router.use('/api', adminAuth)
+router.use('/api', (req, res, next) => {
+  // /api/auth/verify es llamado por la app Android — no requiere admin secret
+  if (req.path === '/auth/verify') return next()
+  adminAuth(req, res, next)
+})
 
 // ── Clients CRUD ──────────────────────────────────────────────────────────────
 
