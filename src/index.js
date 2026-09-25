@@ -11,11 +11,13 @@ app.use(express.json({
 
 const authRoutes = require('./routes/auth')
 const smsRoutes = require('./routes/sms')
+const onboardingRoutes = require('./routes/onboarding')
 const panelRoutes = require('./routes/panel')
 const adminRoutes = require('./routes/admin')
 
 app.use('/api/auth', authRoutes)
 app.use('/api/sms', smsRoutes)
+app.use('/api/onboarding', onboardingRoutes)
 app.use('/panel', panelRoutes)
 app.use('/api/admin', adminRoutes)
 
