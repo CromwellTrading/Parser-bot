@@ -2,12 +2,18 @@ const express = require('express')
 const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
+const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
 
 router.get('/', (req, res) => res.send(PANEL_HTML))
 
 function adminAuth(req, res, next) {
   const secret = req.headers['x-admin-secret']
-  if (secret !== process.env.ADMIN_SECRET) return res.status(401).json({ error: 'No autorizado' })
+  if (!secretsMatch(secret)) {
+    if (!getConfiguredAdminSecret()) {
+      return res.status(503).json({ error: 'Panel admin sin contraseña configurada' })
+    }
+    return res.status(401).json({ error: 'No autorizado' })
+  }
   next()
 }
 
@@ -79,14 +85,26 @@ router.put('/api/clients/:id/toggle', async (req, res) => {
   const nowActive = !client.active
 
   if (!nowActive && client.token) {
-    // Desactivando → meter token en blacklist (suspensión temporal)
-    await supabase.from('token_blacklist')
-      .insert({ token: client.token, invalidated_at: new Date().toISOString() })
+    const { error: revokeError } = await supabase
+      .from('token_blacklist')
+      .delete().eq('token', client.token)
+    if (revokeError) return res.status(500).json({ error: 'No se pudo preparar la revocación del token' })
+
+    const { error: blacklistError } = await supabase
+      .from('token_blacklist')
+      .insert({
+        token: client.token,
+        client_id: req.params.id,
+        reason: 'SUSPENDED_BY_ADMIN',
+        invalidated_at: new Date().toISOString(),
+      })
+    if (blacklistError) return res.status(500).json({ error: 'No se pudo revocar el token' })
     console.log(`🔴 Token suspendido para cliente ${req.params.id}`)
   } else if (nowActive && client.token) {
-    // Activando → sacar token de blacklist para restaurar acceso
-    await supabase.from('token_blacklist')
+    const { error: restoreError } = await supabase
+      .from('token_blacklist')
       .delete().eq('token', client.token)
+    if (restoreError) return res.status(500).json({ error: 'No se pudo restaurar el token' })
     console.log(`🟢 Token restaurado para cliente ${req.params.id}`)
   }
 
@@ -133,8 +151,16 @@ router.put('/api/clients/:id/renew-token', async (req, res) => {
 
   // 2. Meter token viejo en blacklist
   if (client.token) {
-    await supabase.from('token_blacklist')
-      .insert({ token: client.token, invalidated_at: new Date().toISOString() })
+    await supabase.from('token_blacklist').delete().eq('token', client.token)
+    const { error: blacklistError } = await supabase
+      .from('token_blacklist')
+      .insert({
+        token: client.token,
+        client_id: req.params.id,
+        reason: 'TOKEN_RENEWED',
+        invalidated_at: new Date().toISOString(),
+      })
+    if (blacklistError) return res.status(500).json({ error: 'No se pudo invalidar el token anterior' })
     console.log(`🚫 Token viejo invalidado para cliente ${req.params.id}`)
   }
 
@@ -173,15 +199,18 @@ router.delete('/api/clients/:id', async (req, res) => {
 
     // 3. Invalidar el token en blacklist
     if (client?.token) {
+      await supabase.from('token_blacklist').delete().eq('token', client.token)
       const { error: blacklistError } = await supabase
         .from('token_blacklist')
-        .insert({ token: client.token, invalidated_at: new Date().toISOString() });
+        .insert({
+          token: client.token,
+          client_id: req.params.id,
+          reason: 'CLIENT_DELETED',
+          invalidated_at: new Date().toISOString(),
+        });
       
-      if (blacklistError) {
-        console.error('Error al invalidar token:', blacklistError);
-      } else {
-        console.log(`✅ Token invalidado para cliente ${req.params.id}`);
-      }
+      if (blacklistError) throw new Error(`No se pudo invalidar token antes de eliminar: ${blacklistError.message}`)
+      console.log(`✅ Token invalidado para cliente ${req.params.id}`)
     }
 
     // 4. Eliminar logs del cliente
@@ -536,16 +565,29 @@ tr:hover td{background:#ffffff04}
 let SECRET = ''
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-function login() {
+async function login() {
   const s = document.getElementById('sec-in').value.trim()
+  const err = document.getElementById('login-err')
   if (!s) return
+
+  err.style.display='none'
   SECRET = s
-  api('/clients').then(r => {
-    if (r.error) { document.getElementById('login-err').style.display='block'; SECRET=''; return }
+  try {
+    const r = await api('/clients')
+    if (r.error) {
+      err.textContent = r.error.includes('sin contraseña') ? 'El servidor no tiene contraseña de panel configurada' : 'Clave incorrecta'
+      err.style.display='block'
+      SECRET=''
+      return
+    }
     document.getElementById('login').style.display='none'
     document.getElementById('dash').style.display='block'
     loadAll()
-  })
+  } catch (e) {
+    err.textContent='No se pudo conectar con el servidor'
+    err.style.display='block'
+    SECRET=''
+  }
 }
 function logout() {
   SECRET=''
