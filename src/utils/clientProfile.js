@@ -21,7 +21,7 @@ function pickFirst(...values) {
 
 function normalizeClientProfile(body = {}) {
   const profile = {
-    phone_number: pickFirst(body.phone_number, body.wallet, body.phoneNumber),
+    phone_number: pickFirst(body.phone_number, body.phoneNumber),
     card1: pickFirst(body.card1, body.card_1),
     card2: pickFirst(body.card2, body.card_2),
     card3: pickFirst(body.card3, body.card_3),
