@@ -9,7 +9,7 @@ function normalizePhone(phone) {
   return clean
 }
 
-function parseSms(sender, body) {
+function parseSmsBase(sender, body) {
   const clean = removeAccents(body)
   const upper = clean.toUpperCase()
 
@@ -102,31 +102,46 @@ function parseSms(sender, body) {
     }
   }
 
-  // 4. ENVIADO: Monedero→Monedero (Mi Transfer, con Ordenante)
+  // 4. ENVIADO: MiTransfer con Ordenante.
+  // El beneficiario puede ser teléfono o tarjeta; la tarjeta puede venir completa o enmascarada.
   if (
     upper.includes('LA TRANSFERENCIA FUE COMPLETADA') &&
     upper.includes('ORDENANTE') &&
     upper.includes('BENEFICIARIO')
   ) {
-    const amount    = clean.match(/Monto[:\s]+([\d.]+)/i)?.[1]
-    const benef     = clean.match(/Beneficiario[:\s]+(\d+)/i)?.[1]
+    const amount    = clean.match(/Monto[:\s]+([\d.,]+)/i)?.[1]
+    const benef     = clean.match(/Beneficiario[:\s]+([\dX\s]+)/i)?.[1]?.replace(/\s/g, '')
     const ordenante = clean.match(/Ordenante[:\s]+(\d+)/i)?.[1]
     const txId      = clean.match(/Nro\.?\s*Transaccion[:\s]+(\w+)/i)?.[1]
-    const comision  = clean.match(/cobro de comision de\s+([\d.]+)\s*CUP/i)?.[1]
-    const balance   = clean.match(/Saldo restante[:\s]+([\d.]+)\s*CUP/i)?.[1]
+    const comision  = clean.match(/cobro de comision de\s+([\d.,]+)\s*CUP/i)?.[1]
+    const balance   = clean.match(/Saldo restante[:\s]+([\d.,]+)\s*CUP/i)?.[1]
     const totalGasto = (amount && comision)
-      ? parseFloat(amount) + parseFloat(comision)
-      : amount ? parseFloat(amount) : null
-    return {
-      direction: 'ENVIADO', type: 'MONEDERO_MONEDERO', network: 'PAGOMOVIL',
-      amount: totalGasto, currency: 'CUP',
-      sender_phone: normalizePhone(ordenante),
-      receiver_phone: normalizePhone(benef),
-      receiver_account: null, transaction_id: txId,
-      commission: comision ? parseFloat(comision) : null,
-      balance_after: balance ? parseFloat(balance) : null,
-      raw: body
-    }
+      ? parseFloat(amount.replace(',', '.')) + parseFloat(comision.replace(',', '.'))
+      : amount ? parseFloat(amount.replace(',', '.')) : null
+    const beneficiaryDigits = (benef || '').replace(/\D/g, '')
+    const beneficiaryIsCard = Boolean(benef && (benef.includes('X') || beneficiaryDigits.length === 16))
+
+    return beneficiaryIsCard
+      ? {
+          direction: 'ENVIADO', type: 'MONEDERO_TARJETA', network: 'PAGOMOVIL',
+          amount: totalGasto, currency: 'CUP',
+          sender_phone: normalizePhone(ordenante),
+          receiver_phone: null,
+          receiver_account: benef, transaction_id: txId,
+          commission: comision ? parseFloat(comision.replace(',', '.')) : null,
+          balance_after: balance ? parseFloat(balance.replace(',', '.')) : null,
+          raw: body
+        }
+      : {
+          direction: 'ENVIADO', type: 'MONEDERO_MONEDERO', network: 'PAGOMOVIL',
+          amount: totalGasto, currency: 'CUP',
+          sender_phone: normalizePhone(ordenante),
+          receiver_phone: normalizePhone(benef),
+          receiver_account: null, transaction_id: txId,
+          commission: comision ? parseFloat(comision.replace(',', '.')) : null,
+          balance_after: balance ? parseFloat(balance.replace(',', '.')) : null,
+          raw: body
+        }
   }
 
   // 5. ENVIADO: Monedero→Tarjeta (Mi Transfer, sin Ordenante)
@@ -290,6 +305,63 @@ if (upper.includes('BANCO POPULAR DE AHORRO') && upper.includes('LA TRANSFERENCI
     receiver_phone: null, receiver_account: null,
     transaction_id: null, balance_after: null, raw: body
   }
+}
+
+function parseCubaLocalDateTime(datePart, timePart) {
+  const m = String(datePart).match(/^(\d{1,4})[\/\-](\d{1,2})[\/\-](\d{1,4})$/)
+  if (!m) return null
+  let year, month, day
+  if (m[1].length === 4) {
+    year = Number(m[1]); month = Number(m[2]); day = Number(m[3])
+  } else {
+    day = Number(m[1]); month = Number(m[2]); year = Number(m[3]); if (year < 100) year += 2000
+  }
+  const t = String(timePart).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/)
+  if (!t) return null
+  const hour=Number(t[1]), minute=Number(t[2]), second=Number(t[3] || 0)
+  if (hour>23 || minute>59 || second>59) return null
+  // Find the UTC instant corresponding to the local Cuba wall-clock time.
+  const guess = Date.UTC(year, month-1, day, hour, minute, second)
+  if (!Number.isFinite(guess)) return null
+  const tz = 'America/Havana'
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName:'shortOffset', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false })
+  const parts = Object.fromEntries(fmt.formatToParts(new Date(guess)).map(p=>[p.type,p.value]))
+  const z = parts.timeZoneName || 'GMT'
+  const om = z.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/i)
+  const offsetMin = om ? ((om[2]*60) + Number(om[3]||0)) * (om[1] === '+' ? 1 : -1) : 0
+  return new Date(guess - offsetMin*60*1000).toISOString()
+}
+
+function parseTransactionAt(body, receivedAt = null) {
+  const clean = removeAccents(String(body || '')).replace(/\s+/g, ' ').trim()
+  const patterns = [
+    /(?:FECHA(?:\s+Y\s+HORA)?|REALIZADA\s+EL|FECHA\s+DE\s+(?:LA\s+)?(?:OPERACION|TRANSACCION))\s*[:#-]?\s*(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})\s*(?:,|[-|])?\s+(\d{1,2}:\d{2}(?::\d{2})?)/i,
+    /\b(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\b/i,
+    /\b(\d{4}-\d{1,2}-\d{1,2})\s+(\d{1,2}:\d{2}(?::\d{2})?)\b/i,
+  ]
+  for (const re of patterns) {
+    const m = clean.match(re)
+    if (m) {
+      const parsed = parseCubaLocalDateTime(m[1], m[2])
+      if (parsed) return parsed
+    }
+  }
+  const timeOnly = clean.match(/(?:HORA(?:\s+DE\s+(?:LA\s+)?(?:OPERACION|TRANSACCION))?|REALIZADA\s+A\s+LAS)\s*[:#-]?\s*(\d{1,2}:\d{2}(?::\d{2})?)/i)?.[1]
+  if (timeOnly && receivedAt) {
+    const received = new Date(receivedAt)
+    if (!Number.isNaN(received.getTime())) {
+      const dateParts = new Intl.DateTimeFormat('en-CA', { timeZone:'America/Havana', year:'numeric', month:'2-digit', day:'2-digit' }).formatToParts(received)
+      const map = Object.fromEntries(dateParts.map(p=>[p.type,p.value]))
+      const parsed = parseCubaLocalDateTime(`${map.year}-${map.month}-${map.day}`, timeOnly)
+      if (parsed) return parsed
+    }
+  }
+  return null
+}
+
+function parseSms(sender, body, receivedAt = null) {
+  const parsed = parseSmsBase(sender, body)
+  return { ...parsed, transaction_at: parseTransactionAt(body, receivedAt) }
 }
 
 function matchesCard(accountInSms, cardFirst4, cardLast4) {
