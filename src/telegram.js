@@ -6,7 +6,7 @@ const supabase = require("./supabase");
 const pendingCreates = new Map(); 
 
 // IDs de administradores permitidos
-const ADMINS = [5387882635, 5376388604];
+const ADMINS = String(process.env.ADMIN_TELEGRAM_IDS || "5387882635,5376388604").split(",").map(v => Number(v.trim())).filter(Number.isFinite);
 
 // Verificar token
 if (!process.env.TELEGRAM_BOT_TOKEN) {
@@ -52,38 +52,47 @@ bot.onText(/\/start/, async (msg) => {
 bot.onText(/\/panel/, async (msg) => {
   if (!isAdmin(msg.from.id)) return denyAccess(msg.chat.id);
 
-  const { data: clients, error } = await supabase
-    .from("clients")
-    .select("id, name, active, expires_at, role")
-    .order("created_at", { ascending: false });
+  const [{ data: clients, error: clientError }, { data: sessions, error: sessionError }] = await Promise.all([
+    supabase
+      .from("clients")
+      .select("id, name, active, expires_at, role")
+      .order("created_at", { ascending: false }),
+    supabase
+      .from("license_activation_sessions")
+      .select("activation_id, phone_number, device_id, status, created_at")
+      .is("client_id", null)
+      .in("status", ["READY_TO_PAY", "WAITING_PAYMENT", "WAITING_LATE_CONFIRMATION"])
+      .order("created_at", { ascending: false })
+      .limit(100),
+  ]);
 
-  if (error) {
-    return bot.sendMessage(msg.chat.id, `❌ Error:\n${error.message}`);
-  }
+  if (clientError) return bot.sendMessage(msg.chat.id, `❌ Error clientes:\n${clientError.message}`);
+  if (sessionError) return bot.sendMessage(msg.chat.id, `❌ Error sesiones:\n${sessionError.message}`);
 
-  const activeCount = clients.filter((c) => c.active).length;
+  const safeClients = clients || [];
+  const pending = sessions || [];
+  const activeCount = safeClients.filter((c) => c.active).length;
 
-  // Construir teclado: una fila por cliente
-  const keyboard = clients.map((client) => [
-    {
+  const keyboard = [];
+  for (const client of safeClients) {
+    keyboard.push([{
       text: `${client.active ? "🟢" : "🔴"} ${client.name}`,
       callback_data: `client_${client.id}`,
-    },
-  ]);
+    }]);
+  }
+  for (const session of pending) {
+    keyboard.push([{
+      text: `🟡 ${session.phone_number || "Sin teléfono"} · ${session.status}`,
+      callback_data: `onboarding_${session.activation_id}`,
+    }]);
+  }
 
-  // Añadir fila extra para crear licencia
-  keyboard.push([
-    { text: "➕ Crear licencia", callback_data: "create_license" },
-  ]);
+  keyboard.push([{ text: "➕ Crear licencia", callback_data: "create_license" }]);
 
   await bot.sendMessage(
     msg.chat.id,
-    `📊 PANEL ADMIN\n\n🟢 Activas: ${activeCount}\n👥 Total: ${clients.length}\n\nSelecciona un cliente:`,
-    {
-      reply_markup: {
-        inline_keyboard: keyboard,
-      },
-    }
+    `📊 PANEL ADMIN\n\n🟢 Activas: ${activeCount}\n👥 Clientes: ${safeClients.length}\n🟡 Pre-registros: ${pending.length}`,
+    { reply_markup: { inline_keyboard: keyboard } }
   );
 });
 
@@ -251,6 +260,27 @@ bot.on("callback_query", async (query) => {
       .eq("id", id);
 
     await bot.answerCallbackQuery(query.id, { text: "Estado actualizado" });
+    return;
+  }
+
+  // Ver detalle de una sesión de onboarding / pre-registro
+  if (data.startsWith("onboarding_")) {
+    const activationId = data.replace("onboarding_", "");
+    const { data: session } = await supabase
+      .from("license_activation_sessions")
+      .select("*")
+      .eq("activation_id", activationId)
+      .single();
+
+    if (!session) return bot.answerCallbackQuery(query.id, { text: "Sesión no encontrada" });
+
+    const messageText = `🟡 PRE-REGISTRO\n\n📱 Teléfono: ${session.phone_number || "No definido"}\n📲 Device ID: ${session.device_id || "No registrado"}\n🆔 Activation ID: ${session.activation_id || "No definido"}\n🔐 Secret almacenado: ${session.activation_secret_encrypted ? "Sí" : "No"}\n📌 Estado: ${session.status || "—"}\n🕒 Creado: ${session.created_at ? new Date(session.created_at).toLocaleString() : "—"}\n⏱ Pago iniciado: ${session.payment_started_at ? new Date(session.payment_started_at).toLocaleString() : "—"}\n⌛ Vence pago: ${session.payment_deadline_at ? new Date(session.payment_deadline_at).toLocaleString() : "—"}`;
+
+    await bot.editMessageText(messageText, {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: [[{ text: "⬅️ Volver", callback_data: "back_panel" }]] },
+    });
     return;
   }
 
