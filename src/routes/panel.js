@@ -24,6 +24,12 @@ router.use('/api', (req, res, next) => {
   adminAuth(req, res, next)
 })
 
+// Explicit panel authentication endpoint used by the web UI.
+// It is behind adminAuth, so a successful response proves the password is accepted.
+router.get('/api/auth/check', (req, res) => {
+  res.json({ ok: true, authenticated: true })
+})
+
 // ── Clients CRUD ──────────────────────────────────────────────────────────────
 
 const ONBOARDING_CLIENT_PREFIX = 'onboarding:'
@@ -809,27 +815,53 @@ let SECRET = ''
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 async function login() {
-  const s = document.getElementById('sec-in').value.trim()
+  const input = document.getElementById('sec-in')
+  const btn = document.querySelector('#login .btn-primary')
   const err = document.getElementById('login-err')
-  if (!s) return
+  const s = input.value.trim()
+  if (!s) {
+    err.textContent='Introduce la contraseña de administrador'
+    err.style.display='block'
+    return
+  }
 
   err.style.display='none'
   SECRET = s
+  if (btn) { btn.disabled = true; btn.textContent = 'Comprobando…' }
+
   try {
-    const r = await api('/clients')
-    if (r.error) {
-      err.textContent = r.error.includes('sin contraseña') ? 'El servidor no tiene contraseña de panel configurada' : 'Clave incorrecta'
+    const r = await fetch('/panel/api/auth/check', {
+      method: 'GET',
+      headers: { 'x-admin-secret': SECRET, 'Accept': 'application/json' },
+      cache: 'no-store'
+    })
+
+    let body = {}
+    try { body = await r.json() } catch (_) {}
+
+    if (!r.ok || !body.ok) {
+      if (r.status === 503 || body.error === 'Panel admin sin contraseña configurada') {
+        err.textContent = 'El servidor no tiene contraseña de panel configurada'
+      } else if (r.status === 401 || r.status === 403) {
+        err.textContent = 'Clave incorrecta'
+      } else {
+        err.textContent = body.error || ('Error del servidor (' + r.status + ')')
+      }
       err.style.display='block'
       SECRET=''
       return
     }
+
     document.getElementById('login').style.display='none'
     document.getElementById('dash').style.display='block'
-    loadAll()
+    await loadAll()
   } catch (e) {
+    console.error('Error de login:', e)
     err.textContent='No se pudo conectar con el servidor'
     err.style.display='block'
     SECRET=''
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Acceder →' }
   }
 }
 function logout() {
@@ -844,9 +876,16 @@ document.getElementById('sec-in').addEventListener('keydown', e => { if(e.key===
 async function api(path, opts={}) {
   const r = await fetch('/panel/api'+path, {
     ...opts,
+    cache: 'no-store',
     headers:{'Content-Type':'application/json','x-admin-secret':SECRET,...(opts.headers||{})}
   })
-  return r.json()
+  const text = await r.text()
+  let data = {}
+  try { data = text ? JSON.parse(text) : {} } catch (_) {
+    data = { error: text || ('HTTP ' + r.status) }
+  }
+  if (!r.ok && !data.error) data.error = 'HTTP ' + r.status
+  return data
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
