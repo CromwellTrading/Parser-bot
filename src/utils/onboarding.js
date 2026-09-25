@@ -23,14 +23,16 @@ function getLicenseConfig() {
   const amount = envNumber('LICENSE_PRICE_AMOUNT', null)
   const durationDays = envNumber('LICENSE_DURATION_DAYS', 30)
   const paymentCard = normalizeCard(process.env.LICENSE_PAYMENT_CARD || '')
+  const paymentPhone = normalizeRegisteredPhone(process.env.LICENSE_PAYMENT_PHONE || '')
   const currency = String(process.env.LICENSE_PRICE_CURRENCY || 'CUP').trim().toUpperCase()
 
   return {
     amount,
     durationDays: durationDays > 0 ? durationDays : 30,
     paymentCard,
+    paymentPhone,
     currency,
-    configured: amount !== null && Boolean(paymentCard),
+    configured: amount !== null && Boolean(paymentCard) && Boolean(paymentPhone),
   }
 }
 
@@ -108,7 +110,7 @@ function senderMatchesSession(parsed, sessionPhone) {
 function evaluateLicensePayment(parsed, session, config = getLicenseConfig()) {
   const reasons = []
   if (!config.configured) {
-    return { matched: false, reason: 'LICENSE_PAYMENT_CONFIG_MISSING', reasons: ['Configura LICENSE_PRICE_AMOUNT, LICENSE_PRICE_CURRENCY y LICENSE_PAYMENT_CARD'] }
+    return { matched: false, reason: 'LICENSE_PAYMENT_CONFIG_MISSING', reasons: ['Configura LICENSE_PRICE_AMOUNT, LICENSE_PRICE_CURRENCY, LICENSE_PAYMENT_CARD y LICENSE_PAYMENT_PHONE'] }
   }
 
   // Algunos formatos del parser usan `amount` como gasto total (transferencia + comisión)
