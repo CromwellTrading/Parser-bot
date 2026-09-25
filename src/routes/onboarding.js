@@ -14,6 +14,7 @@ const {
 } = require('../utils/onboarding')
 const { bot, ADMINS } = require('../telegram')
 const { evaluateActivationTiming } = require('../utils/onboarding')
+const { encryptActivationSecret } = require('../utils/activationSecretVault')
 
 const SESSION_TTL_HOURS = Number(process.env.ACTIVATION_SESSION_TTL_HOURS || 24)
 const MAX_BOOTSTRAP_SMS_AGE_MS = Number(process.env.ACTIVATION_MAX_SMS_AGE_MS || 2 * 60 * 60 * 1000)
@@ -176,6 +177,7 @@ router.post('/register', async (req, res) => {
       .insert({
         activation_id: activationId,
         secret_hash: secretHash,
+        activation_secret_encrypted: encryptActivationSecret(activationSecret),
         phone_number: phoneNumber,
         device_id: deviceId,
         status: 'READY_TO_PAY',
