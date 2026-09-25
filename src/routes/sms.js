@@ -4,7 +4,7 @@ const crypto = require('crypto')
 const supabase = require('../supabase')
 const { bot, ADMINS } = require('../telegram');
 const { verifySignature } = require('../utils/hmac')
-const { parseSms } = require('../utils/parser')
+const { parseSms, normalizePhone } = require('../utils/parser')
 
 function digestFallback(sender, body, receivedAt, token) {
   return crypto
@@ -83,7 +83,7 @@ router.post('/ingest', async (req, res) => {
     const signature = req.headers['x-signature']
     if (!signature) return res.status(401).json({ error: 'Firma requerida' })
 
-    const { sender, body, receivedAt, token, messageId, smsId, deviceId } = req.body || {}
+    const { sender, body, receivedAt, token, messageId, smsId, deviceId, phone_number: phoneNumber } = req.body || {}
     if (!sender || !body || !receivedAt || !token) {
       return res.status(400).json({ error: 'Datos incompletos' })
     }
@@ -107,7 +107,7 @@ router.post('/ingest', async (req, res) => {
     // ============================================================
     const { data: client, error: clientError } = await supabase
       .from('clients')
-      .select('id, name, token, active, token_used, device_id, expires_at, webhook_url, webhook_url_2, webhook_url_3')
+      .select('id, name, token, active, token_used, device_id, phone_number, wallet, card1, card2, card3, expires_at, webhook_url, webhook_url_2, webhook_url_3')
       .eq('token', token)
       .maybeSingle()
 
@@ -142,6 +142,11 @@ router.post('/ingest', async (req, res) => {
       return res.status(403).json({ error: 'Dispositivo no autorizado' })
     }
 
+    if (client.phone_number && phoneNumber && normalizePhone(client.phone_number) !== normalizePhone(phoneNumber)) {
+      console.log(`❌ Teléfono no autorizado para cliente: ${client.name}`);
+      return res.status(403).json({ error: 'Teléfono no autorizado' })
+    }
+
     // ============================================================
     // 5️⃣ Verificar firma
     // ============================================================
@@ -153,7 +158,7 @@ router.post('/ingest', async (req, res) => {
     // ============================================================
     // 6️⃣ Parsear el SMS
     // ============================================================
-    const parsed = parseSms(sender, body)
+    const parsed = parseSms(sender, body, receivedAt)
     const receivedIso = new Date(receivedAt).toISOString()
     const smsHash = messageId || smsId || digestFallback(sender, body, receivedIso, token)
 
