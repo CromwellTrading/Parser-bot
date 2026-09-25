@@ -206,6 +206,19 @@ router.delete('/api/clients/:id', async (req, res) => {
   }
 });
 
+router.get('/api/activations', async (req, res) => {
+  const { status, limit = 100 } = req.query
+  let query = supabase
+    .from('license_activation_sessions')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(Math.min(parseInt(limit) || 100, 250))
+  if (status) query = query.eq('status', status)
+  const { data, error } = await query
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data)
+})
+
 router.get('/api/logs', async (req, res) => {
   const { client_id, limit = 50 } = req.query
   let query = supabase
