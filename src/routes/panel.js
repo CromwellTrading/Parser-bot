@@ -3,6 +3,7 @@ const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
 const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
+const { decryptActivationSecret } = require('../utils/activationSecretVault')
 
 router.get('/', (req, res) => res.send(PANEL_HTML))
 
@@ -24,6 +25,100 @@ router.use('/api', (req, res, next) => {
 })
 
 // ── Clients CRUD ──────────────────────────────────────────────────────────────
+
+router.get('/api/clients/:id/details', async (req, res) => {
+  try {
+    const { data: client, error: clientError } = await supabase
+      .from('clients')
+      .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret')
+      .eq('id', req.params.id)
+      .maybeSingle()
+
+    if (clientError) throw clientError
+    if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
+
+    let session = null
+    if (client.id) {
+      const { data, error } = await supabase
+        .from('license_activation_sessions')
+        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted')
+        .eq('client_id', client.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (error) throw error
+      session = data || null
+    }
+
+    // Compatibility for older clients whose session was not linked to client_id.
+    if (!session && client.phone_number && client.device_id) {
+      const { data, error } = await supabase
+        .from('license_activation_sessions')
+        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted')
+        .eq('phone_number', client.phone_number)
+        .eq('device_id', client.device_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (error) throw error
+      session = data || null
+    }
+
+    let activationSecret = null
+    let activationSecretError = null
+    if (session?.activation_secret_encrypted) {
+      try {
+        activationSecret = decryptActivationSecret(session.activation_secret_encrypted)
+      } catch (error) {
+        activationSecretError = 'No se pudo descifrar la credencial. Verifica ACTIVATION_SECRET_ENCRYPTION_KEY.'
+      }
+    }
+
+    let payment = null
+    if (session?.activation_id) {
+      const { data, error } = await supabase
+        .from('license_payments')
+        .select('id, activation_id, client_id, sender, amount, currency, transaction_id, transaction_at, received_at, status, reason, created_at, parsed')
+        .eq('activation_id', session.activation_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (error) throw error
+      payment = data || null
+    }
+
+    res.json({
+      client,
+      activation: session ? {
+        activation_id: session.activation_id,
+        phone_number: session.phone_number,
+        device_id: session.device_id,
+        status: session.status,
+        client_id: session.client_id || null,
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+        paid_at: session.paid_at || null,
+        payment_started_at: session.payment_started_at || null,
+        payment_deadline_at: session.payment_deadline_at || null,
+        confirmation_deadline_at: session.confirmation_deadline_at || null,
+        last_payment_reason: session.last_payment_reason || null,
+        activation_secret: activationSecret,
+        activation_secret_available: Boolean(session.activation_secret_encrypted),
+        activation_secret_error: activationSecretError,
+      } : null,
+      payment,
+      payment_config: {
+        amount: process.env.LICENSE_PRICE_AMOUNT ? Number(process.env.LICENSE_PRICE_AMOUNT) : null,
+        currency: String(process.env.LICENSE_PRICE_CURRENCY || 'CUP').trim().toUpperCase(),
+        card: String(process.env.LICENSE_PAYMENT_CARD || '').trim() || null,
+        confirmation_phone: String(process.env.LICENSE_PAYMENT_PHONE || '').trim() || null,
+      },
+    })
+  } catch (error) {
+    console.error('Error en detalles de cliente:', error)
+    res.status(500).json({ error: 'Error obteniendo detalles: ' + error.message })
+  }
+})
 
 router.get('/api/clients', async (req, res) => {
   const { data, error } = await supabase
@@ -414,6 +509,14 @@ tr:hover td{background:#ffffff04}
   cursor:pointer;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .token-cell:hover{color:var(--text)}
 .acts{display:flex;gap:6px;flex-wrap:wrap}
+.client-search{max-width:420px;margin-bottom:14px}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}
+.detail-item{background:var(--bg);border:1px solid var(--border);padding:11px 12px;border-radius:4px;min-width:0}
+.detail-item.full{grid-column:1 / -1}
+.detail-key{font-size:8px;letter-spacing:1.5px;color:var(--muted);font-family:'Space Mono',monospace;text-transform:uppercase;margin-bottom:5px}
+.detail-val{font-size:11px;color:var(--text2);font-family:'Space Mono',monospace;word-break:break-word}
+.detail-val.secret{color:#7ee787}
+@media(max-width:600px){.detail-grid{grid-template-columns:1fr}.detail-item.full{grid-column:auto}}
 
 /* MODAL */
 .modal-bg{position:fixed;inset:0;background:#000000cc;display:flex;align-items:center;
@@ -512,6 +615,8 @@ tr:hover td{background:#ffffff04}
   </div>
 </div>
 
+      <input class="client-search" id="client-search" placeholder="Buscar por nombre, teléfono, cuenta o device ID…" oninput="filterClients()" />
+
       <div class="tbl-wrap">
         <table>
           <thead><tr>
@@ -609,12 +714,21 @@ async function api(path, opts={}) {
 // ── Load ──────────────────────────────────────────────────────────────────────
 async function loadAll() { await Promise.all([loadClients(), loadLogs()]) }
 
+let CLIENTS = []
+
 async function loadClients() {
   const clients = await api('/clients')
   if (!Array.isArray(clients)) return
+  CLIENTS = clients
   document.getElementById('s-total').textContent = clients.length
   document.getElementById('s-active').textContent = clients.filter(c=>c.active).length
   renderClients(clients)
+}
+
+function filterClients() {
+  const q = (document.getElementById('client-search')?.value || '').trim().toLowerCase()
+  if (!q) return renderClients(CLIENTS)
+  renderClients(CLIENTS.filter(c => [c.name, c.phone_number, c.wallet, c.card1, c.card2, c.card3, c.device_id, c.id].filter(Boolean).some(v => String(v).toLowerCase().includes(q))))
 }
 
 async function loadLogs() {
@@ -642,7 +756,7 @@ function renderClients(clients) {
           <button class="btn btn-sm \${c.active?'btn-red':'btn-green'}" onclick="toggle('\${c.id}')">\${c.active?'Desactivar':'Activar'}</button>
           <button class="btn btn-sm btn-blue" onclick="openWebhooks(\${JSON.stringify(c).replace(/"/g,'&quot;')})">Webhooks</button>
           <button class="btn btn-sm btn-purple" onclick="renewToken('\${c.id}','\${c.name}')">↺ Token</button>
-          <button class="btn btn-sm btn-blue" onclick="showInfo(\${JSON.stringify(c).replace(/"/g,'&quot;')})">Info</button>
+          <button class="btn btn-sm btn-blue" onclick="showInfo('\${c.id}')">Detalles</button>
           <button class="btn btn-sm btn-red" onclick="deleteClient('\${c.id}','\${c.name}')">Eliminar</button>
         </div>
       </td>
@@ -686,23 +800,57 @@ async function deleteClient(id, name) {
   loadClients()
 }
 
-function showInfo(c) {
-  document.getElementById('info-name').textContent = c.name
+async function showInfo(id) {
+  document.getElementById('info-name').textContent = 'Cargando detalles…'
+  document.getElementById('info-body').innerHTML = '<div class="loading">Cargando…</div>'
+  document.getElementById('info-modal').classList.add('open')
+
+  const data = await api('/clients/' + id + '/details')
+  if (data.error) {
+    document.getElementById('info-name').textContent = 'Error'
+    document.getElementById('info-body').textContent = data.error
+    return
+  }
+
+  const c = data.client || {}
+  const a = data.activation || {}
+  const p = data.payment || {}
+  const cfg = data.payment_config || {}
   const cards = [c.card1, c.card2, c.card3].filter(Boolean)
   const roleLabel = c.role === 'admin' ? 'Administrador' : 'Cliente'
+  const fmt = v => v ? new Date(v).toLocaleString('es') : '—'
+  const secretText = a.activation_secret || (a.activation_secret_error ? a.activation_secret_error : (a.activation_secret_available ? 'Disponible, pero no se pudo recuperar' : 'No disponible (sesión antigua)'))
+
+  document.getElementById('info-name').textContent = c.name || 'Cliente'
   document.getElementById('info-body').innerHTML = \`
-    <div>👤 Rol: \${roleLabel}</div>
-    <div>📱 Monedero: \${c.wallet || c.phone_number || '—'}</div>
-    <div>💳 Tarjetas: \${cards.length ? cards.join(', ') : '—'}</div>
-    <div>🔗 Webhook 1: \${c.webhook_url || '—'}</div>
-    <div>🔗 Webhook 2: \${c.webhook_url_2 || '—'}</div>
-    <div>🔗 Webhook 3: \${c.webhook_url_3 || '—'}</div>
-    <div>🔐 Webhook Secret: \${c.webhook_secret || 'No generado'}</div>
-    <div>🆔 Dispositivo: \${c.device_id || '—'}</div>
-    <div>📅 Creado: \${new Date(c.created_at).toLocaleString('es')}</div>
-    <div>⏳ Vence: \${c.expires_at ? new Date(c.expires_at).toLocaleDateString('es') : 'Sin límite'}</div>
+    <div class="detail-grid">
+      <div class="detail-item"><div class="detail-key">Teléfono registrado</div><div class="detail-val">\${c.phone_number || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Device ID</div><div class="detail-val">\${c.device_id || a.device_id || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Activation ID</div><div class="detail-val">\${a.activation_id || '—'}</div></div>
+      <div class="detail-item full"><div class="detail-key">Activation Secret</div><div class="detail-val secret">\${secretText}</div><div style="margin-top:8px"><button class="btn btn-sm btn-green" onclick="copyValue(\${JSON.stringify(a.activation_secret || '').replace(/"/g, '&quot;')}, 'Activation Secret')" \${a.activation_secret ? '' : 'disabled'}>📋 Copiar secret</button></div></div>
+      <div class="detail-item"><div class="detail-key">Estado activación</div><div class="detail-val">\${a.status || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Cliente ID</div><div class="detail-val">\${c.id || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Token</div><div class="detail-val">\${c.token || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Token usado</div><div class="detail-val">\${c.token_used ? 'Sí' : 'No'}</div></div>
+      <div class="detail-item"><div class="detail-key">Pago iniciado</div><div class="detail-val">\${fmt(a.payment_started_at)}</div></div>
+      <div class="detail-item"><div class="detail-key">Vencimiento pago</div><div class="detail-val">\${fmt(a.payment_deadline_at)}</div></div>
+      <div class="detail-item"><div class="detail-key">Fin gracia</div><div class="detail-val">\${fmt(a.confirmation_deadline_at)}</div></div>
+      <div class="detail-item"><div class="detail-key">Pago confirmado</div><div class="detail-val">\${fmt(a.paid_at)}</div></div>
+      <div class="detail-item"><div class="detail-key">Tarjeta 1</div><div class="detail-val">\${c.card1 || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Tarjeta 2 / 3</div><div class="detail-val">\${[c.card2,c.card3].filter(Boolean).join(' · ') || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Monedero</div><div class="detail-val">\${c.wallet || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Número a confirmar</div><div class="detail-val">\${cfg.confirmation_phone || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Tarjeta receptora</div><div class="detail-val">\${cfg.card || '—'}</div></div>
+      <div class="detail-item"><div class="detail-key">Precio licencia</div><div class="detail-val">\${cfg.amount || '—'} \${cfg.currency || ''}</div></div>
+      <div class="detail-item"><div class="detail-key">Último pago</div><div class="detail-val">\${p.status || '—'} · \${p.amount || '—'} \${p.currency || ''}</div></div>
+      <div class="detail-item full"><div class="detail-key">TX / motivo</div><div class="detail-val">\${p.transaction_id || '—'} \${p.reason ? ' · ' + p.reason : ''}</div></div>
+      <div class="detail-item full"><div class="detail-key">Webhooks</div><div class="detail-val">1: \${c.webhook_url || '—'}<br>2: \${c.webhook_url_2 || '—'}<br>3: \${c.webhook_url_3 || '—'}</div></div>
+      <div class="detail-item full"><div class="detail-key">WebHook Secret</div><div class="detail-val">\${c.webhook_secret || 'No generado'}</div></div>
+      <div class="detail-item"><div class="detail-key">Creado</div><div class="detail-val">\${fmt(c.created_at)}</div></div>
+      <div class="detail-item"><div class="detail-key">Expira licencia</div><div class="detail-val">\${fmt(c.expires_at)}</div></div>
+      <div class="detail-item full"><div class="detail-key">Último motivo de pago</div><div class="detail-val">\${a.last_payment_reason || '—'}</div></div>
+    </div>
   \`
-  document.getElementById('info-modal').classList.add('open')
 }
 
 // ── Webhooks modal ────────────────────────────────────────────────────────────
@@ -771,6 +919,13 @@ function toggleForm() { document.getElementById('new-form').classList.toggle('op
 function copyT(t, notify=true) {
   navigator.clipboard.writeText(t)
   if (notify) toast('Token copiado')
+}
+
+function copyValue(value, label='Valor') {
+  if (!value) return
+  navigator.clipboard.writeText(value)
+    .then(()=>toast(label+' copiado'))
+    .catch(()=>toast('No se pudo copiar', true))
 }
 
 function toast(msg, isErr=false) {
