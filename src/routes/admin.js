@@ -2,10 +2,12 @@ const express = require('express')
 const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
+const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
 
 function adminAuth(req, res, next) {
   const secret = req.headers['x-admin-secret']
-  if (secret !== process.env.ADMIN_SECRET) {
+  if (!secretsMatch(secret)) {
+    if (!getConfiguredAdminSecret()) return res.status(503).json({ error: 'Panel admin sin contraseña configurada' })
     return res.status(401).json({ error: 'No autorizado' })
   }
   next()
@@ -61,15 +63,30 @@ router.post('/clients', async (req, res) => {
 router.put('/clients/:id/toggle', async (req, res) => {
   const { data: client, error: fetchError } = await supabase
     .from('clients')
-    .select('active, name')
+    .select('id, active, token, name')
     .eq('id', req.params.id)
     .single()
 
   if (fetchError || !client) return res.status(404).json({ error: 'Cliente no encontrado' })
 
+  const nowActive = !client.active
+
+  if (!nowActive && client.token) {
+    await supabase.from('token_blacklist').delete().eq('token', client.token)
+    const { error: blacklistError } = await supabase
+      .from('token_blacklist')
+      .insert({ token: client.token, client_id: client.id, reason: 'SUSPENDED_BY_ADMIN', invalidated_at: new Date().toISOString() })
+    if (blacklistError) return res.status(500).json({ error: 'No se pudo revocar el token' })
+  }
+
+  if (nowActive && client.token) {
+    const { error: restoreError } = await supabase.from('token_blacklist').delete().eq('token', client.token)
+    if (restoreError) return res.status(500).json({ error: 'No se pudo restaurar el token' })
+  }
+
   const { data, error } = await supabase
     .from('clients')
-    .update({ active: !client.active })
+    .update({ active: nowActive })
     .eq('id', req.params.id)
     .select()
     .single()
@@ -101,13 +118,25 @@ router.put('/clients/:id/profile', async (req, res) => {
 })
 
 router.put('/clients/:id/renew-token', async (req, res) => {
+  const { data: client, error: fetchError } = await supabase
+    .from('clients').select('id, name, token, role').eq('id', req.params.id).single()
+  if (fetchError || !client) return res.status(404).json({ error: 'Cliente no encontrado' })
+
+  if (client.token) {
+    await supabase.from('token_blacklist').delete().eq('token', client.token)
+    const { error: blacklistError } = await supabase
+      .from('token_blacklist')
+      .insert({ token: client.token, client_id: client.id, reason: 'TOKEN_RENEWED', invalidated_at: new Date().toISOString() })
+    if (blacklistError) return res.status(500).json({ error: 'No se pudo invalidar el token anterior' })
+  }
+
   const newToken = crypto.randomBytes(32).toString('hex')
   const expiresInDays = Number.isFinite(Number(req.body?.expires_in_days)) ? Number(req.body.expires_in_days) : 30
-  const expiresAt = req.body?.expires_at || new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString()
+  const expiresAt = client.role === 'admin' ? null : (req.body?.expires_at || new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString())
 
   const { data, error } = await supabase
     .from('clients')
-    .update({ token: newToken, token_used: false, device_id: null, expires_at: expiresAt })
+    .update({ token: newToken, token_used: false, device_id: null, expires_at: expiresAt, active: true })
     .eq('id', req.params.id)
     .select()
     .single()
@@ -117,43 +146,27 @@ router.put('/clients/:id/renew-token', async (req, res) => {
   res.json(data)
 })
 
-router.delete('/clients/:id', async (req, res) => {  // ← RUTA CORREGIDA
+router.delete('/clients/:id', async (req, res) => {
   try {
-    // 1. Obtener el token del cliente
-    const { data: client } = await supabase
-      .from('clients')
-      .select('token')
-      .eq('id', req.params.id)
-      .single();
+    const { data: client, error: fetchError } = await supabase
+      .from('clients').select('id, token, name').eq('id', req.params.id).single();
+    if (fetchError || !client) return res.status(404).json({ error: 'Cliente no encontrado' });
 
-    // 2. Invalidar el token (guardarlo en blacklist)
-    if (client?.token) {
+    if (client.token) {
+      await supabase.from('token_blacklist').delete().eq('token', client.token);
       const { error: blacklistError } = await supabase
         .from('token_blacklist')
-        .insert({ token: client.token, invalidated_at: new Date().toISOString() });
-      
-      if (blacklistError) {
-        console.error('Error al invalidar token:', blacklistError);
-      } else {
-        console.log(`✅ Token invalidado para cliente ${req.params.id}`);
-      }
+        .insert({ token: client.token, client_id: client.id, reason: 'CLIENT_DELETED', invalidated_at: new Date().toISOString() });
+      if (blacklistError) throw blacklistError;
     }
 
-    // 3. Eliminar logs del cliente
-    await supabase
-      .from('sms_logs')
-      .delete()
-      .eq('client_id', req.params.id);
+    const { error: logsError } = await supabase.from('sms_logs').delete().eq('client_id', req.params.id);
+    if (logsError) throw logsError;
 
-    // 4. Eliminar el cliente
-    const { error: deleteError } = await supabase
-      .from('clients')
-      .delete()
-      .eq('id', req.params.id);
-
+    const { error: deleteError } = await supabase.from('clients').delete().eq('id', req.params.id);
     if (deleteError) throw deleteError;
 
-    console.log(`✅ Cliente ${req.params.id} eliminado correctamente`);
+    console.log(`✅ Cliente ${client.name} eliminado correctamente y token invalidado`);
     res.json({ ok: true, message: 'Cliente eliminado y token invalidado' });
   } catch (error) {
     console.error('Error al eliminar cliente:', error);
