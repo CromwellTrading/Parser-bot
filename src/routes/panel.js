@@ -26,8 +26,136 @@ router.use('/api', (req, res, next) => {
 
 // ── Clients CRUD ──────────────────────────────────────────────────────────────
 
+const ONBOARDING_CLIENT_PREFIX = 'onboarding:'
+
+async function getPendingOnboardingClients() {
+  const { data, error } = await supabase
+    .from('license_activation_sessions')
+    .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason')
+    .is('client_id', null)
+    .in('status', ['READY_TO_PAY', 'WAITING_PAYMENT', 'WAITING_LATE_CONFIRMATION'])
+    .order('created_at', { ascending: false })
+    .limit(500)
+
+  if (error) throw error
+
+  return (data || []).map(session => ({
+    id: `${ONBOARDING_CLIENT_PREFIX}${session.activation_id}`,
+    name: `Cliente ${session.phone_number}`,
+    token: null,
+    active: false,
+    token_used: false,
+    webhook_url: null,
+    webhook_url_2: null,
+    webhook_url_3: null,
+    phone_number: session.phone_number,
+    card1: null,
+    card2: null,
+    card3: null,
+    wallet: null,
+    device_id: session.device_id,
+    created_at: session.created_at,
+    expires_at: null,
+    role: 'client',
+    webhook_secret: null,
+    pending_activation: true,
+    activation_status: session.status,
+    payment_started_at: session.payment_started_at || null,
+    payment_deadline_at: session.payment_deadline_at || null,
+    confirmation_deadline_at: session.confirmation_deadline_at || null,
+    last_payment_reason: session.last_payment_reason || null,
+  }))
+}
+
 router.get('/api/clients/:id/details', async (req, res) => {
   try {
+    const rawId = String(req.params.id || '')
+
+    // A phone registration exists first as an onboarding session.
+    // Show it in the admin panel before a real client/token is created.
+    if (rawId.startsWith(ONBOARDING_CLIENT_PREFIX)) {
+      const activationId = rawId.slice(ONBOARDING_CLIENT_PREFIX.length)
+      if (!activationId) return res.status(404).json({ error: 'Sesión de activación no encontrada' })
+
+      const { data: session, error: sessionError } = await supabase
+        .from('license_activation_sessions')
+        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted')
+        .eq('activation_id', activationId)
+        .maybeSingle()
+
+      if (sessionError) throw sessionError
+      if (!session) return res.status(404).json({ error: 'Sesión de activación no encontrada' })
+
+      let activationSecret = null
+      let activationSecretError = null
+      if (session.activation_secret_encrypted) {
+        try {
+          activationSecret = decryptActivationSecret(session.activation_secret_encrypted)
+        } catch (error) {
+          activationSecretError = 'No se pudo descifrar la credencial. Verifica ACTIVATION_SECRET_ENCRYPTION_KEY.'
+        }
+      }
+
+      let payment = null
+      const { data: paymentData, error: paymentError } = await supabase
+        .from('license_payments')
+        .select('id, activation_id, client_id, sender, amount, currency, transaction_id, transaction_at, received_at, status, reason, created_at, parsed')
+        .eq('activation_id', activationId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (paymentError) throw paymentError
+      payment = paymentData || null
+
+      return res.json({
+        client: {
+          id: null,
+          name: `Cliente ${session.phone_number}`,
+          token: null,
+          active: false,
+          token_used: false,
+          webhook_url: null,
+          webhook_url_2: null,
+          webhook_url_3: null,
+          phone_number: session.phone_number,
+          card1: null,
+          card2: null,
+          card3: null,
+          wallet: null,
+          device_id: session.device_id,
+          created_at: session.created_at,
+          expires_at: null,
+          role: 'client',
+          webhook_secret: null,
+          pending_activation: true,
+        },
+        activation: {
+          activation_id: session.activation_id,
+          phone_number: session.phone_number,
+          device_id: session.device_id,
+          status: session.status,
+          client_id: session.client_id || null,
+          created_at: session.created_at,
+          updated_at: session.updated_at,
+          paid_at: session.paid_at || null,
+          payment_started_at: session.payment_started_at || null,
+          payment_deadline_at: session.payment_deadline_at || null,
+          confirmation_deadline_at: session.confirmation_deadline_at || null,
+          last_payment_reason: session.last_payment_reason || null,
+          activation_secret: activationSecret,
+          activation_secret_available: Boolean(session.activation_secret_encrypted),
+          activation_secret_error: activationSecretError,
+        },
+        payment,
+        payment_config: {
+          amount: process.env.LICENSE_PRICE_AMOUNT ? Number(process.env.LICENSE_PRICE_AMOUNT) : null,
+          currency: String(process.env.LICENSE_PRICE_CURRENCY || 'CUP').trim().toUpperCase(),
+          card: String(process.env.LICENSE_PAYMENT_CARD || '').trim() || null,
+          confirmation_phone: String(process.env.LICENSE_PAYMENT_PHONE || '').trim() || null,
+        },
+      })
+    }
+
     const { data: client, error: clientError } = await supabase
       .from('clients')
       .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret')
@@ -121,13 +249,23 @@ router.get('/api/clients/:id/details', async (req, res) => {
 })
 
 router.get('/api/clients', async (req, res) => {
-  const { data, error } = await supabase
-    .from('clients')
-    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret')
-    .order('created_at', { ascending: false }); // <- sin coma, punto y coma
+  try {
+    const { data, error } = await supabase
+      .from('clients')
+      .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret')
+      .order('created_at', { ascending: false })
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+    if (error) throw error
+
+    const pending = await getPendingOnboardingClients()
+    const combined = [...(data || []), ...pending]
+      .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+
+    res.json(combined)
+  } catch (error) {
+    console.error('Error listando clientes/sesiones:', error)
+    res.status(500).json({ error: error.message })
+  }
 });
 
 router.post('/api/clients', async (req, res) => {
@@ -728,7 +866,7 @@ async function loadClients() {
 function filterClients() {
   const q = (document.getElementById('client-search')?.value || '').trim().toLowerCase()
   if (!q) return renderClients(CLIENTS)
-  renderClients(CLIENTS.filter(c => [c.name, c.phone_number, c.wallet, c.card1, c.card2, c.card3, c.device_id, c.id].filter(Boolean).some(v => String(v).toLowerCase().includes(q))))
+  renderClients(CLIENTS.filter(c => [c.name, c.phone_number, c.wallet, c.card1, c.card2, c.card3, c.device_id, c.id, c.activation_status].filter(Boolean).some(v => String(v).toLowerCase().includes(q))))
 }
 
 async function loadLogs() {
@@ -741,27 +879,48 @@ async function loadLogs() {
 function renderClients(clients) {
   const tb = document.getElementById('clients-tb')
   if (!clients.length) { tb.innerHTML='<tr><td colspan="7"><div class="empty">Sin clientes</div></td></tr>'; return }
-  tb.innerHTML = clients.map(c => {
-    const roleLabel = c.role === 'admin' ? 'Admin' : 'Cliente'
-    return \`
-    <tr>
-      <td><strong>\${c.name}</strong></td>
-      <td><span class="badge badge-role">\${roleLabel}</span></td>
-      <td><div class="token-cell" onclick="copyT('\${c.token}')" title="Click para copiar">\${c.token.slice(0,12)}...</div></td>
-      <td><span class="badge \${c.active?'badge-on':'badge-off'}">\${c.active?'● ACTIVO':'○ INACTIVO'}</span></td>
-      <td><span class="badge \${c.token_used?'badge-used':'badge-on'}">\${c.token_used?'EN USO':'LIBRE'}</span></td>
-      <td style="font-family:'Space Mono',monospace;font-size:11px;color:var(--muted)">\${new Date(c.created_at).toLocaleDateString('es')}</td>
-      <td>
-        <div class="acts">
-          <button class="btn btn-sm \${c.active?'btn-red':'btn-green'}" onclick="toggle('\${c.id}')">\${c.active?'Desactivar':'Activar'}</button>
-          <button class="btn btn-sm btn-blue" onclick="openWebhooks(\${JSON.stringify(c).replace(/"/g,'&quot;')})">Webhooks</button>
-          <button class="btn btn-sm btn-purple" onclick="renewToken('\${c.id}','\${c.name}')">↺ Token</button>
-          <button class="btn btn-sm btn-blue" onclick="showInfo('\${c.id}')">Detalles</button>
-          <button class="btn btn-sm btn-red" onclick="deleteClient('\${c.id}','\${c.name}')">Eliminar</button>
-        </div>
-      </td>
-    </tr>
-  \`}).join('')
+  tb.innerHTML = clients.map(function(c) {
+    const pending = c.pending_activation === true
+    const roleLabel = pending ? 'Pre-registro' : (c.role === 'admin' ? 'Admin' : 'Cliente')
+    const tokenText = c.token ? String(c.token).slice(0,12) + '...' : '—'
+    let statusText
+    if (pending) {
+      if (c.activation_status === 'WAITING_PAYMENT') statusText = '◌ ESPERANDO PAGO'
+      else if (c.activation_status === 'WAITING_LATE_CONFIRMATION') statusText = '◌ CONFIRMACIÓN TARDÍA'
+      else statusText = '◌ LISTO PARA PAGAR'
+    } else {
+      statusText = c.active ? '● ACTIVO' : '○ INACTIVO'
+    }
+
+    let actionButtons
+    if (pending) {
+      actionButtons = '<button class="btn btn-sm btn-blue" onclick="showInfo(\'' + c.id + '\')">Detalles</button>'
+    } else {
+      const activeClass = c.active ? 'btn-red' : 'btn-green'
+      const activeText = c.active ? 'Desactivar' : 'Activar'
+      const webhooks = JSON.stringify(c).replace(/"/g, '&quot;')
+      actionButtons =
+        '<button class="btn btn-sm ' + activeClass + '" onclick="toggle(\'' + c.id + '\')">' + activeText + '</button>' +
+        '<button class="btn btn-sm btn-blue" onclick="openWebhooks(' + webhooks + ')">Webhooks</button>' +
+        '<button class="btn btn-sm btn-purple" onclick="renewToken(\'' + c.id + '\',\'' + String(c.name || '').replace(/\'/g, '\\\'') + '\')">↺ Token</button>' +
+        '<button class="btn btn-sm btn-blue" onclick="showInfo(\'' + c.id + '\')">Detalles</button>' +
+        '<button class="btn btn-sm btn-red" onclick="deleteClient(\'' + c.id + '\',\'' + String(c.name || '').replace(/\'/g, '\\\'') + '\')">Eliminar</button>'
+    }
+
+    const tokenAttrs = c.token ? ' onclick="copyT(\'' + c.token + '\')" title="Click para copiar"' : ''
+    const tokenBadge = pending ? 'SIN TOKEN' : (c.token_used ? 'EN USO' : 'LIBRE')
+    const tokenBadgeClass = pending ? 'badge-off' : (c.token_used ? 'badge-used' : 'badge-on')
+
+    return '<tr>' +
+      '<td><strong>' + (c.name || '') + '</strong><div style="font-family:\'Space Mono\',monospace;font-size:10px;color:var(--muted);margin-top:3px">' + (c.phone_number || '') + '</div></td>' +
+      '<td><span class="badge badge-role">' + roleLabel + '</span></td>' +
+      '<td><div class="token-cell"' + tokenAttrs + '>' + tokenText + '</div></td>' +
+      '<td><span class="badge ' + (pending ? 'badge-off' : (c.active ? 'badge-on' : 'badge-off')) + '">' + statusText + '</span></td>' +
+      '<td><span class="badge ' + tokenBadgeClass + '">' + tokenBadge + '</span></td>' +
+      '<td style="font-family:\'Space Mono\',monospace;font-size:11px;color:var(--muted)">' + new Date(c.created_at).toLocaleDateString('es') + '</td>' +
+      '<td><div class="acts">' + actionButtons + '</div></td>' +
+      '</tr>'
+  }).join('')
 }
 
 async function createClient() {
