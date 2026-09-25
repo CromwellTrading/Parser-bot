@@ -60,6 +60,7 @@ function publicActivation(session, includeSecret = false) {
       amount: CONFIG.amount,
       currency: CONFIG.currency,
       card: CONFIG.paymentCard || null,
+      confirmation_phone: CONFIG.paymentPhone || null,
     },
   }
   if (includeSecret) result.activation_secret = includeSecret === true ? session.activation_secret : undefined
@@ -139,6 +140,7 @@ router.get('/config', (req, res) => {
       amount: CONFIG.amount,
       currency: CONFIG.currency,
       card: CONFIG.paymentCard || null,
+      confirmation_phone: CONFIG.paymentPhone || null,
       duration_days: CONFIG.durationDays,
       payment_window_ms: PAYMENT_WINDOW_MS,
       confirmation_grace_ms: CONFIRMATION_GRACE_MS,
