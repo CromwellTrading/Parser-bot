@@ -17,6 +17,7 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
 // Inicializar bot con polling
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 console.log("✅ Bot de Telegram iniciado");
+console.log("ℹ️ Activación automática gestionada por /api/onboarding");
 
 // ====================
 // UTILIDADES
