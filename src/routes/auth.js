@@ -6,6 +6,7 @@ const {
   publicClient,
   clientStatus,
 } = require('../utils/clientProfile')
+const { normalizePhone } = require('../utils/parser')
 
 function isExpired(expiresAt) {
   if (!expiresAt) return false
@@ -57,6 +58,10 @@ router.post('/verify', async (req, res) => {
     const deviceId = profile.device_id
     if (client.device_id && deviceId && client.device_id !== deviceId) {
       return res.status(403).json({ error: 'Token en uso', status: 'used', client: publicClient(client) })
+    }
+
+    if (client.phone_number && profile.phone_number && normalizePhone(client.phone_number) !== normalizePhone(profile.phone_number)) {
+      return res.status(403).json({ error: 'Teléfono no autorizado', status: 'phone_mismatch', client: publicClient(client) })
     }
 
     if (client.token_used && !deviceId && !client.device_id) {
@@ -114,6 +119,14 @@ router.put('/profile', async (req, res) => {
 
     if (client.device_id && profile.device_id && client.device_id !== profile.device_id) {
       return res.status(403).json({ error: 'Dispositivo no autorizado' })
+    }
+
+    if (client.device_id && !profile.device_id) {
+      return res.status(400).json({ error: 'Dispositivo requerido' })
+    }
+
+    if (client.phone_number && profile.phone_number && normalizePhone(client.phone_number) !== normalizePhone(profile.phone_number)) {
+      return res.status(403).json({ error: 'Teléfono no autorizado', status: 'phone_mismatch' })
     }
 
     const updated = await updateClient(client.id, profile)
