@@ -103,6 +103,12 @@ router.get('/api/auth/check', (req, res) => {
 
 const ONBOARDING_CLIENT_PREFIX = 'onboarding:'
 
+function isExpiredDate(expiresAt) {
+  if (!expiresAt) return false
+  const date = new Date(expiresAt)
+  return Number.isFinite(date.getTime()) && date < new Date()
+}
+
 async function getPendingOnboardingClients() {
   const { data, error } = await supabase
     .from('license_activation_sessions')
@@ -114,7 +120,23 @@ async function getPendingOnboardingClients() {
 
   if (error) throw error
 
-  return (data || []).map(session => ({
+  // No mostrar pre-registros que ya corresponden a un cliente activo y vigente.
+  // Esto evita que el panel presente el mismo teléfono como "pendiente" y "registrado".
+  const { data: activeClients, error: activeError } = await supabase
+    .from('clients')
+    .select('phone_number, active, expires_at')
+    .eq('role', 'client')
+    .eq('active', true)
+    .limit(1000)
+  if (activeError) throw activeError
+
+  const activePhones = new Set(
+    (activeClients || [])
+      .filter(client => client.phone_number && !isExpiredDate(client.expires_at))
+      .map(client => String(client.phone_number).trim())
+  )
+
+  return (data || []).filter(session => !activePhones.has(String(session.phone_number || '').trim())).map(session => ({
     id: `${ONBOARDING_CLIENT_PREFIX}${session.activation_id}`,
     name: `Cliente ${session.phone_number}`,
     token: null,
