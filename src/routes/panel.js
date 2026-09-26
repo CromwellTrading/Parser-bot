@@ -940,12 +940,23 @@ if (window.PANEL_AUTHENTICATED) { loadAll().catch(e => console.error('Error carg
 let CLIENTS = []
 
 async function loadClients() {
-  const clients = await api('/clients')
-  if (!Array.isArray(clients)) return
-  CLIENTS = clients
-  document.getElementById('s-total').textContent = clients.length
-  document.getElementById('s-active').textContent = clients.filter(c=>c.active).length
-  renderClients(clients)
+  try {
+    const clients = await api('/clients')
+    if (!Array.isArray(clients)) {
+      const msg = clients?.error || 'No se pudieron cargar los clientes'
+      document.getElementById('clients-tb').innerHTML = '<tr><td colspan="7"><div class="empty">' + escapeHtml(msg) + '</div></td></tr>'
+      document.getElementById('s-total').textContent = '—'
+      document.getElementById('s-active').textContent = '—'
+      return
+    }
+    CLIENTS = clients
+    document.getElementById('s-total').textContent = clients.length
+    document.getElementById('s-active').textContent = clients.filter(c=>c.active).length
+    renderClients(clients)
+  } catch (error) {
+    console.error('Error cargando clientes:', error)
+    document.getElementById('clients-tb').innerHTML = '<tr><td colspan="7"><div class="empty">Error cargando clientes</div></td></tr>'
+  }
 }
 
 function filterClients() {
@@ -955,19 +966,38 @@ function filterClients() {
 }
 
 async function loadLogs() {
-  const logs = await api('/logs?limit=100')
-  document.getElementById('s-sms').textContent = Array.isArray(logs) ? logs.length : '—'
-  renderLogs(logs)
+  try {
+    const logs = await api('/logs?limit=100')
+    document.getElementById('s-sms').textContent = Array.isArray(logs) ? logs.length : '—'
+    renderLogs(logs)
+  } catch (error) {
+    console.error('Error cargando logs:', error)
+    document.getElementById('s-sms').textContent = '—'
+    renderLogs([])
+  }
 }
 
 // ── Clients ───────────────────────────────────────────────────────────────────
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
 function renderClients(clients) {
   const tb = document.getElementById('clients-tb')
-  if (!clients.length) { tb.innerHTML='<tr><td colspan="7"><div class="empty">Sin clientes</div></td></tr>'; return }
+  if (!Array.isArray(clients) || !clients.length) {
+    tb.innerHTML='<tr><td colspan="7"><div class="empty">Sin clientes</div></td></tr>'
+    return
+  }
+
   tb.innerHTML = clients.map(function(c) {
     const pending = c.pending_activation === true
     const roleLabel = pending ? 'Pre-registro' : (c.role === 'admin' ? 'Admin' : 'Cliente')
     const tokenText = c.token ? String(c.token).slice(0,12) + '...' : '—'
+
     let statusText
     if (pending) {
       if (c.activation_status === 'WAITING_PAYMENT') statusText = '◌ ESPERANDO PAGO'
@@ -977,32 +1007,42 @@ function renderClients(clients) {
       statusText = c.active ? '● ACTIVO' : '○ INACTIVO'
     }
 
+    const id = escapeHtml(c.id)
+    const name = escapeHtml(c.name || '')
+    const phone = escapeHtml(c.phone_number || '')
+    const token = escapeHtml(c.token || '')
+    const role = escapeHtml(roleLabel)
+    const created = c.created_at ? new Date(c.created_at).toLocaleDateString('es') : '—'
+
     let actionButtons
     if (pending) {
-      actionButtons = '<button class="btn btn-sm btn-blue" onclick="showInfo(\'' + c.id + '\')">Detalles</button>'
+      actionButtons = '<button class="btn btn-sm btn-blue" data-id="' + id + '" onclick="showInfo(this.dataset.id)">Detalles</button>'
     } else {
       const activeClass = c.active ? 'btn-red' : 'btn-green'
       const activeText = c.active ? 'Desactivar' : 'Activar'
-      const webhooks = JSON.stringify(c).replace(/"/g, '&quot;')
       actionButtons =
-        '<button class="btn btn-sm ' + activeClass + '" onclick="toggle(\'' + c.id + '\')">' + activeText + '</button>' +
-        '<button class="btn btn-sm btn-blue" onclick="openWebhooks(' + webhooks + ')">Webhooks</button>' +
-        '<button class="btn btn-sm btn-purple" onclick="renewToken(\'' + c.id + '\',\'' + String(c.name || '').replace(/\'/g, '\\\'') + '\')">↺ Token</button>' +
-        '<button class="btn btn-sm btn-blue" onclick="showInfo(\'' + c.id + '\')">Detalles</button>' +
-        '<button class="btn btn-sm btn-red" onclick="deleteClient(\'' + c.id + '\',\'' + String(c.name || '').replace(/\'/g, '\\\'') + '\')">Eliminar</button>'
+        '<button class="btn btn-sm ' + activeClass + '" data-id="' + id + '" onclick="toggle(this.dataset.id)">' + activeText + '</button>' +
+        '<button class="btn btn-sm btn-blue" data-id="' + id + '" onclick="openWebhooksById(this.dataset.id)">Webhooks</button>' +
+        '<button class="btn btn-sm btn-purple" data-id="' + id + '" onclick="renewToken(this.dataset.id, this.dataset.name)" data-name="' + name + '">↺ Token</button>' +
+        '<button class="btn btn-sm btn-blue" data-id="' + id + '" onclick="showInfo(this.dataset.id)">Detalles</button>' +
+        '<button class="btn btn-sm btn-red" data-id="' + id + '" onclick="deleteClient(this.dataset.id, this.dataset.name)" data-name="' + name + '">Eliminar</button>'
     }
 
-    const tokenAttrs = c.token ? ' onclick="copyT(\'' + c.token + '\')" title="Click para copiar"' : ''
+    const tokenCell = c.token
+      ? '<div class="token-cell" data-token="' + token + '" onclick="copyT(this.dataset.token)" title="Click para copiar">' + tokenText + '</div>'
+      : '<div class="token-cell">—</div>'
+
     const tokenBadge = pending ? 'SIN TOKEN' : (c.token_used ? 'EN USO' : 'LIBRE')
     const tokenBadgeClass = pending ? 'badge-off' : (c.token_used ? 'badge-used' : 'badge-on')
+    const statusClass = pending ? 'badge-off' : (c.active ? 'badge-on' : 'badge-off')
 
     return '<tr>' +
-      '<td><strong>' + (c.name || '') + '</strong><div style="font-family:\'Space Mono\',monospace;font-size:10px;color:var(--muted);margin-top:3px">' + (c.phone_number || '') + '</div></td>' +
-      '<td><span class="badge badge-role">' + roleLabel + '</span></td>' +
-      '<td><div class="token-cell"' + tokenAttrs + '>' + tokenText + '</div></td>' +
-      '<td><span class="badge ' + (pending ? 'badge-off' : (c.active ? 'badge-on' : 'badge-off')) + '">' + statusText + '</span></td>' +
+      '<td><strong>' + name + '</strong><div style="font-family:Space Mono,monospace;font-size:10px;color:var(--muted);margin-top:3px">' + phone + '</div></td>' +
+      '<td><span class="badge badge-role">' + role + '</span></td>' +
+      '<td>' + tokenCell + '</td>' +
+      '<td><span class="badge ' + statusClass + '">' + escapeHtml(statusText) + '</span></td>' +
       '<td><span class="badge ' + tokenBadgeClass + '">' + tokenBadge + '</span></td>' +
-      '<td style="font-family:\'Space Mono\',monospace;font-size:11px;color:var(--muted)">' + new Date(c.created_at).toLocaleDateString('es') + '</td>' +
+      '<td style="font-family:Space Mono,monospace;font-size:11px;color:var(--muted)">' + escapeHtml(created) + '</td>' +
       '<td><div class="acts">' + actionButtons + '</div></td>' +
       '</tr>'
   }).join('')
@@ -1098,6 +1138,12 @@ async function showInfo(id) {
 }
 
 // ── Webhooks modal ────────────────────────────────────────────────────────────
+function openWebhooksById(id) {
+  const client = CLIENTS.find(x => String(x.id) === String(id))
+  if (!client) return toast('Cliente no encontrado', true)
+  openWebhooks(client)
+}
+
 function openWebhooks(c) {
   document.getElementById('wh-client-id').value = c.id
   document.getElementById('wh-1').value = c.webhook_url || ''
