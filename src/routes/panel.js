@@ -5,11 +5,80 @@ const supabase = require('../supabase')
 const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
 const { decryptActivationSecret } = require('../utils/activationSecretVault')
 
-router.get('/', (req, res) => res.send(PANEL_HTML))
+const ADMIN_SESSION_COOKIE = 'synthesisone_admin_session'
+const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000
+
+router.use(express.urlencoded({ extended: false }))
+
+function timingSafeHexMatch(a, b) {
+  try {
+    const aa = Buffer.from(String(a || ''), 'hex')
+    const bb = Buffer.from(String(b || ''), 'hex')
+    return aa.length > 0 && aa.length === bb.length && crypto.timingSafeEqual(aa, bb)
+  } catch (_) {
+    return false
+  }
+}
+
+function makeAdminSession(secret) {
+  const ts = Date.now().toString()
+  const mac = crypto.createHmac('sha256', secret).update(ts).digest('hex')
+  return `${ts}.${mac}`
+}
+
+function getAdminCookie(req) {
+  const raw = String(req.headers.cookie || '')
+  const part = raw.split(';').map(v => v.trim()).find(v => v.startsWith(ADMIN_SESSION_COOKIE + '='))
+  return part ? decodeURIComponent(part.slice(ADMIN_SESSION_COOKIE.length + 1)) : ''
+}
+
+function validAdminSession(req) {
+  const configured = getConfiguredAdminSecret()
+  if (!configured) return false
+  const value = getAdminCookie(req)
+  const [ts, mac] = value.split('.')
+  const timestamp = Number(ts)
+  if (!Number.isFinite(timestamp) || timestamp <= 0 || timestamp > Date.now() + 60 * 1000 || Date.now() - timestamp > ADMIN_SESSION_TTL_MS) return false
+  const expected = crypto.createHmac('sha256', configured).update(String(ts)).digest('hex')
+  return timingSafeHexMatch(mac, expected)
+}
+
+function panelHtml(req, loginError = '') {
+  const authenticated = validAdminSession(req)
+  let html = PANEL_HTML
+    .replace('<div id="login">', `<div id="login" style="display:${authenticated ? 'none' : 'flex'}">`)
+    .replace('<div id="dash">', `<div id="dash" style="display:${authenticated ? 'block' : 'none'}">`)
+    .replace('<div class="err" id="login-err"></div>', `<div class="err" id="login-err" style="${loginError ? 'display:block' : ''}">${loginError}</div>`)
+  const boot = `<script>window.PANEL_AUTHENTICATED=${authenticated ? 'true' : 'false'};</script>`
+  html = html.replace('</head>', boot + '</head>')
+  return html
+}
+
+router.get('/', (req, res) => res.send(panelHtml(req, String(req.query?.login || '') === 'error' ? 'Clave incorrecta' : '')))
+
+router.post('/login', (req, res) => {
+  const provided = String(req.body?.password || '').trim()
+  if (!getConfiguredAdminSecret()) return res.redirect('/panel?login=error')
+  if (!secretsMatch(provided)) return res.redirect('/panel?login=error')
+
+  const cookie = makeAdminSession(getConfiguredAdminSecret())
+  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https'
+  res.setHeader('Set-Cookie', `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(cookie)}; Max-Age=${Math.floor(ADMIN_SESSION_TTL_MS / 1000)}; Path=/panel; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`)
+  return res.redirect('/panel')
+})
+
+function clearAdminSession(res) {
+  res.setHeader('Set-Cookie', `${ADMIN_SESSION_COOKIE}=; Max-Age=0; Path=/panel; HttpOnly; SameSite=Lax`)
+  res.redirect('/panel')
+}
+
+router.post('/logout', (req, res) => clearAdminSession(res))
+router.get('/logout', (req, res) => clearAdminSession(res))
 
 function adminAuth(req, res, next) {
   const secret = req.headers['x-admin-secret']
-  if (!secretsMatch(secret)) {
+  if (secretsMatch(secret) || validAdminSession(req)) return next()
+  {
     if (!getConfiguredAdminSecret()) {
       return res.status(503).json({ error: 'Panel admin sin contraseña configurada' })
     }
@@ -706,9 +775,12 @@ tr:hover td{background:#ffffff04}
     <div class="logo">SYNTHESISONE</div>
     <h1>Panel Admin</h1>
     <p>Acceso restringido</p>
-    <input type="password" id="sec-in" placeholder="Clave de administrador" />
-    <button class="btn btn-primary" onclick="login()">Acceder →</button>
-    <div class="err" id="login-err">Clave incorrecta</div>
+    <form id="login-form" method="post" action="/panel/login" autocomplete="off">
+      <input type="password" id="sec-in" name="password" placeholder="Clave de administrador" autocomplete="current-password" />
+      <button type="submit" class="btn btn-primary" id="login-btn">Acceder →</button>
+    </form>
+    <div class="err" id="login-err"></div>
+    <div id="login-status" style="margin-top:10px;color:var(--muted);font-family:'Space Mono',monospace;font-size:11px;min-height:16px"></div>
   </div>
 </div>
 
@@ -814,63 +886,36 @@ tr:hover td{background:#ffffff04}
 let SECRET = ''
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-async function login() {
-  const input = document.getElementById('sec-in')
-  const btn = document.querySelector('#login .btn-primary')
-  const err = document.getElementById('login-err')
-  const s = input.value.trim()
-  if (!s) {
-    err.textContent='Introduce la contraseña de administrador'
-    err.style.display='block'
-    return
-  }
-
-  err.style.display='none'
-  SECRET = s
-  if (btn) { btn.disabled = true; btn.textContent = 'Comprobando…' }
-
-  try {
-    const r = await fetch('/panel/api/auth/check', {
-      method: 'GET',
-      headers: { 'x-admin-secret': SECRET, 'Accept': 'application/json' },
-      cache: 'no-store'
-    })
-
-    let body = {}
-    try { body = await r.json() } catch (_) {}
-
-    if (!r.ok || !body.ok) {
-      if (r.status === 503 || body.error === 'Panel admin sin contraseña configurada') {
-        err.textContent = 'El servidor no tiene contraseña de panel configurada'
-      } else if (r.status === 401 || r.status === 403) {
-        err.textContent = 'Clave incorrecta'
-      } else {
-        err.textContent = body.error || ('Error del servidor (' + r.status + ')')
+async function login(event) {
+  if (event) {
+    // Let the native POST /panel/login handle authentication. This works even if
+    // the WebView/browser blocks the JavaScript fetch path.
+    if (!event.submitter || event.submitter.type === 'submit') {
+      const input = document.getElementById('sec-in')
+      const err = document.getElementById('login-err')
+      const status = document.getElementById('login-status')
+      const s = String(input?.value || '').trim()
+      err.style.display = 'none'
+      err.textContent = ''
+      status.textContent = ''
+      if (!s) {
+        event.preventDefault()
+        err.textContent = 'Introduce la contraseña de administrador'
+        err.style.display = 'block'
+        return
       }
-      err.style.display='block'
-      SECRET=''
+      status.textContent = 'Comprobando…'
       return
     }
-
-    document.getElementById('login').style.display='none'
-    document.getElementById('dash').style.display='block'
-    await loadAll()
-  } catch (e) {
-    console.error('Error de login:', e)
-    err.textContent='No se pudo conectar con el servidor'
-    err.style.display='block'
-    SECRET=''
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Acceder →' }
   }
 }
+
 function logout() {
-  SECRET=''
-  document.getElementById('login').style.display='flex'
-  document.getElementById('dash').style.display='none'
-  document.getElementById('sec-in').value=''
+  window.location.href = '/panel/logout'
 }
-document.getElementById('sec-in').addEventListener('keydown', e => { if(e.key==='Enter') login() })
+
+const loginForm = document.getElementById('login-form')
+if (loginForm) loginForm.addEventListener('submit', login)
 
 // ── API ───────────────────────────────────────────────────────────────────────
 async function api(path, opts={}) {
@@ -890,6 +935,7 @@ async function api(path, opts={}) {
 
 // ── Load ──────────────────────────────────────────────────────────────────────
 async function loadAll() { await Promise.all([loadClients(), loadLogs()]) }
+if (window.PANEL_AUTHENTICATED) { loadAll().catch(e => console.error('Error cargando panel:', e)) }
 
 let CLIENTS = []
 
