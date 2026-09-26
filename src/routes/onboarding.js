@@ -198,18 +198,18 @@ router.post('/register', async (req, res) => {
     if (!deviceId) return res.status(400).json({ error: 'Dispositivo requerido' })
 
     // Reinstalación: si el teléfono ya tiene una licencia activa y vigente,
-    // recuperamos ese mismo cliente en lugar de crear otra compra/cliente.
-    // También actualizamos el device_id actual (por ejemplo, al pasar de debug a release)
-    // para que el mismo teléfono pueda recuperar su licencia después de reinstalar.
+    // solo se puede recuperar desde el MISMO device_id que quedó asociado al cliente.
+    // Importante: NO re-vinculamos automáticamente un dispositivo nuevo, porque conocer
+    // el número de teléfono por sí solo nunca debe ser suficiente para obtener el token.
     const existingClient = await findActiveClientByPhone(phoneNumber)
     if (existingClient) {
-      if (existingClient.device_id !== deviceId) {
-        const { error: rebindError } = await supabase
-          .from('clients')
-          .update({ device_id: deviceId })
-          .eq('id', existingClient.id)
-        if (rebindError) throw rebindError
-        existingClient.device_id = deviceId
+      if (!existingClient.device_id || existingClient.device_id !== deviceId) {
+        return res.status(409).json({
+          ok: false,
+          existing_active: true,
+          code: 'DEVICE_MISMATCH',
+          error: 'Este número ya tiene una licencia activa asociada a otro dispositivo. Por seguridad, no se puede recuperar solo con el número.',
+        })
       }
 
       const { data: pendingToExpire, error: pendingError } = await supabase
