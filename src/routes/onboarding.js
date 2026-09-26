@@ -89,6 +89,45 @@ async function updateSession(activationId, patch) {
   return data
 }
 
+async function findActiveClientByPhone(phoneNumber) {
+  const { data, error } = await supabase
+    .from('clients')
+    .select('id, name, token, active, token_used, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret, webhook_url, webhook_url_2, webhook_url_3')
+    .eq('phone_number', phoneNumber)
+    .eq('role', 'client')
+    .eq('active', true)
+    .order('created_at', { ascending: false })
+    .limit(10)
+
+  if (error) throw error
+
+  const valid = (data || []).filter(client => !isExpired(client.expires_at))
+  return valid[0] || null
+}
+
+function publicExistingClient(client) {
+  if (!client) return null
+  return {
+    id: client.id,
+    name: client.name,
+    token: client.token,
+    active: client.active,
+    token_used: client.token_used,
+    phone_number: client.phone_number,
+    card1: client.card1,
+    card2: client.card2,
+    card3: client.card3,
+    wallet: client.wallet,
+    device_id: client.device_id,
+    created_at: client.created_at,
+    expires_at: client.expires_at,
+    role: client.role,
+    webhook_url: client.webhook_url,
+    webhook_url_2: client.webhook_url_2,
+    webhook_url_3: client.webhook_url_3,
+  }
+}
+
 async function notifyAdmins(text) {
   for (const adminId of ADMINS) {
     try {
@@ -158,10 +197,44 @@ router.post('/register', async (req, res) => {
     if (!/^5\d{7}$/.test(phoneNumber)) return res.status(400).json({ error: 'Número de teléfono inválido' })
     if (!deviceId) return res.status(400).json({ error: 'Dispositivo requerido' })
 
-    // A phone number should have only one active pre-registration/payment session.
-    // This also handles uninstall/reinstall or re-registration from a new device ID
-    // without leaving two sessions (READY_TO_PAY + WAITING_PAYMENT) for the same phone.
-    // The newest registration becomes authoritative; older pending sessions are expired.
+    // Reinstalación: si el teléfono ya tiene una licencia activa y vigente,
+    // recuperamos ese mismo cliente en lugar de crear otra compra/cliente.
+    // También actualizamos el device_id actual (por ejemplo, al pasar de debug a release)
+    // para que el mismo teléfono pueda recuperar su licencia después de reinstalar.
+    const existingClient = await findActiveClientByPhone(phoneNumber)
+    if (existingClient) {
+      if (existingClient.device_id !== deviceId) {
+        const { error: rebindError } = await supabase
+          .from('clients')
+          .update({ device_id: deviceId })
+          .eq('id', existingClient.id)
+        if (rebindError) throw rebindError
+        existingClient.device_id = deviceId
+      }
+
+      const { data: pendingToExpire, error: pendingError } = await supabase
+        .from('license_activation_sessions')
+        .select('activation_id, status')
+        .eq('phone_number', phoneNumber)
+        .is('client_id', null)
+        .in('status', ['READY_TO_PAY', 'WAITING_PAYMENT', 'WAITING_LATE_CONFIRMATION'])
+      if (pendingError) throw pendingError
+      for (const item of pendingToExpire || []) {
+        await updateSession(item.activation_id, {
+          status: 'EXPIRED',
+          last_payment_reason: 'ACTIVE_CLIENT_ALREADY_REGISTERED',
+        })
+      }
+
+      return res.status(200).json({
+        ok: true,
+        existing_active: true,
+        message: 'Licencia activa recuperada; no se creó una nueva activación.',
+        client: publicExistingClient(existingClient),
+      })
+    }
+
+    // No existe una licencia activa. Mantener una sola sesión pendiente por teléfono.
     const { data: previous, error: previousError } = await supabase
       .from('license_activation_sessions')
       .select('activation_id, device_id, status')
