@@ -158,13 +158,14 @@ router.post('/register', async (req, res) => {
     if (!/^5\d{7}$/.test(phoneNumber)) return res.status(400).json({ error: 'Número de teléfono inválido' })
     if (!deviceId) return res.status(400).json({ error: 'Dispositivo requerido' })
 
-    // A secret is intentionally returned only once. If the app registers again,
-    // invalidate prior waiting sessions for this device/phone and issue fresh credentials.
+    // A phone number should have only one active pre-registration/payment session.
+    // This also handles uninstall/reinstall or re-registration from a new device ID
+    // without leaving two sessions (READY_TO_PAY + WAITING_PAYMENT) for the same phone.
+    // The newest registration becomes authoritative; older pending sessions are expired.
     const { data: previous, error: previousError } = await supabase
       .from('license_activation_sessions')
-      .select('activation_id')
+      .select('activation_id, device_id, status')
       .eq('phone_number', phoneNumber)
-      .eq('device_id', deviceId)
       .in('status', ['READY_TO_PAY', 'WAITING_PAYMENT', 'WAITING_LATE_CONFIRMATION'])
     if (previousError) throw previousError
     for (const item of previous || []) {
