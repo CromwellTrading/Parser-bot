@@ -122,9 +122,6 @@ function publicExistingClient(client) {
     created_at: client.created_at,
     expires_at: client.expires_at,
     role: client.role,
-    webhook_url: client.webhook_url,
-    webhook_url_2: client.webhook_url_2,
-    webhook_url_3: client.webhook_url_3,
   }
 }
 
@@ -167,9 +164,25 @@ async function createClientFromPayment(session, parsed, receivedIso) {
     .select('*')
     .single()
 
-  if (error) throw error
+  if (!error) return { client, expiresAt, token, receivedIso, parsed }
 
-  return { client, expiresAt, token, receivedIso, parsed }
+  // Defense in depth for concurrent payments/registrations: the DB unique
+  // constraint can win a race even when the application checked first. Reuse
+  // the existing active client only when its device matches this session.
+  if (error.code === '23505') {
+    const existing = await findActiveClientByPhone(session.phone_number)
+    if (existing && existing.device_id === session.device_id) {
+      return {
+        client: existing,
+        expiresAt: existing.expires_at,
+        token: existing.token,
+        receivedIso,
+        parsed,
+      }
+    }
+  }
+
+  throw error
 }
 
 router.get('/config', (req, res) => {
