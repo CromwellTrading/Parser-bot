@@ -113,15 +113,10 @@ function evaluateLicensePayment(parsed, session, config = getLicenseConfig()) {
     return { matched: false, reason: 'LICENSE_PAYMENT_CONFIG_MISSING', reasons: ['Configura LICENSE_PRICE_AMOUNT, LICENSE_PRICE_CURRENCY, LICENSE_PAYMENT_CARD y LICENSE_PAYMENT_PHONE'] }
   }
 
-  // Algunos formatos del parser usan `amount` como gasto total (transferencia + comisión)
-  // para los reportes financieros. Para la licencia debemos comparar el monto transferido,
-  // no la comisión. Si existe `transfer_amount`, tiene prioridad; en los formatos actuales
-  // con comisión se puede recuperar restándola.
-  const licenseAmount = parsed?.transfer_amount !== undefined && parsed?.transfer_amount !== null
-    ? Number(parsed.transfer_amount)
-    : (parsed?.commission !== undefined && parsed?.commission !== null && parsed?.amount !== undefined && parsed?.amount !== null
-      ? Number(parsed.amount) - Number(parsed.commission)
-      : parsed?.amount)
+  // Para pagos de licencia usamos exclusivamente el monto de la transferencia.
+  // Las comisiones cobradas por Transfermóvil/banco son un costo del servicio y
+  // NO participan en la validación del pago ni se restan o suman al precio.
+  const licenseAmount = parsed?.amount != null ? Number(parsed.amount) : parsed?.amount
 
   if (!paymentDestinationIsCard(parsed)) reasons.push('NOT_OUTGOING_CARD_PAYMENT')
   if (!amountMatches(licenseAmount, config.amount)) reasons.push('AMOUNT_MISMATCH')
