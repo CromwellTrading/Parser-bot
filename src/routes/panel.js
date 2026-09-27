@@ -3,6 +3,7 @@ const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
 const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
+const { validateWebhookUrl } = require('../utils/webhookDelivery')
 const { decryptActivationSecret } = require('../utils/activationSecretVault')
 
 const ADMIN_SESSION_COOKIE = 'synthesisone_admin_session'
@@ -366,7 +367,11 @@ router.get('/api/clients', async (req, res) => {
 });
 
 router.post('/api/clients', async (req, res) => {
-  const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days, role } = req.body
+  const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days, role } = req.body || {}
+  const webhookValues = [webhook_url, webhook_url_2, webhook_url_3]
+  const normalizedWebhooks = webhookValues.map(value => validateWebhookUrl(value))
+  const invalidWebhook = normalizedWebhooks.find(item => !item.ok)
+  if (invalidWebhook) return res.status(400).json({ error: invalidWebhook.error })
   if (!name) return res.status(400).json({ error: 'Nombre requerido' })
 
   const token = crypto.randomBytes(32).toString('hex')
@@ -387,9 +392,9 @@ router.post('/api/clients', async (req, res) => {
     name,
     token,
     webhook_secret: webhookSecret,
-    webhook_url: webhook_url || null,
-    webhook_url_2: webhook_url_2 || null,
-    webhook_url_3: webhook_url_3 || null,
+    webhook_url: normalizedWebhooks[0].url || null,
+    webhook_url_2: normalizedWebhooks[1].url || null,
+    webhook_url_3: normalizedWebhooks[2].url || null,
     phone_number: phone_number || null,
     card1: card1 || null,
     card2: card2 || null,
@@ -443,11 +448,54 @@ router.put('/api/clients/:id/toggle', async (req, res) => {
   res.json(data)
 })
 
+router.get('/api/clients/:id/webhook-deliveries', async (req, res) => {
+  try {
+    const rawLimit = Number(req.query.limit || 50)
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 50, 1), 200)
+    const { data, error } = await supabase
+      .from('webhook_deliveries')
+      .select('id, client_id, event_id, sms_log_id, webhook_url, status, attempts, next_attempt_at, last_error, response_status, response_body, created_at, delivered_at')
+      .eq('client_id', req.params.id)
+      .order('created_at', { ascending: false })
+      .limit(limit)
+    if (error) return res.status(500).json({ error: error.message })
+    res.json(data || [])
+  } catch (error) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
 router.put('/api/clients/:id/webhooks', async (req, res) => {
-  const { webhook_url, webhook_url_2, webhook_url_3 } = req.body
+  const { webhook_url, webhook_url_2, webhook_url_3 } = req.body || {}
+  const values = [webhook_url, webhook_url_2, webhook_url_3]
+  const normalized = []
+  for (const value of values) {
+    const checked = validateWebhookUrl(value)
+    if (!checked.ok) return res.status(400).json({ error: checked.error })
+    normalized.push(checked.url)
+  }
+
+  const payload = {
+    webhook_url: normalized[0] || null,
+    webhook_url_2: normalized[1] || null,
+    webhook_url_3: normalized[2] || null,
+  }
+
+  let { data: current, error: currentError } = await supabase
+    .from('clients')
+    .select('id, webhook_secret')
+    .eq('id', req.params.id)
+    .maybeSingle()
+  if (currentError) return res.status(500).json({ error: currentError.message })
+  if (!current) return res.status(404).json({ error: 'Cliente no encontrado' })
+
+  if ((payload.webhook_url || payload.webhook_url_2 || payload.webhook_url_3) && !current.webhook_secret) {
+    payload.webhook_secret = crypto.randomBytes(32).toString('hex')
+  }
+
   const { data, error } = await supabase
     .from('clients')
-    .update({ webhook_url: webhook_url || null, webhook_url_2: webhook_url_2 || null, webhook_url_3: webhook_url_3 || null })
+    .update(payload)
     .eq('id', req.params.id).select().single()
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
