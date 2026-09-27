@@ -2,9 +2,15 @@ const express = require('express')
 const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
-const { bot, ADMINS } = require('../telegram');
+const { bot, ADMINS } = require('../telegram')
 const { verifySignature } = require('../utils/hmac')
 const { parseSms, normalizePhone } = require('../utils/parser')
+const { requireNonRevokedToken } = require('../utils/tokenState')
+const { createEventId, ensureWebhookSecret, queueWebhookDeliveries } = require('../utils/webhookDelivery')
+
+const MAX_SMS_AGE_MS = Number(process.env.MAX_SMS_AGE_MS || 30 * 24 * 60 * 60 * 1000)
+const MAX_FUTURE_SKEW_MS = Number(process.env.MAX_SMS_FUTURE_SKEW_MS || 5 * 60 * 1000)
+const MAX_BODY_CHARS = Number(process.env.MAX_SMS_BODY_CHARS || 20_000)
 
 function digestFallback(sender, body, receivedAt, token) {
   return crypto
@@ -13,45 +19,19 @@ function digestFallback(sender, body, receivedAt, token) {
     .digest('hex')
 }
 
-async function sendWebhook(url, data, secret) {
-  try {
-    const payload = JSON.stringify(data);
-    let headers = { 'Content-Type': 'application/json' };
-    
-    if (secret) {
-      const signature = crypto
-        .createHmac('sha256', secret)
-        .update(payload)
-        .digest('hex');
-      headers['X-Webhook-Signature'] = signature;
-    } else {
-      console.warn(`⚠️ Webhook sin secreto para ${url}, enviando sin firma`);
-    }
-
-    await fetch(url, {
-      method: 'POST',
-      headers,
-      body: payload,
-    });
-    console.log(`📤 Webhook enviado a ${url}`);
-  } catch (error) {
-    console.error(`❌ Error webhook ${url}:`, error.message);
-  }
-}
-
+const { buildWebhookPayload } = require('../utils/webhookPayload')
 async function sendTelegramAlert(parsed, sender, clientName, receivedIso) {
-  // Solo notificar si hay monto (es una transacción financiera)
-  if (parsed.amount == null) return;
+  if (parsed.amount == null) return
 
-  const dir = parsed.direction === 'RECIBIDO' ? '📥 RECIBIDO' : '📤 ENVIADO';
+  const dir = parsed.direction === 'RECIBIDO' ? '📥 RECIBIDO' : '📤 ENVIADO'
   const amount = parsed.amount != null
     ? `💰 *${parsed.amount.toFixed(2)} ${parsed.currency ?? 'CUP'}*`
-    : '';
-  const type = parsed.type?.replace(/_/g, ' → ') ?? 'DESCONOCIDO';
-  const date = new Date(receivedIso).toLocaleString('es-CU', { timeZone: 'America/Havana' });
+    : ''
+  const type = parsed.type?.replace(/_/g, ' → ') ?? 'DESCONOCIDO'
+  const date = new Date(receivedIso).toLocaleString('es-CU', { timeZone: 'America/Havana' })
 
-  const remitente = parsed.sender_phone ?? null;
-  const receptor = parsed.receiver_phone ?? parsed.receiver_account ?? null;
+  const remitente = parsed.sender_phone ?? null
+  const receptor = parsed.receiver_phone ?? parsed.receiver_account ?? null
 
   const lines = [
     `${dir} — ${type}`,
@@ -61,53 +41,59 @@ async function sendTelegramAlert(parsed, sender, clientName, receivedIso) {
     parsed.transaction_id ? `🔖 TX: \`${parsed.transaction_id}\`` : null,
     `🏪 Cliente: ${clientName}`,
     `🕐 ${date}`,
-  ];
+  ]
 
-  const text = lines.filter(Boolean).join('\n');
+  const text = lines.filter(Boolean).join('\n')
 
-  // Enviar a cada administrador
   for (const adminId of ADMINS) {
     try {
-      await bot.sendMessage(adminId, text, { parse_mode: 'Markdown' });
+      await bot.sendMessage(adminId, text, { parse_mode: 'Markdown' })
     } catch (err) {
-      console.error(`Error enviando a admin ${adminId}:`, err.message);
+      console.error(`Error enviando a admin ${adminId}:`, err.message)
     }
   }
+}
+
+function extractBearerToken(req) {
+  const auth = String(req.headers.authorization || '')
+  if (!auth.toLowerCase().startsWith('bearer ')) return null
+  return auth.slice(7).trim() || null
 }
 
 router.post('/ingest', async (req, res) => {
   try {
     const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {})
-    console.log('📨 SMS recibido:', rawBody)
-
     const signature = req.headers['x-signature']
     if (!signature) return res.status(401).json({ error: 'Firma requerida' })
 
-    const { sender, body, receivedAt, token, messageId, smsId, deviceId, phone_number: phoneNumber } = req.body || {}
-    if (!sender || !body || !receivedAt || !token) {
+    const bodyJson = req.body || {}
+    const token = bodyJson.token || extractBearerToken(req)
+    const { sender, body, receivedAt, messageId, message_id: messageIdAlt, smsId, deviceId, phone_number: phoneNumber } = bodyJson
+
+    if (!sender || typeof body !== 'string' || !receivedAt || !token) {
       return res.status(400).json({ error: 'Datos incompletos' })
     }
-
-    // ============================================================
-    // 1️⃣ PRIMERO: Verificar si el token está en la blacklist
-    // ============================================================
-    const { data: blacklisted } = await supabase
-      .from('token_blacklist')
-      .select('token')
-      .eq('token', token)
-      .maybeSingle();
-
-    if (blacklisted) {
-      console.log(`🚫 Token revocado: ${token}`);
-      return res.status(403).json({ error: 'Token revocado' });
+    if (body.length > MAX_BODY_CHARS) {
+      return res.status(413).json({ error: 'SMS demasiado largo' })
     }
 
-    // ============================================================
-    // 2️⃣ LUEGO: Buscar el cliente
-    // ============================================================
+    const receivedDate = new Date(receivedAt)
+    if (Number.isNaN(receivedDate.getTime())) {
+      return res.status(400).json({ error: 'receivedAt inválido' })
+    }
+    const now = Date.now()
+    if (receivedDate.getTime() > now + MAX_FUTURE_SKEW_MS) {
+      return res.status(400).json({ error: 'receivedAt en el futuro' })
+    }
+    if (now - receivedDate.getTime() > MAX_SMS_AGE_MS) {
+      return res.status(400).json({ error: 'SMS demasiado antiguo' })
+    }
+
+    await requireNonRevokedToken(token)
+
     const { data: client, error: clientError } = await supabase
       .from('clients')
-      .select('id, name, token, active, token_used, device_id, phone_number, wallet, card1, card2, card3, expires_at, webhook_url, webhook_url_2, webhook_url_3')
+      .select('id, name, token, active, token_used, device_id, phone_number, wallet, card1, card2, card3, expires_at, webhook_url, webhook_url_2, webhook_url_3, webhook_secret')
       .eq('token', token)
       .maybeSingle()
 
@@ -115,59 +101,31 @@ router.post('/ingest', async (req, res) => {
       console.error('Error buscando cliente:', clientError)
       return res.status(500).json({ error: 'Error interno' })
     }
-
-    if (!client) {
-      console.log(`❌ Cliente no encontrado para token: ${token}`);
-      return res.status(404).json({ error: 'Cliente no encontrado' })
-    }
-
-    // ============================================================
-    // 3️⃣ Validar estado de la licencia
-    // ============================================================
-    if (!client.active) {
-      console.log(`❌ Licencia inactiva para cliente: ${client.name}`);
-      return res.status(403).json({ error: 'Licencia inactiva' })
-    }
-
+    if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
+    if (!client.active) return res.status(403).json({ error: 'Licencia inactiva' })
     if (client.expires_at && new Date(client.expires_at) < new Date()) {
-      console.log(`❌ Licencia expirada para cliente: ${client.name}`);
       return res.status(403).json({ error: 'Licencia expirada' })
     }
 
-    // ============================================================
-    // 4️⃣ Validar dispositivo
-    // ============================================================
-    if (client.device_id && deviceId && client.device_id !== deviceId) {
-      console.log(`❌ Dispositivo no autorizado para cliente: ${client.name}`);
+    if (client.device_id && (!deviceId || client.device_id !== deviceId)) {
       return res.status(403).json({ error: 'Dispositivo no autorizado' })
     }
-
-    if (client.phone_number && phoneNumber && normalizePhone(client.phone_number) !== normalizePhone(phoneNumber)) {
-      console.log(`❌ Teléfono no autorizado para cliente: ${client.name}`);
+    if (client.phone_number && (!phoneNumber || normalizePhone(client.phone_number) !== normalizePhone(phoneNumber))) {
       return res.status(403).json({ error: 'Teléfono no autorizado' })
     }
 
-    // ============================================================
-    // 5️⃣ Verificar firma
-    // ============================================================
     if (!verifySignature(rawBody, token, signature)) {
-      console.log(`❌ Firma inválida para cliente: ${client.name}`);
       return res.status(401).json({ error: 'Firma inválida' })
     }
 
-    // ============================================================
-    // 6️⃣ Parsear el SMS
-    // ============================================================
     const parsed = parseSms(sender, body, receivedAt)
-    const receivedIso = new Date(receivedAt).toISOString()
-    const smsHash = messageId || smsId || digestFallback(sender, body, receivedIso, token)
+    const receivedIso = receivedDate.toISOString()
+    const messageHash = messageId || messageIdAlt || smsId || digestFallback(sender, body, receivedIso, token)
+    const eventId = createEventId({ clientId: client.id, sender, body, receivedAt: receivedIso })
 
-    // ============================================================
-    // 7️⃣ Verificar duplicados
-    // ============================================================
     const { data: existing } = await supabase
       .from('sms_logs')
-      .select('id')
+      .select('id, created_at')
       .eq('client_id', client.id)
       .eq('sender', sender)
       .eq('body', body)
@@ -175,13 +133,15 @@ router.post('/ingest', async (req, res) => {
       .maybeSingle()
 
     if (existing) {
-      console.log(`⚠️ SMS duplicado para cliente: ${client.name}`);
-      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, status: 'SENT' })
+      const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, existing.id, messageHash)
+      let webhookClient = client
+      if (client.webhook_url || client.webhook_url_2 || client.webhook_url_3) {
+        webhookClient = await ensureWebhookSecret(client)
+        await queueWebhookDeliveries({ client: webhookClient, payload: webhookPayload, eventId, logId: existing.id })
+      }
+      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, event_id: eventId, status: 'QUEUED' })
     }
 
-    // ============================================================
-    // 8️⃣ Guardar en la base de datos
-    // ============================================================
     const payload = {
       client_id: client.id,
       sender,
@@ -198,38 +158,52 @@ router.post('/ingest', async (req, res) => {
 
     if (insertError) {
       console.error('Error guardando SMS:', insertError)
+      // If another request won a race and inserted the same SMS, locate the
+      // winner and rebuild any missing webhook deliveries.
+      if (insertError.code === '23505') {
+        const { data: raced } = await supabase
+          .from('sms_logs')
+          .select('id, created_at')
+          .eq('client_id', client.id)
+          .eq('sender', sender)
+          .eq('body', body)
+          .eq('received_at', receivedIso)
+          .maybeSingle()
+        if (raced) {
+          const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, raced.id, messageHash)
+          if (client.webhook_url || client.webhook_url_2 || client.webhook_url_3) {
+            const webhookClient = await ensureWebhookSecret(client)
+            await queueWebhookDeliveries({ client: webhookClient, payload: webhookPayload, eventId, logId: raced.id })
+          }
+          return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: raced.id, event_id: eventId, status: 'QUEUED' })
+        }
+      }
       return res.status(500).json({ error: 'Error interno' })
     }
 
-    // ============================================================
-    // 9️⃣ Enviar webhooks (si están configurados)
-    // ============================================================
-    const webhooks = [client.webhook_url, client.webhook_url_2, client.webhook_url_3].filter(Boolean)
-    if (webhooks.length) {
-      const webhookPayload = {
-        event: 'SMS_RECEIVED',
-        client: client.name,
-        client_id: client.id,
-        parsed,
-        sender,
-        received_at: receivedIso,
-        log_id: log?.id,
-        message_id: smsHash,
-      }
-      for (const url of webhooks) {
-        sendWebhook(url, webhookPayload, client.webhook_secret)
-      }
+    const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, log?.id, messageHash)
+    const hasWebhooks = Boolean(client.webhook_url || client.webhook_url_2 || client.webhook_url_3)
+
+    if (hasWebhooks) {
+      const webhookClient = await ensureWebhookSecret(client)
+      await queueWebhookDeliveries({ client: webhookClient, payload: webhookPayload, eventId, logId: log?.id })
     }
 
-    // ============================================================
-    // 🔟 Enviar notificación Telegram (si es transacción financiera)
-    // ============================================================
     sendTelegramAlert(parsed, sender, client.name, receivedIso)
+      .catch(error => console.error('❌ Telegram alert:', error.message))
 
-    console.log(`✅ SMS de "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount ?? '—'} ${parsed.currency ?? ''}`)
-    return res.status(200).json({ ok: true, parsed, log_id: log?.id, status: 'SENT' })
-
+    console.log(`✅ SMS de "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount ?? '—'} ${parsed.currency ?? ''} | event=${eventId}`)
+    return res.status(200).json({
+      ok: true,
+      parsed,
+      log_id: log?.id,
+      event_id: eventId,
+      status: hasWebhooks ? 'QUEUED' : 'STORED',
+    })
   } catch (error) {
+    if (error.code === 'TOKEN_REVOKED') {
+      return res.status(403).json({ error: 'Token revocado' })
+    }
     console.error('❌ Error en /ingest:', error)
     return res.status(500).json({ error: 'Error interno' })
   }
