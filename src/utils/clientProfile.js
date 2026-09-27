@@ -45,6 +45,23 @@ function normalizeClientProfile(body = {}) {
   return profile
 }
 
+function normalizeClientProfileUpdate(body = {}) {
+  const keys = {
+    phone_number: ['phone_number', 'phoneNumber'],
+    card1: ['card1', 'card_1'],
+    card2: ['card2', 'card_2'],
+    card3: ['card3', 'card_3'],
+    wallet: ['wallet', 'wallet_number', 'walletNumber'],
+    device_id: ['deviceId', 'device_id', 'deviceID'],
+  }
+  const patch = {}
+  for (const [target, aliases] of Object.entries(keys)) {
+    const supplied = aliases.find(key => Object.prototype.hasOwnProperty.call(body, key))
+    if (supplied) patch[target] = cleanText(body[supplied])
+  }
+  return patch
+}
+
 function normalizeClientInsert(body = {}) {
   const payload = {
     name: cleanText(body.name),
@@ -80,7 +97,14 @@ function clientStatus(client, now = new Date()) {
 
 function publicClient(client) {
   if (!client) return null
-  const { token, ...rest } = client
+  const {
+    token,
+    webhook_secret,
+    webhook_url,
+    webhook_url_2,
+    webhook_url_3,
+    ...rest
+  } = client
   return {
     ...rest,
     license_status: clientStatus(client),
@@ -90,6 +114,7 @@ function publicClient(client) {
 module.exports = {
   cleanText,
   normalizeClientProfile,
+  normalizeClientProfileUpdate,
   normalizeClientInsert,
   publicClient,
   clientStatus,
