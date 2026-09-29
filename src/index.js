@@ -26,6 +26,7 @@ const onboardingRoutes = require('./routes/onboarding')
 const panelRoutes = require('./routes/panel')
 const adminRoutes = require('./routes/admin')
 const { startWebhookWorker } = require('./utils/webhookDelivery')
+const { startLicenseExpiryWorker } = require('./utils/licenseExpiry')
 
 app.use('/api/auth', authRoutes)
 app.use('/api/sms', smsRoutes)
@@ -34,6 +35,7 @@ app.use('/panel', panelRoutes)
 app.use('/api/admin', adminRoutes)
 
 startWebhookWorker()
+startLicenseExpiryWorker()
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'SynthesisOne Backend' })
