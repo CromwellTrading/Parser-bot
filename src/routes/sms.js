@@ -68,7 +68,22 @@ router.post('/ingest', async (req, res) => {
 
     const bodyJson = req.body || {}
     const token = bodyJson.token || extractBearerToken(req)
-    const { sender, body, receivedAt, messageId, message_id: messageIdAlt, smsId, deviceId, phone_number: phoneNumber } = bodyJson
+    // Android sends snake_case device_id/phone_number. Keep camelCase aliases
+    // for compatibility with older bootstrap payloads.
+    const {
+      sender,
+      body,
+      receivedAt,
+      messageId,
+      message_id: messageIdAlt,
+      smsId,
+      deviceId: deviceIdCamel,
+      device_id: deviceIdSnake,
+      phone_number: phoneNumberSnake,
+      phoneNumber: phoneNumberCamel,
+    } = bodyJson
+    const deviceId = String(deviceIdCamel || deviceIdSnake || '').trim()
+    const phoneNumber = String(phoneNumberSnake || phoneNumberCamel || '').trim()
 
     if (!sender || typeof body !== 'string' || !receivedAt || !token) {
       return res.status(400).json({ error: 'Datos incompletos' })
@@ -108,10 +123,16 @@ router.post('/ingest', async (req, res) => {
     }
 
     if (client.device_id && (!deviceId || client.device_id !== deviceId)) {
-      return res.status(403).json({ error: 'Dispositivo no autorizado' })
+      return res.status(403).json({
+        error: 'Dispositivo no autorizado',
+        code: 'DEVICE_MISMATCH',
+      })
     }
     if (client.phone_number && (!phoneNumber || normalizePhone(client.phone_number) !== normalizePhone(phoneNumber))) {
-      return res.status(403).json({ error: 'Teléfono no autorizado' })
+      return res.status(403).json({
+        error: 'Teléfono no autorizado',
+        code: 'PHONE_MISMATCH',
+      })
     }
 
     if (!verifySignature(rawBody, token, signature)) {

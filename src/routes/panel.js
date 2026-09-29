@@ -626,15 +626,98 @@ router.get('/api/activations', async (req, res) => {
   res.json(data)
 })
 
+function zonedParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date)
+  const map = Object.fromEntries(parts.map(p => [p.type, p.value]))
+  return {
+    year: Number(map.year),
+    month: Number(map.month),
+    day: Number(map.day),
+    hour: Number(map.hour),
+    minute: Number(map.minute),
+    second: Number(map.second),
+  }
+}
+
+function zoneOffsetMs(date, timeZone) {
+  const p = zonedParts(date, timeZone)
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - date.getTime()
+}
+
+function getDayBoundsIso(date = new Date(), timeZone = 'America/Havana') {
+  const p = zonedParts(date, timeZone)
+  const startNaive = Date.UTC(p.year, p.month - 1, p.day, 0, 0, 0)
+  const start = new Date(startNaive - zoneOffsetMs(new Date(startNaive), timeZone))
+  const nextNaive = Date.UTC(p.year, p.month - 1, p.day + 1, 0, 0, 0)
+  const end = new Date(nextNaive - zoneOffsetMs(new Date(nextNaive), timeZone))
+  return { start: start.toISOString(), end: end.toISOString() }
+}
+
+router.get('/api/stats', async (req, res) => {
+  try {
+    const bounds = getDayBoundsIso(new Date(), 'America/Havana')
+    const [{ count: smsToday, error: smsError }, { count: smsTotal, error: totalError }] = await Promise.all([
+      supabase
+        .from('sms_logs')
+        .select('id', { count: 'exact', head: true })
+        .gte('received_at', bounds.start)
+        .lt('received_at', bounds.end),
+      supabase
+        .from('sms_logs')
+        .select('id', { count: 'exact', head: true }),
+    ])
+
+    if (smsError) throw smsError
+    if (totalError) throw totalError
+
+    res.json({
+      ok: true,
+      timezone: 'America/Havana',
+      today_start: bounds.start,
+      today_end: bounds.end,
+      sms_today: smsToday || 0,
+      sms_total: smsTotal || 0,
+    })
+  } catch (error) {
+    console.error('Error obteniendo estadísticas:', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
 router.get('/api/logs', async (req, res) => {
-  const { client_id, limit = 50 } = req.query
-  let query = supabase
-    .from('sms_logs').select('*, clients(name)')
-    .order('created_at', { ascending: false }).limit(parseInt(limit))
-  if (client_id) query = query.eq('client_id', client_id)
-  const { data, error } = await query
-  if (error) return res.status(500).json({ error: error.message })
-  res.json(data)
+  try {
+    const clientId = String(req.query.client_id || '').trim()
+    const today = String(req.query.today ?? 'true').toLowerCase() !== 'false'
+    const rawLimit = Number(req.query.limit || 100)
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 100, 1), 500)
+
+    let query = supabase
+      .from('sms_logs').select('*, clients(name, phone_number)')
+      .order('received_at', { ascending: false })
+      .limit(limit)
+
+    if (clientId) query = query.eq('client_id', clientId)
+
+    if (today) {
+      const bounds = getDayBoundsIso(new Date(), 'America/Havana')
+      query = query.gte('received_at', bounds.start).lt('received_at', bounds.end)
+    }
+
+    const { data, error } = await query
+    if (error) return res.status(500).json({ error: error.message })
+    res.json(data || [])
+  } catch (error) {
+    res.status(500).json({ error: error.message })
+  }
 })
 
 // ── Auth verify (used by Android app) ────────────────────────────────────────
@@ -915,10 +998,18 @@ tr:hover td{background:#ffffff04}
 
     <!-- LOGS -->
     <div id="tab-logs" style="display:none">
-      <div class="sec-head">
+      <div class="sec-head" style="align-items:flex-start;gap:12px;flex-wrap:wrap">
         <span class="sec-title">SMS Recibidos</span>
-        <button class="btn btn-sm btn-blue" onclick="loadLogs()">↻ Actualizar</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;flex:1;justify-content:flex-end">
+          <select id="logs-client-filter" style="width:auto;min-width:190px;padding:8px 10px;font-size:11px" onchange="loadLogs()">
+            <option value="">Todos los clientes</option>
+          </select>
+          <button id="logs-today-btn" class="btn btn-sm btn-blue" onclick="setLogsRange('TODAY')">HOY</button>
+          <button id="logs-history-btn" class="btn btn-sm btn-purple" onclick="setLogsRange('HISTORY')">HISTORIAL</button>
+          <button class="btn btn-sm btn-blue" onclick="loadLogs()">↻ Actualizar</button>
+        </div>
       </div>
+      <div id="logs-scope-label" style="color:var(--muted);font:11px 'Space Mono',monospace;margin:-10px 0 14px">Mostrando SMS con fecha de recepción de hoy (hora de Cuba)</div>
       <div id="logs-cont"><div class="loading">Cargando...</div></div>
     </div>
   </main>
@@ -1004,7 +1095,12 @@ async function api(path, opts={}) {
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
-async function loadAll() { await Promise.all([loadClients(), loadLogs()]) }
+let LOGS_RANGE = 'TODAY'
+
+async function loadAll() {
+  await loadClients()
+  await loadLogs()
+}
 if (window.PANEL_AUTHENTICATED) { loadAll().catch(e => console.error('Error cargando panel:', e)) }
 
 let CLIENTS = []
@@ -1022,6 +1118,7 @@ async function loadClients() {
     CLIENTS = clients
     document.getElementById('s-total').textContent = clients.length
     document.getElementById('s-active').textContent = clients.filter(c=>c.active).length
+    populateLogsClientFilter()
     renderClients(clients)
   } catch (error) {
     console.error('Error cargando clientes:', error)
@@ -1035,10 +1132,42 @@ function filterClients() {
   renderClients(CLIENTS.filter(c => [c.name, c.phone_number, c.wallet, c.card1, c.card2, c.card3, c.device_id, c.id, c.activation_status].filter(Boolean).some(v => String(v).toLowerCase().includes(q))))
 }
 
+function populateLogsClientFilter() {
+  const select = document.getElementById('logs-client-filter')
+  if (!select) return
+  const previous = select.value
+  const clients = CLIENTS.filter(c => c && !c.pending_activation && c.role !== 'admin')
+  select.innerHTML = '<option value="">Todos los clientes</option>' + clients.map(c =>
+    '<option value="' + escapeHtml(c.id) + '">' + escapeHtml(c.name || c.phone_number || c.id) + (c.phone_number ? ' — ' + escapeHtml(c.phone_number) : '') + '</option>'
+  ).join('')
+  if ([...select.options].some(o => o.value === previous)) select.value = previous
+}
+
+function setLogsRange(range) {
+  LOGS_RANGE = range === 'HISTORY' ? 'HISTORY' : 'TODAY'
+  const todayBtn = document.getElementById('logs-today-btn')
+  const historyBtn = document.getElementById('logs-history-btn')
+  if (todayBtn) todayBtn.style.opacity = LOGS_RANGE === 'TODAY' ? '1' : '.55'
+  if (historyBtn) historyBtn.style.opacity = LOGS_RANGE === 'HISTORY' ? '1' : '.55'
+  const label = document.getElementById('logs-scope-label')
+  if (label) label.textContent = LOGS_RANGE === 'TODAY'
+    ? 'Mostrando SMS con fecha de recepción de hoy (hora de Cuba)'
+    : 'Mostrando historial de SMS almacenados en el servidor'
+  loadLogs()
+}
+
 async function loadLogs() {
   try {
-    const logs = await api('/logs?limit=100')
-    document.getElementById('s-sms').textContent = Array.isArray(logs) ? logs.length : '—'
+    const selectedClient = document.getElementById('logs-client-filter')?.value || ''
+    const query = new URLSearchParams({ limit: '100', today: LOGS_RANGE === 'TODAY' ? 'true' : 'false' })
+    if (selectedClient) query.set('client_id', selectedClient)
+
+    const [logs, stats] = await Promise.all([
+      api('/logs?' + query.toString()),
+      api('/stats'),
+    ])
+
+    document.getElementById('s-sms').textContent = Number.isFinite(Number(stats?.sms_today)) ? stats.sms_today : '—'
     renderLogs(logs)
   } catch (error) {
     console.error('Error cargando logs:', error)
@@ -1251,15 +1380,15 @@ function renderLogs(logs) {
     const typeLabel = p.type ? p.type.replace(/_/g,' ') : 'DESCONOCIDO'
     return \`
       <div class="log-card \${incoming?'':'enviado'}">
-        <div class="log-client">\${l.clients?.name||'—'}</div>
+        <div class="log-client">\${escapeHtml(l.clients?.name || l.clients?.phone_number || '—')}</div>
         <div class="log-top">
           <div>
             <div class="log-amount \${incoming?'':'enviado'}">\${incoming?'↓ ':'↑ '}\${amount}</div>
-            <div class="log-type">\${typeLabel}</div>
+            <div class="log-type">\${escapeHtml(typeLabel)}</div>
           </div>
-          <div class="log-time">\${new Date(l.created_at).toLocaleString('es')}</div>
+          <div class="log-time">\${new Date(l.received_at || l.created_at).toLocaleString('es')}</div>
         </div>
-        <div class="log-body">\${l.body}</div>
+        <div class="log-body">\${escapeHtml(l.body)}</div>
       </div>
     \`
   }).join('')
