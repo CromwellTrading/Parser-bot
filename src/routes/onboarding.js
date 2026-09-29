@@ -15,6 +15,7 @@ const {
 const { bot, ADMINS } = require('../telegram')
 const { evaluateActivationTiming } = require('../utils/onboarding')
 const { encryptActivationSecret } = require('../utils/activationSecretVault')
+const { expireDueLicenses } = require('../utils/licenseExpiry')
 
 const SESSION_TTL_HOURS = Number(process.env.ACTIVATION_SESSION_TTL_HOURS || 24)
 const MAX_BOOTSTRAP_SMS_AGE_MS = Number(process.env.ACTIVATION_MAX_SMS_AGE_MS || 2 * 60 * 60 * 1000)
@@ -203,6 +204,7 @@ router.get('/config', (req, res) => {
 
 router.post('/register', async (req, res) => {
   try {
+    await expireDueLicenses()
     const phoneNumber = normalizeRegisteredPhone(req.body?.phone_number || req.body?.phoneNumber)
     const deviceId = String(req.body?.device_id || req.body?.deviceId || '').trim()
 

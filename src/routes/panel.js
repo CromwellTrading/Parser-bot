@@ -4,6 +4,7 @@ const crypto = require('crypto')
 const supabase = require('../supabase')
 const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
 const { validateWebhookUrl } = require('../utils/webhookDelivery')
+const { expireDueLicenses, isExpired } = require('../utils/licenseExpiry')
 const { decryptActivationSecret } = require('../utils/activationSecretVault')
 
 const ADMIN_SESSION_COOKIE = 'synthesisone_admin_session'
@@ -348,6 +349,7 @@ router.get('/api/clients/:id/details', async (req, res) => {
 
 router.get('/api/clients', async (req, res) => {
   try {
+    await expireDueLicenses()
     const { data, error } = await supabase
       .from('clients')
       .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret')
@@ -414,10 +416,14 @@ router.post('/api/clients', async (req, res) => {
 })
 
 router.put('/api/clients/:id/toggle', async (req, res) => {
-  const { data: client } = await supabase.from('clients').select('active, token').eq('id', req.params.id).single()
+  const { data: client } = await supabase.from('clients').select('active, token, expires_at').eq('id', req.params.id).single()
   if (!client) return res.status(404).json({ error: 'No encontrado' })
 
   const nowActive = !client.active
+
+  if (nowActive && isExpired(client.expires_at)) {
+    return res.status(409).json({ error: 'La licencia está expirada. Debe renovarse antes de activarla nuevamente.', status: 'expired' })
+  }
 
   if (!nowActive && client.token) {
     const { error: revokeError } = await supabase
@@ -1198,10 +1204,13 @@ function renderClients(clients) {
     const tokenText = c.token ? String(c.token).slice(0,12) + '...' : '—'
 
     let statusText
+    const expired = c.expires_at && new Date(c.expires_at).getTime() <= Date.now()
     if (pending) {
       if (c.activation_status === 'WAITING_PAYMENT') statusText = '◌ ESPERANDO PAGO'
       else if (c.activation_status === 'WAITING_LATE_CONFIRMATION') statusText = '◌ CONFIRMACIÓN TARDÍA'
       else statusText = '◌ LISTO PARA PAGAR'
+    } else if (expired && c.role === 'client') {
+      statusText = '○ EXPIRADO'
     } else {
       statusText = c.active ? '● ACTIVO' : '○ INACTIVO'
     }

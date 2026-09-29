@@ -3,6 +3,8 @@ const router = express.Router()
 const crypto = require('crypto')
 const supabase = require('../supabase')
 const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
+const { validateWebhookUrl } = require('../utils/webhookDelivery')
+const { expireDueLicenses, isExpired } = require('../utils/licenseExpiry')
 
 function adminAuth(req, res, next) {
   const secret = req.headers['x-admin-secret']
@@ -16,6 +18,7 @@ function adminAuth(req, res, next) {
 router.use(adminAuth)
 
 router.get('/clients', async (req, res) => {
+  await expireDueLicenses()
   const { data, error } = await supabase
     .from('clients')
     .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at')
@@ -26,11 +29,16 @@ router.get('/clients', async (req, res) => {
 })
 
 router.post('/clients', async (req, res) => {
-  const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days } = req.body
+  const { name, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, expires_at, plan, expires_in_days } = req.body || {}
+  const webhookValues = [webhook_url, webhook_url_2, webhook_url_3]
+  const normalizedWebhooks = webhookValues.map(value => validateWebhookUrl(value))
+  const invalidWebhook = normalizedWebhooks.find(item => !item.ok)
+  if (invalidWebhook) return res.status(400).json({ error: invalidWebhook.error })
 
   if (!name) return res.status(400).json({ error: 'Nombre requerido' })
 
   const token = crypto.randomBytes(32).toString('hex')
+  const webhookSecret = crypto.randomBytes(32).toString('hex')
   const days = Number.isFinite(Number(expires_in_days)) ? Number(expires_in_days) : (plan === 'trial' ? 3 : 30)
   const defaultExpiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
 
@@ -39,9 +47,10 @@ router.post('/clients', async (req, res) => {
     .insert({
       name,
       token,
-      webhook_url: webhook_url || null,
-      webhook_url_2: webhook_url_2 || null,
-      webhook_url_3: webhook_url_3 || null,
+      webhook_secret: webhookSecret,
+      webhook_url: normalizedWebhooks[0].url || null,
+      webhook_url_2: normalizedWebhooks[1].url || null,
+      webhook_url_3: normalizedWebhooks[2].url || null,
       phone_number: phone_number || null,
       card1: card1 || null,
       card2: card2 || null,
@@ -63,13 +72,17 @@ router.post('/clients', async (req, res) => {
 router.put('/clients/:id/toggle', async (req, res) => {
   const { data: client, error: fetchError } = await supabase
     .from('clients')
-    .select('id, active, token, name')
+    .select('id, active, token, name, expires_at')
     .eq('id', req.params.id)
     .single()
 
   if (fetchError || !client) return res.status(404).json({ error: 'Cliente no encontrado' })
 
   const nowActive = !client.active
+
+  if (nowActive && isExpired(client.expires_at)) {
+    return res.status(409).json({ error: 'La licencia está expirada. Debe renovarse antes de activarla nuevamente.', status: 'expired' })
+  }
 
   if (!nowActive && client.token) {
     await supabase.from('token_blacklist').delete().eq('token', client.token)

@@ -7,6 +7,7 @@ const { verifySignature } = require('../utils/hmac')
 const { parseSms, normalizePhone } = require('../utils/parser')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { createEventId, ensureWebhookSecret, queueWebhookDeliveries } = require('../utils/webhookDelivery')
+const { expireDueLicenses } = require('../utils/licenseExpiry')
 
 const MAX_SMS_AGE_MS = Number(process.env.MAX_SMS_AGE_MS || 30 * 24 * 60 * 60 * 1000)
 const MAX_FUTURE_SKEW_MS = Number(process.env.MAX_SMS_FUTURE_SKEW_MS || 5 * 60 * 1000)
@@ -62,6 +63,7 @@ function extractBearerToken(req) {
 
 router.post('/ingest', async (req, res) => {
   try {
+    await expireDueLicenses()
     const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {})
     const signature = req.headers['x-signature']
     if (!signature) return res.status(401).json({ error: 'Firma requerida' })

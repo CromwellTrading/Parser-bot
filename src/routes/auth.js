@@ -9,6 +9,7 @@ const {
 } = require('../utils/clientProfile')
 const { normalizePhone } = require('../utils/parser')
 const { requireNonRevokedToken } = require('../utils/tokenState')
+const { expireDueLicenses } = require('../utils/licenseExpiry')
 
 function isExpired(expiresAt) {
   if (!expiresAt) return false
@@ -47,6 +48,7 @@ async function updateClient(clientId, patch) {
 
 router.post('/verify', async (req, res) => {
   try {
+    await expireDueLicenses()
     const token = extractToken(req)
     const profile = normalizeClientProfile(req.body || {})
 
@@ -57,12 +59,12 @@ router.post('/verify', async (req, res) => {
     const client = await fetchClientByToken(token)
     if (!client) return res.status(401).json({ error: 'Token inválido' })
 
-    if (!client.active) {
-      return res.status(403).json({ error: 'Licencia inactiva', status: 'inactive', client: publicClient(client) })
+    if (isExpired(client.expires_at)) {
+      return res.status(403).json({ error: 'Licencia expirada', status: 'expired', client: publicClient({ ...client, active: false }) })
     }
 
-    if (isExpired(client.expires_at)) {
-      return res.status(403).json({ error: 'Licencia expirada', status: 'expired', client: publicClient(client) })
+    if (!client.active) {
+      return res.status(403).json({ error: 'Licencia inactiva', status: 'inactive', client: publicClient(client) })
     }
 
     const deviceId = profile.device_id
@@ -108,6 +110,7 @@ router.post('/verify', async (req, res) => {
 
 router.get('/me', async (req, res) => {
   try {
+    await expireDueLicenses()
     const token = extractToken(req)
     if (!token) return res.status(400).json({ error: 'Token requerido' })
 
@@ -128,6 +131,7 @@ router.get('/me', async (req, res) => {
 
 router.put('/profile', async (req, res) => {
   try {
+    await expireDueLicenses()
     const token = extractToken(req)
     const profile = normalizeClientProfileUpdate(req.body || {})
     if (!token) return res.status(400).json({ error: 'Token requerido' })
