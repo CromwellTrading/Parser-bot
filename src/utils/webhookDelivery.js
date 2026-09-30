@@ -4,6 +4,7 @@ const https = require('https')
 const net = require('net')
 const supabase = require('../supabase')
 const { createEventId, hmacHex, validateWebhookUrl, isPrivateOrReservedIp } = require('./webhookSecurity')
+const { logWebhook, persistWebhookEvent } = require('./observability')
 
 const WEBHOOK_TIMEOUT_MS = Number(process.env.WEBHOOK_TIMEOUT_MS || 15_000)
 const WEBHOOK_MAX_ATTEMPTS = Number(process.env.WEBHOOK_MAX_ATTEMPTS || 8)
@@ -124,7 +125,10 @@ async function deliverWebhook({ url, payload, secret, eventId }) {
   const signatureV2 = hmacHex(`${timestamp}.${body}`, secret)
 
   try {
-    const addresses = await resolvePublicAddresses(new URL(validation.url).hostname)
+    const hostname = new URL(validation.url).hostname
+    const addresses = await resolvePublicAddresses(hostname)
+    logWebhook('INFO', 'HTTP_POST_START', { event_id: eventId, webhook_url: validation.url, hostname, resolved_addresses: addresses.map(x => x.address) })
+    const startedAt = Date.now()
     const response = await requestHttps(validation.url, body, {
       'Content-Type': 'application/json',
       Accept: 'application/json',
@@ -135,8 +139,10 @@ async function deliverWebhook({ url, payload, secret, eventId }) {
       'X-Webhook-Signature-V2': signatureV2,
     }, addresses)
 
+    const durationMs = Date.now() - startedAt
     const success = response.statusCode >= 200 && response.statusCode < 300
     const retryable = response.statusCode === 408 || response.statusCode === 429 || response.statusCode >= 500
+    logWebhook(success ? 'INFO' : 'WARN', 'HTTP_POST_RESULT', { event_id: eventId, webhook_url: validation.url, status_code: response.statusCode, duration_ms: durationMs, retryable, response_body: response.body || '' })
     return {
       success,
       retryable: !success && retryable,
@@ -145,6 +151,7 @@ async function deliverWebhook({ url, payload, secret, eventId }) {
       error: success ? null : `HTTP ${response.statusCode}`,
     }
   } catch (error) {
+    logWebhook('ERROR', 'HTTP_POST_EXCEPTION', { event_id: eventId, webhook_url: validation.url, error: error.message || 'Error de red' })
     return { success: false, retryable: true, error: error.message || 'Error de red' }
   }
 }
@@ -178,7 +185,11 @@ async function queueWebhookDeliveries({ client, payload, eventId, logId }) {
     .map(v => (v ? String(v).trim() : ''))
     .filter(Boolean)
 
-  if (!urls.length) return { queued: 0, skipped: 0 }
+  if (!urls.length) {
+    logWebhook('WARN', 'NO_WEBHOOK_REGISTERED', { client_id: client.id, event_id: eventId })
+    await persistWebhookEvent({ clientId: client.id, eventId, event: payload?.event, level: 'WARN', stage: 'QUEUE', status: 'SKIPPED', details: { reason: 'NO_WEBHOOK_REGISTERED' } })
+    return { queued: 0, skipped: 0 }
+  }
 
   const uniqueUrls = [...new Set(urls)]
   const rows = []
@@ -218,8 +229,15 @@ async function queueWebhookDeliveries({ client, payload, eventId, logId }) {
     .from('webhook_deliveries')
     .upsert(rows, { onConflict: 'client_id,event_id,webhook_url', ignoreDuplicates: true })
 
-  if (error) throw error
-  return { queued: rows.filter(r => r.status === 'PENDING').length, skipped }
+  if (error) {
+    logWebhook('ERROR', 'QUEUE_FAILED', { client_id: client.id, event_id: eventId, error: error.message, queued_rows: rows.length })
+    await persistWebhookEvent({ clientId: client.id, eventId, event: payload?.event, level: 'ERROR', stage: 'QUEUE', status: 'FAILED', error: error.message, details: { queued_rows: rows.length } })
+    throw error
+  }
+  const queued = rows.filter(r => r.status === 'PENDING').length
+  logWebhook('INFO', 'DELIVERIES_QUEUED', { client_id: client.id, event_id: eventId, queued, skipped, webhook_urls: uniqueUrls })
+  await persistWebhookEvent({ clientId: client.id, eventId, event: payload?.event, level: 'INFO', stage: 'QUEUE', status: 'QUEUED', details: { queued, skipped, webhook_urls: uniqueUrls } })
+  return { queued, skipped }
 }
 
 async function recoverStaleDeliveries() {
@@ -264,10 +282,14 @@ async function processWebhookDeliveries(limit = 20) {
         .maybeSingle()
 
       if (claimError) {
-        console.error(`❌ Error reclamando webhook ${item.id}:`, claimError.message)
+        logWebhook('ERROR', 'CLAIM_FAILED', { delivery_id: item.id, event_id: item.event_id, client_id: item.client_id, error: claimError.message })
+        await persistWebhookEvent({ clientId: item.client_id, eventId: item.event_id, deliveryId: item.id, level: 'ERROR', stage: 'CLAIM', status: 'FAILED', error: claimError.message })
         continue
       }
       if (!claimed) continue
+
+      logWebhook('INFO', 'DELIVERY_ATTEMPT_START', { delivery_id: claimed.id, event_id: claimed.event_id, client_id: claimed.client_id, webhook_url: claimed.webhook_url, attempt: attemptNumber })
+      await persistWebhookEvent({ clientId: claimed.client_id, eventId: claimed.event_id, deliveryId: claimed.id, level: 'INFO', stage: 'DELIVER', status: 'STARTED', webhookUrl: claimed.webhook_url, attempt: attemptNumber, details: { payload_event: claimed.payload?.event } })
 
       try {
         const { data: client, error: clientError } = await supabase
@@ -276,7 +298,10 @@ async function processWebhookDeliveries(limit = 20) {
           .eq('id', claimed.client_id)
           .maybeSingle()
 
-        if (clientError) throw clientError
+        if (clientError) {
+          logWebhook('ERROR', 'CLIENT_SECRET_LOOKUP_FAILED', { delivery_id: claimed.id, event_id: claimed.event_id, client_id: claimed.client_id, error: clientError.message })
+          throw clientError
+        }
         if (!client?.webhook_secret) {
           const update = {
             status: 'FAILED',
@@ -286,6 +311,8 @@ async function processWebhookDeliveries(limit = 20) {
             next_attempt_at: new Date().toISOString(),
           }
           await supabase.from('webhook_deliveries').update(update).eq('id', claimed.id)
+          logWebhook('ERROR', 'DELIVERY_NO_SECRET', { delivery_id: claimed.id, event_id: claimed.event_id, client_id: claimed.client_id })
+          await persistWebhookEvent({ clientId: claimed.client_id, eventId: claimed.event_id, deliveryId: claimed.id, level: 'ERROR', stage: 'DELIVER', status: 'FAILED', webhookUrl: claimed.webhook_url, attempt: attemptNumber, error: update.last_error })
           continue
         }
 
@@ -306,7 +333,8 @@ async function processWebhookDeliveries(limit = 20) {
             response_body: result.responseBody || null,
             last_error: null,
           }).eq('id', claimed.id)
-          console.log(`📤 Webhook entregado | event=${claimed.event_id} | url=${claimed.webhook_url}`)
+          logWebhook('INFO', 'DELIVERY_SUCCESS', { delivery_id: claimed.id, event_id: claimed.event_id, client_id: claimed.client_id, webhook_url: claimed.webhook_url, attempt: attemptNumber, response_status: result.statusCode, response_body: result.responseBody || '' })
+          await persistWebhookEvent({ clientId: claimed.client_id, eventId: claimed.event_id, deliveryId: claimed.id, level: 'INFO', stage: 'DELIVER', status: 'DELIVERED', webhookUrl: claimed.webhook_url, attempt: attemptNumber, responseStatus: result.statusCode, responseBody: result.responseBody })
         } else {
           const exhausted = attemptNumber >= WEBHOOK_MAX_ATTEMPTS || !result.retryable
           const nextAttempt = new Date(Date.now() + calculateBackoffMs(attemptNumber)).toISOString()
@@ -319,9 +347,12 @@ async function processWebhookDeliveries(limit = 20) {
             response_body: result.responseBody || null,
             last_error: result.error || `HTTP ${result.statusCode || 0}`,
           }).eq('id', claimed.id)
-          console.error(`❌ Webhook ${exhausted ? 'falló definitivamente' : 'falló; reintento programado'} | event=${claimed.event_id} | intento=${attemptNumber} | ${result.error || ''}`)
+          logWebhook(exhausted ? 'ERROR' : 'WARN', exhausted ? 'DELIVERY_FAILED_FINAL' : 'DELIVERY_RETRY_SCHEDULED', { delivery_id: claimed.id, event_id: claimed.event_id, client_id: claimed.client_id, webhook_url: claimed.webhook_url, attempt: attemptNumber, response_status: result.statusCode, response_body: result.responseBody || '', error: result.error || `HTTP ${result.statusCode || 0}`, next_attempt_at: nextAttempt })
+          await persistWebhookEvent({ clientId: claimed.client_id, eventId: claimed.event_id, deliveryId: claimed.id, level: exhausted ? 'ERROR' : 'WARN', stage: 'DELIVER', status: exhausted ? 'FAILED' : 'RETRYING', webhookUrl: claimed.webhook_url, attempt: attemptNumber, responseStatus: result.statusCode, responseBody: result.responseBody, error: result.error || `HTTP ${result.statusCode || 0}`, details: { next_attempt_at: nextAttempt } })
         }
       } catch (error) {
+        logWebhook('ERROR', 'DELIVERY_EXCEPTION', { delivery_id: claimed.id, event_id: claimed.event_id, client_id: claimed.client_id, webhook_url: claimed.webhook_url, attempt: attemptNumber, error: error.message })
+        await persistWebhookEvent({ clientId: claimed.client_id, eventId: claimed.event_id, deliveryId: claimed.id, level: 'ERROR', stage: 'DELIVER', status: 'EXCEPTION', webhookUrl: claimed.webhook_url, attempt: attemptNumber, error: error.message })
         const exhausted = attemptNumber >= WEBHOOK_MAX_ATTEMPTS
         const nextAttempt = new Date(Date.now() + calculateBackoffMs(attemptNumber)).toISOString()
         await supabase.from('webhook_deliveries').update({
