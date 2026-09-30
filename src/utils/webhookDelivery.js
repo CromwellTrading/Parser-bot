@@ -62,7 +62,14 @@ function requestHttps(urlString, body, headers, addresses) {
           'Content-Length': contentLength,
           Connection: 'close',
         },
-        lookup: (_hostname, _options, callback) => callback(null, target.address, target.family),
+        // Node 20+ may call the custom DNS lookup with `{ all: true }`
+        // (Happy Eyeballs / auto family selection). In that mode Node expects
+        // an array of `{ address, family }`, not the legacy scalar form.
+        lookup: (_hostname, options, callback) => {
+          const result = { address: target.address, family: target.family }
+          if (options?.all) return callback(null, [result])
+          return callback(null, result.address, result.family)
+        },
       }, (res) => {
         let total = 0
         const chunks = []
