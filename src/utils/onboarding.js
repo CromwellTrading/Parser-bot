@@ -20,7 +20,7 @@ function normalizeRegisteredPhone(value) {
 }
 
 function getLicenseConfig() {
-  const amount = envNumber('LICENSE_PRICE_AMOUNT', null)
+  const amount = envNumber('LICENSE_PRICE_AMOUNT', 28000)
   const durationDays = envNumber('LICENSE_DURATION_DAYS', 30)
   const paymentCard = normalizeCard(process.env.LICENSE_PAYMENT_CARD || '')
   const paymentPhone = normalizeRegisteredPhone(process.env.LICENSE_PAYMENT_PHONE || '')
@@ -116,7 +116,14 @@ function evaluateLicensePayment(parsed, session, config = getLicenseConfig()) {
   // Para pagos de licencia usamos exclusivamente el monto de la transferencia.
   // Las comisiones cobradas por Transfermóvil/banco son un costo del servicio y
   // NO participan en la validación del pago ni se restan o suman al precio.
-  const licenseAmount = parsed?.amount != null ? Number(parsed.amount) : parsed?.amount
+  const reportedAmount = parsed?.amount != null ? Number(parsed.amount) : parsed?.amount
+  // New parser output explicitly sets amount_includes_commission=false. For legacy
+  // payloads without that marker, if amount is gross and commission is supplied,
+  // compare the actual transfer amount (gross minus commission).
+  const legacyCommission = parsed?.amount_includes_commission === false
+    ? 0
+    : Number(parsed?.commission || 0)
+  const licenseAmount = reportedAmount == null ? reportedAmount : reportedAmount - legacyCommission
 
   if (!paymentDestinationIsCard(parsed)) reasons.push('NOT_OUTGOING_CARD_PAYMENT')
   if (!amountMatches(licenseAmount, config.amount)) reasons.push('AMOUNT_MISMATCH')

@@ -1,6 +1,14 @@
 function buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, logId, messageId) {
   const isTransfer = ['RECIBIDO', 'ENVIADO'].includes(parsed?.direction) && parsed?.amount != null
-  const { raw: _raw, ...parsedForWebhook } = parsed || {}
+  const { raw: _raw, amount_includes_commission: amountIncludesCommission, ...parsedForWebhook } = parsed || {}
+
+  // Older stored parser payloads may still carry amount=transfer+commission.
+  // Normalize those to the actual transfer amount. Current parser output sets
+  // amount_includes_commission=false and is never reduced twice.
+  const commission = Number(parsed?.commission || 0)
+  if (amountIncludesCommission !== false && commission > 0 && Number.isFinite(Number(parsedForWebhook.amount))) {
+    parsedForWebhook.amount = Math.max(0, Number(parsedForWebhook.amount) - commission)
+  }
 
   // `amount` is the actual transfer amount used by SynthesisOne.
   // Any provider commission is not part of the merchant payment and is kept

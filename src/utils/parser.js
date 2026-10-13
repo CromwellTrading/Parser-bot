@@ -115,16 +115,14 @@ function parseSmsBase(sender, body) {
     const txId      = clean.match(/Nro\.?\s*Transaccion[:\s]+(\w+)/i)?.[1]
     const comision  = clean.match(/cobro de comision de\s+([\d.,]+)\s*CUP/i)?.[1]
     const balance   = clean.match(/Saldo restante[:\s]+([\d.,]+)\s*CUP/i)?.[1]
-    const totalGasto = (amount && comision)
-      ? parseFloat(amount.replace(',', '.')) + parseFloat(comision.replace(',', '.'))
-      : amount ? parseFloat(amount.replace(',', '.')) : null
+    const transferAmount = amount ? parseFloat(amount.replace(',', '.')) : null
     const beneficiaryDigits = (benef || '').replace(/\D/g, '')
     const beneficiaryIsCard = Boolean(benef && (benef.includes('X') || beneficiaryDigits.length === 16))
 
     return beneficiaryIsCard
       ? {
           direction: 'ENVIADO', type: 'MONEDERO_TARJETA', network: 'PAGOMOVIL',
-          amount: totalGasto, currency: 'CUP',
+          amount: transferAmount, amount_includes_commission: false, currency: 'CUP',
           sender_phone: normalizePhone(ordenante),
           receiver_phone: null,
           receiver_account: benef, transaction_id: txId,
@@ -134,7 +132,7 @@ function parseSmsBase(sender, body) {
         }
       : {
           direction: 'ENVIADO', type: 'MONEDERO_MONEDERO', network: 'PAGOMOVIL',
-          amount: totalGasto, currency: 'CUP',
+          amount: transferAmount, amount_includes_commission: false, currency: 'CUP',
           sender_phone: normalizePhone(ordenante),
           receiver_phone: normalizePhone(benef),
           receiver_account: null, transaction_id: txId,
@@ -159,12 +157,10 @@ if (
   const balanceCup = clean.match(/Saldo cuenta CUP[:\s]+([\d.]+)/i)?.[1];
   const balanceUsd = clean.match(/Saldo cuenta USD[:\s]+([\d.]+)/i)?.[1];
   if (benef && (benef.includes('X') || benef.replace(/\D/g, '').length === 16)) {
-    const totalGasto = (amount && comision)
-      ? parseFloat(amount) + parseFloat(comision)
-      : amount ? parseFloat(amount) : null;
+    const transferAmount = amount ? parseFloat(amount) : null;
     return {
       direction: 'ENVIADO', type: 'MONEDERO_TARJETA', network: 'PAGOMOVIL',
-      amount: totalGasto, currency: 'CUP',
+      amount: transferAmount, amount_includes_commission: false, currency: 'CUP',
       sender_phone: null, receiver_phone: null, receiver_account: benef,
       transaction_id: txId,
       commission: comision ? parseFloat(comision) : null,
@@ -188,12 +184,10 @@ if (
   const comision = clean.match(/cobro de comision de\s+([\d.]+)\s*CUP/i)?.[1];
   const balance = clean.match(/Saldo restante[:\s]+([\d.]+)\s*CUP/i)?.[1];
   if (benef && !benef.includes('X') && benef.replace(/\D/g, '').length <= 11) {
-    const totalGasto = (amount && comision)
-      ? parseFloat(amount) + parseFloat(comision)
-      : amount ? parseFloat(amount) : null;
+    const transferAmount = amount ? parseFloat(amount) : null;
     return {
       direction: 'ENVIADO', type: 'MONEDERO_MONEDERO', network: 'PAGOMOVIL',
-      amount: totalGasto, currency: 'CUP',
+      amount: transferAmount, amount_includes_commission: false, currency: 'CUP',
       sender_phone: null,
       receiver_phone: normalizePhone(benef),
       receiver_account: null, transaction_id: txId,
