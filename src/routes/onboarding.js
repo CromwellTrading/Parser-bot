@@ -16,6 +16,7 @@ const { bot, ADMINS } = require('../telegram')
 const { evaluateActivationTiming } = require('../utils/onboarding')
 const { encryptActivationSecret } = require('../utils/activationSecretVault')
 const { expireDueLicenses } = require('../utils/licenseExpiry')
+const { getAutomationAvailability } = require('../utils/systemSettings')
 
 const SESSION_TTL_HOURS = Number(process.env.ACTIVATION_SESSION_TTL_HOURS || 24)
 const MAX_BOOTSTRAP_SMS_AGE_MS = Number(process.env.ACTIVATION_MAX_SMS_AGE_MS || 2 * 60 * 60 * 1000)
@@ -24,6 +25,8 @@ const PAYMENT_WINDOW_MS = Number(process.env.ACTIVATION_PAYMENT_WINDOW_MS || 5 *
 const CONFIRMATION_GRACE_MS = Number(process.env.ACTIVATION_CONFIRMATION_GRACE_MS || 15 * 60 * 1000)
 const PAYMENT_CLOCK_SKEW_MS = Number(process.env.ACTIVATION_PAYMENT_CLOCK_SKEW_MS || 120000)
 const CONFIG = getLicenseConfig()
+const renewalAmountEnv = String(process.env.LICENSE_RENEWAL_PRICE_AMOUNT || '').trim()
+const RENEWAL_PRICE_AMOUNT = renewalAmountEnv && Number.isFinite(Number(renewalAmountEnv)) && Number(renewalAmountEnv) > 0 ? Number(renewalAmountEnv) : 10000
 const TRUSTED_SMS_SENDERS = [
   'PAGOMOVIL', 'PAGOxMOVIL', 'TRANSFERMOVIL', 'CUBACEL', 'ETECSA', 'BANDEC', 'BPA'
 ]
@@ -59,7 +62,8 @@ function publicActivation(session, includeSecret = false) {
     confirmation_deadline_at: session.confirmation_deadline_at || null,
     last_payment_reason: session.last_payment_reason || null,
     payment: {
-      amount: CONFIG.amount,
+      amount: Number(session.price_amount || CONFIG.amount),
+      price_type: session.price_type || 'initial',
       currency: CONFIG.currency,
       card: CONFIG.paymentCard || null,
       confirmation_phone: CONFIG.paymentPhone || null,
@@ -106,6 +110,23 @@ async function findActiveClientByPhone(phoneNumber) {
   return valid[0] || null
 }
 
+async function getPriceForPhone(phoneNumber) {
+  const { data, error } = await supabase
+    .from('clients')
+    .select('id, created_at')
+    .eq('phone_number', phoneNumber)
+    .eq('role', 'client')
+    .order('created_at', { ascending: false })
+    .limit(1)
+  if (error) throw error
+  const isRenewal = Boolean(data?.length)
+  return {
+    amount: isRenewal ? RENEWAL_PRICE_AMOUNT : CONFIG.amount,
+    price_type: isRenewal ? 'renewal' : 'initial',
+    renewal: isRenewal,
+  }
+}
+
 function publicExistingClient(client) {
   if (!client) return null
   return {
@@ -142,6 +163,39 @@ async function createClientFromPayment(session, parsed, receivedIso) {
   const expiresAt = new Date(Date.now() + CONFIG.durationDays * 24 * 60 * 60 * 1000).toISOString()
   const name = `Cliente ${session.phone_number}`
 
+  // A returning customer renews the existing client row rather than creating a
+  // duplicate account. This preserves webhook configuration and support history.
+  if (session.price_type === 'renewal') {
+    const { data: previousClients, error: findError } = await supabase
+      .from('clients')
+      .select('*')
+      .eq('phone_number', session.phone_number)
+      .eq('role', 'client')
+      .order('created_at', { ascending: false })
+      .limit(1)
+    if (findError) throw findError
+    const previous = previousClients?.[0]
+    if (previous) {
+      const { data: renewed, error: renewError } = await supabase.from('clients')
+        .update({
+          token,
+          webhook_secret: previous.webhook_secret || webhookSecret,
+          device_id: session.device_id,
+          expires_at: expiresAt,
+          active: true,
+          token_used: true,
+          phone_number: session.phone_number,
+          role: 'client',
+        })
+        .eq('id', previous.id)
+        .select('*')
+        .single()
+      if (renewError) throw renewError
+      // Keep the previous token in the blacklist permanently; the fresh token is new.
+      return { client: renewed, expiresAt, token, receivedIso, parsed, renewed: true }
+    }
+  }
+
   const { data: client, error } = await supabase
     .from('clients')
     .insert({
@@ -165,7 +219,7 @@ async function createClientFromPayment(session, parsed, receivedIso) {
     .select('*')
     .single()
 
-  if (!error) return { client, expiresAt, token, receivedIso, parsed }
+  if (!error) return { client, expiresAt, token, receivedIso, parsed, renewed: false }
 
   // Defense in depth for concurrent payments/registrations: the DB unique
   // constraint can win a race even when the application checked first. Reuse
@@ -179,6 +233,7 @@ async function createClientFromPayment(session, parsed, receivedIso) {
         token: existing.token,
         receivedIso,
         parsed,
+        renewed: false,
       }
     }
   }
@@ -186,12 +241,27 @@ async function createClientFromPayment(session, parsed, receivedIso) {
   throw error
 }
 
-router.get('/config', (req, res) => {
+router.get('/config', async (req, res) => {
+  const automation = await getAutomationAvailability()
+  let price = { amount: CONFIG.amount, price_type: 'initial', renewal: false }
+  const phoneNumber = normalizeRegisteredPhone(req.query?.phone_number || req.query?.phoneNumber || '')
+  if (phoneNumber && /^5\d{7}$/.test(phoneNumber)) {
+    try { price = await getPriceForPhone(phoneNumber) } catch (error) {
+      console.error('No se pudo determinar precio de licencia:', error.message)
+      return res.status(500).json({ error: 'No se pudo calcular el precio' })
+    }
+  }
+  res.set('Cache-Control', 'no-store')
   res.json({
     ok: true,
     configured: CONFIG.configured,
+    automation_enabled: automation.enabled,
+    automation_message: automation.message,
     payment: {
-      amount: CONFIG.amount,
+      amount: price.amount,
+      price_type: price.price_type,
+      renewal_amount: RENEWAL_PRICE_AMOUNT,
+      initial_amount: CONFIG.amount,
       currency: CONFIG.currency,
       card: CONFIG.paymentCard || null,
       confirmation_phone: CONFIG.paymentPhone || null,
@@ -249,6 +319,14 @@ router.post('/register', async (req, res) => {
       })
     }
 
+    // Los nuevos pagos/renovaciones se bloquean mientras el administrador
+    // anuncia que el SMS relay no está disponible.
+    const automation = await getAutomationAvailability()
+    if (!automation.enabled) {
+      return res.status(503).json({ ok: false, code: 'AUTOMATION_UNAVAILABLE', error: automation.message, automation_enabled: false })
+    }
+    const price = await getPriceForPhone(phoneNumber)
+
     // No existe una licencia activa. Mantener una sola sesión pendiente por teléfono.
     const { data: previous, error: previousError } = await supabase
       .from('license_activation_sessions')
@@ -270,6 +348,8 @@ router.post('/register', async (req, res) => {
         phone_number: phoneNumber,
         device_id: deviceId,
         status: 'READY_TO_PAY',
+        price_amount: price.amount,
+        price_type: price.price_type,
         client_id: null,
         created_at: nowIso(),
         updated_at: nowIso(),
@@ -302,6 +382,10 @@ router.post('/start', async (req, res) => {
   try {
     const session = await authorizeSession(req, res)
     if (!session) return
+    const automation = await getAutomationAvailability()
+    if (!automation.enabled) {
+      return res.status(503).json({ ok: false, code: 'AUTOMATION_UNAVAILABLE', error: automation.message, automation_enabled: false })
+    }
     if (!['READY_TO_PAY', 'WAITING_PAYMENT', 'WAITING_LATE_CONFIRMATION'].includes(session.status)) {
       return res.status(409).json({ error: 'Sesión no disponible para iniciar el pago', status: session.status })
     }
@@ -474,7 +558,8 @@ router.post('/sms', async (req, res) => {
 
     const receivedIso = receivedDate.toISOString()
     const parsed = parseSms(sender, body, receivedIso)
-    const evaluation = evaluateLicensePayment(parsed, session, CONFIG)
+    const sessionConfig = { ...CONFIG, amount: Number(session.price_amount || CONFIG.amount) }
+    const evaluation = evaluateLicensePayment(parsed, session, sessionConfig)
     const timing = evaluateActivationTiming({
       paymentStartedAt: session.payment_started_at,
       paymentDeadlineAt: session.payment_deadline_at,
@@ -585,7 +670,7 @@ router.post('/sms', async (req, res) => {
 
     await supabase
       .from('license_payments')
-      .update({ client_id: client.id })
+      .update({ client_id: client.id, status: 'ACTIVATED', reason: `PAYMENT_CONFIRMED:${session.price_type || 'initial'}` })
       .eq('payment_key', fingerprint)
 
     const activatedSession = await updateSession(session.activation_id, {

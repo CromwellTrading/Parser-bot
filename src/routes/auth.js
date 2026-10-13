@@ -26,7 +26,7 @@ function extractToken(req) {
 async function fetchClientByToken(token) {
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at')
+    .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at, role')
     .eq('token', token)
     .maybeSingle()
 
@@ -39,7 +39,7 @@ async function updateClient(clientId, patch) {
     .from('clients')
     .update(patch)
     .eq('id', clientId)
-    .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at')
+    .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at, role')
     .single()
 
   if (error) throw error

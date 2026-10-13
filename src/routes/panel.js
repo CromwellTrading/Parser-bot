@@ -6,6 +6,7 @@ const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
 const { validateWebhookUrl } = require('../utils/webhookDelivery')
 const { expireDueLicenses, isExpired } = require('../utils/licenseExpiry')
 const { decryptActivationSecret } = require('../utils/activationSecretVault')
+const { getAutomationAvailability, setAutomationAvailability } = require('../utils/systemSettings')
 
 const ADMIN_SESSION_COOKIE = 'synthesisone_admin_session'
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000
@@ -101,6 +102,114 @@ router.get('/api/auth/check', (req, res) => {
   res.json({ ok: true, authenticated: true })
 })
 
+
+// ── Global automation availability ───────────────────────────────────────────
+router.get('/api/system/automation', async (_req, res) => {
+  const status = await getAutomationAvailability()
+  res.set('Cache-Control', 'no-store')
+  res.json({ ok: true, ...status })
+})
+
+router.put('/api/system/automation', async (req, res) => {
+  const enabled = req.body?.enabled
+  if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled debe ser booleano' })
+  try {
+    const status = await setAutomationAvailability({ enabled, message: req.body?.message })
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'AUTOMATION_AVAILABILITY_CHANGED', enabled: status.enabled }))
+    res.json({ ok: true, ...status })
+  } catch (error) {
+    console.error('Error cambiando disponibilidad global:', error)
+    res.status(500).json({ error: 'No se pudo guardar la disponibilidad. ¿Ejecutaste la migración SQL?' })
+  }
+})
+
+// ── Support inbox (admin panel) ──────────────────────────────────────────────
+router.get('/api/support/threads', async (_req, res) => {
+  try {
+    const { data: messages, error } = await supabase.from('support_messages')
+      .select('id, client_id, sender_role, message, created_at, read_at')
+      .order('created_at', { ascending: false })
+      .limit(1000)
+    if (error) throw error
+    const latestByClient = new Map()
+    const unreadByClient = new Map()
+    for (const message of messages || []) {
+      const key = String(message.client_id)
+      if (!latestByClient.has(key)) latestByClient.set(key, message)
+      if (message.sender_role === 'client' && !message.read_at) unreadByClient.set(key, (unreadByClient.get(key) || 0) + 1)
+    }
+    const ids = [...latestByClient.keys()]
+    let clientsById = new Map()
+    if (ids.length) {
+      const { data: clients, error: clientError } = await supabase.from('clients')
+        .select('id, name, phone_number, role, active, expires_at')
+        .in('id', ids)
+      if (clientError) throw clientError
+      clientsById = new Map((clients || []).map(c => [String(c.id), c]))
+    }
+    const threads = [...latestByClient.entries()].map(([clientId, latest]) => ({
+      client_id: clientId,
+      client: clientsById.get(clientId) || null,
+      latest_message: latest.message,
+      latest_sender_role: latest.sender_role,
+      latest_at: latest.created_at,
+      unread_count: unreadByClient.get(clientId) || 0,
+    })).sort((a, b) => new Date(b.latest_at) - new Date(a.latest_at))
+    res.json({ ok: true, threads })
+  } catch (error) {
+    console.error('Error listando soporte:', error)
+    res.status(500).json({ error: error.message || 'No se pudieron cargar las conversaciones' })
+  }
+})
+
+router.get('/api/support/threads/:clientId/messages', async (req, res) => {
+  try {
+    const { data: client, error: clientError } = await supabase.from('clients')
+      .select('id, name, phone_number, role, active, expires_at')
+      .eq('id', req.params.clientId).maybeSingle()
+    if (clientError) throw clientError
+    if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
+    const { data: messages, error } = await supabase.from('support_messages')
+      .select('id, client_id, sender_role, message, created_at, read_at')
+      .eq('client_id', req.params.clientId)
+      .order('created_at', { ascending: true })
+      .limit(500)
+    if (error) throw error
+    const unreadIds = (messages || []).filter(m => m.sender_role === 'client' && !m.read_at).map(m => m.id)
+    if (unreadIds.length) {
+      const { error: readError } = await supabase.from('support_messages').update({ read_at: new Date().toISOString() }).in('id', unreadIds)
+      if (readError) console.error('No se marcaron mensajes de soporte como leídos:', readError.message)
+    }
+    res.json({ ok: true, client, messages: messages || [] })
+  } catch (error) {
+    console.error('Error cargando conversación:', error)
+    res.status(500).json({ error: error.message || 'No se pudo cargar la conversación' })
+  }
+})
+
+router.post('/api/support/threads/:clientId/messages', async (req, res) => {
+  const message = String(req.body?.message || '').trim()
+  if (!message) return res.status(400).json({ error: 'Escribe una respuesta' })
+  if (message.length > 4000) return res.status(413).json({ error: 'Máximo 4000 caracteres' })
+  try {
+    const { data: client, error: clientError } = await supabase.from('clients').select('id, name').eq('id', req.params.clientId).maybeSingle()
+    if (clientError) throw clientError
+    if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
+    const { data, error } = await supabase.from('support_messages').insert({
+      client_id: req.params.clientId,
+      sender_role: 'admin',
+      message,
+      created_at: new Date().toISOString(),
+    }).select('id, client_id, sender_role, message, created_at, read_at').single()
+    if (error) throw error
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'SUPPORT_REPLY_SENT', client_id: client.id, message_id: data.id }))
+    res.status(201).json({ ok: true, message: data })
+  } catch (error) {
+    console.error('Error respondiendo soporte:', error)
+    res.status(500).json({ error: error.message || 'No se pudo enviar la respuesta' })
+  }
+})
+
 // ── Clients CRUD ──────────────────────────────────────────────────────────────
 
 const ONBOARDING_CLIENT_PREFIX = 'onboarding:'
@@ -178,7 +287,7 @@ router.get('/api/clients/:id/details', async (req, res) => {
 
       const { data: session, error: sessionError } = await supabase
         .from('license_activation_sessions')
-        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted')
+        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted, price_amount, price_type')
         .eq('activation_id', activationId)
         .maybeSingle()
 
@@ -241,13 +350,15 @@ router.get('/api/clients/:id/details', async (req, res) => {
           payment_deadline_at: session.payment_deadline_at || null,
           confirmation_deadline_at: session.confirmation_deadline_at || null,
           last_payment_reason: session.last_payment_reason || null,
+          payment: { amount: Number(session.price_amount || process.env.LICENSE_PRICE_AMOUNT || 28000), price_type: session.price_type || 'initial' },
           activation_secret: activationSecret,
           activation_secret_available: Boolean(session.activation_secret_encrypted),
           activation_secret_error: activationSecretError,
         },
         payment,
         payment_config: {
-          amount: process.env.LICENSE_PRICE_AMOUNT ? Number(process.env.LICENSE_PRICE_AMOUNT) : null,
+          amount: process.env.LICENSE_PRICE_AMOUNT ? Number(process.env.LICENSE_PRICE_AMOUNT) : 28000,
+          renewal_amount: process.env.LICENSE_RENEWAL_PRICE_AMOUNT ? Number(process.env.LICENSE_RENEWAL_PRICE_AMOUNT) : 10000,
           currency: String(process.env.LICENSE_PRICE_CURRENCY || 'CUP').trim().toUpperCase(),
           card: String(process.env.LICENSE_PAYMENT_CARD || '').trim() || null,
           confirmation_phone: String(process.env.LICENSE_PAYMENT_PHONE || '').trim() || null,
@@ -268,7 +379,7 @@ router.get('/api/clients/:id/details', async (req, res) => {
     if (client.id) {
       const { data, error } = await supabase
         .from('license_activation_sessions')
-        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted')
+        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted, price_amount, price_type')
         .eq('client_id', client.id)
         .order('created_at', { ascending: false })
         .limit(1)
@@ -281,7 +392,7 @@ router.get('/api/clients/:id/details', async (req, res) => {
     if (!session && client.phone_number && client.device_id) {
       const { data, error } = await supabase
         .from('license_activation_sessions')
-        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted')
+        .select('activation_id, phone_number, device_id, status, client_id, created_at, updated_at, paid_at, payment_started_at, payment_deadline_at, confirmation_deadline_at, last_payment_reason, activation_secret_encrypted, price_amount, price_type')
         .eq('phone_number', client.phone_number)
         .eq('device_id', client.device_id)
         .order('created_at', { ascending: false })
@@ -329,13 +440,15 @@ router.get('/api/clients/:id/details', async (req, res) => {
         payment_deadline_at: session.payment_deadline_at || null,
         confirmation_deadline_at: session.confirmation_deadline_at || null,
         last_payment_reason: session.last_payment_reason || null,
+        payment: { amount: Number(session.price_amount || process.env.LICENSE_PRICE_AMOUNT || 28000), price_type: session.price_type || 'initial' },
         activation_secret: activationSecret,
         activation_secret_available: Boolean(session.activation_secret_encrypted),
         activation_secret_error: activationSecretError,
       } : null,
       payment,
       payment_config: {
-        amount: process.env.LICENSE_PRICE_AMOUNT ? Number(process.env.LICENSE_PRICE_AMOUNT) : null,
+        amount: process.env.LICENSE_PRICE_AMOUNT ? Number(process.env.LICENSE_PRICE_AMOUNT) : 28000,
+        renewal_amount: process.env.LICENSE_RENEWAL_PRICE_AMOUNT ? Number(process.env.LICENSE_RENEWAL_PRICE_AMOUNT) : 10000,
         currency: String(process.env.LICENSE_PRICE_CURRENCY || 'CUP').trim().toUpperCase(),
         card: String(process.env.LICENSE_PAYMENT_CARD || '').trim() || null,
         confirmation_phone: String(process.env.LICENSE_PAYMENT_PHONE || '').trim() || null,
@@ -413,6 +526,50 @@ router.post('/api/clients', async (req, res) => {
     .from('clients').insert(payload).select().single()
   if (error) return res.status(500).json({ error: error.message })
   res.status(201).json(data)
+})
+
+router.put('/api/clients/:id/role', async (req, res) => {
+  const role = String(req.body?.role || '').trim().toLowerCase()
+  if (!['admin', 'client'].includes(role)) return res.status(400).json({ error: 'Rol inválido: usa admin o client' })
+  try {
+    const { data: target, error: targetError } = await supabase.from('clients')
+      .select('id, role, expires_at, active, token')
+      .eq('id', req.params.id)
+      .maybeSingle()
+    if (targetError) throw targetError
+    if (!target) return res.status(404).json({ error: 'Cliente no encontrado' })
+    if (target.role === role) return res.json({ ok: true, unchanged: true, client: target })
+
+    if (target.role === 'admin' && role === 'client') {
+      const { data: admins, error: adminsError } = await supabase.from('clients').select('id').eq('role', 'admin').eq('active', true)
+      if (adminsError) throw adminsError
+      if ((admins || []).length <= 1) return res.status(409).json({ error: 'No puedes quitar el rol al último administrador activo' })
+    }
+
+    const patch = { role }
+    if (role === 'admin') {
+      patch.expires_at = null
+      patch.active = true
+    } else {
+      const currentExpires = target.expires_at ? new Date(target.expires_at).getTime() : 0
+      patch.expires_at = currentExpires > Date.now()
+        ? target.expires_at
+        : new Date(Date.now() + Math.max(1, Number(process.env.LICENSE_DURATION_DAYS || 30)) * 86400000).toISOString()
+    }
+    const { data, error } = await supabase.from('clients').update(patch).eq('id', req.params.id).select('id, name, role, active, expires_at, token').single()
+    if (error) throw error
+    // Promoting an expired client to admin must also restore the current token;
+    // old tokens remain blacklisted because a new token is generated on renewal.
+    if (role === 'admin' && data.token) {
+      const { error: restoreError } = await supabase.from('token_blacklist').delete().eq('token', data.token)
+      if (restoreError) throw restoreError
+    }
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'CLIENT_ROLE_CHANGED', client_id: data.id, role: data.role }))
+    res.json({ ok: true, client: data })
+  } catch (error) {
+    console.error('Error cambiando rol:', error)
+    res.status(500).json({ error: error.message || 'No se pudo cambiar el rol' })
+  }
 })
 
 router.put('/api/clients/:id/toggle', async (req, res) => {
@@ -916,6 +1073,35 @@ tr:hover td{background:#ffffff04}
 .log-body{font-size:12px;color:var(--text2);line-height:1.6;font-family:'Space Mono',monospace}
 .empty{padding:48px 20px;text-align:center;color:var(--muted);font-family:'Space Mono',monospace;font-size:12px}
 
+/* SUPPORT / SETTINGS */
+.support-layout{display:grid;grid-template-columns:minmax(240px,330px) 1fr;gap:14px;min-height:460px}
+.support-thread-list,.support-conversation,.automation-card{background:var(--surface);border:1px solid var(--border);border-radius:4px;min-width:0}
+.support-thread-list{max-height:620px;overflow:auto}
+.support-thread{padding:14px;border-bottom:1px solid var(--border);cursor:pointer}
+.support-thread:hover,.support-thread.selected{background:#ffffff08;border-left:3px solid var(--purple)}
+.support-thread strong{display:block;font-size:12px;margin-bottom:5px}
+.support-thread small{font:10px 'Space Mono',monospace;color:var(--muted)}
+.support-preview{font-size:12px;color:var(--text2);margin-top:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.support-conversation{display:flex;flex-direction:column;min-height:460px}
+.support-title{padding:15px;border-bottom:1px solid var(--border);font-weight:800}
+.support-messages{padding:16px;flex:1;overflow:auto;max-height:470px}
+.support-message{padding:11px 13px;border:1px solid var(--border);border-radius:5px;margin-bottom:10px;max-width:92%;white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.55}
+.support-message.client{background:#141a27;margin-right:auto}
+.support-message.admin{background:#211629;border-color:#4a2b61;margin-left:auto}
+.support-message small{display:block;margin-top:7px;color:var(--muted);font:9px 'Space Mono',monospace}
+.support-reply{padding:12px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+.support-reply textarea{flex:1;min-width:180px;min-height:72px;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:12px;border-radius:4px;font:12px 'Space Mono',monospace}
+.automation-card{padding:22px;max-width:760px}
+.automation-status{display:flex;gap:14px;align-items:center;margin-bottom:20px}
+.automation-status h3{font-size:18px}.automation-status p,.automation-hint{color:var(--muted);font-size:12px;margin-top:6px;line-height:1.5}
+.automation-switch{display:flex;align-items:center;gap:12px;margin:18px 0;cursor:pointer;font-size:13px}
+.automation-switch input{width:1px;height:1px;position:absolute;opacity:0}
+.switch-slider{width:46px;height:26px;background:#4c4c5c;border-radius:20px;position:relative;transition:.2s;flex-shrink:0}
+.switch-slider:before{content:'';position:absolute;width:20px;height:20px;background:white;left:3px;top:3px;border-radius:50%;transition:.2s}
+.automation-switch input:checked+.switch-slider{background:var(--green)}
+.automation-switch input:checked+.switch-slider:before{transform:translateX(20px)}
+@media(max-width:760px){.support-layout{grid-template-columns:1fr}.support-thread-list{max-height:240px}.support-conversation{min-height:380px}.tabs{overflow-x:auto}.tab{white-space:nowrap;padding:12px 14px}}
+
 /* TOAST */
 #toast{position:fixed;bottom:24px;right:24px;background:var(--green);color:#000;
   padding:12px 20px;font-family:'Space Mono',monospace;font-size:12px;font-weight:700;
@@ -964,6 +1150,8 @@ tr:hover td{background:#ffffff04}
     <div class="tabs">
       <div class="tab on" onclick="tab('clients')">Clientes</div>
       <div class="tab" onclick="tab('logs')">SMS Logs</div>
+      <div class="tab" onclick="tab('support')">Soporte <span id="support-unread-badge" class="badge badge-off" style="display:none">0</span></div>
+      <div class="tab" onclick="tab('automation')">Automatización</div>
     </div>
 
     <!-- CLIENTES -->
@@ -1017,6 +1205,31 @@ tr:hover td{background:#ffffff04}
       </div>
       <div id="logs-scope-label" style="color:var(--muted);font:11px 'Space Mono',monospace;margin:-10px 0 14px">Mostrando SMS con fecha de recepción de hoy (hora de Cuba)</div>
       <div id="logs-cont"><div class="loading">Cargando...</div></div>
+    </div>
+
+    <!-- SUPPORT -->
+    <div id="tab-support" style="display:none">
+      <div class="sec-head"><span class="sec-title">Bandeja de soporte</span><button class="btn btn-sm btn-blue" onclick="loadSupportThreads()">↻ Actualizar</button></div>
+      <div class="support-layout">
+        <div class="support-thread-list" id="support-thread-list"><div class="loading">Cargando conversaciones…</div></div>
+        <div class="support-conversation">
+          <div id="support-conversation-title" class="support-title">Selecciona un cliente</div>
+          <div id="support-messages" class="support-messages"><div class="empty">Las conversaciones aparecerán aquí.</div></div>
+          <div class="support-reply"><textarea id="support-reply-text" placeholder="Escribe la respuesta al cliente…" maxlength="4000"></textarea><button class="btn btn-primary btn-sm" style="width:auto;margin:0" onclick="sendSupportReply()">Enviar respuesta</button></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- AUTOMATION -->
+    <div id="tab-automation" style="display:none">
+      <div class="sec-head"><span class="sec-title">Disponibilidad del servicio automático</span><button class="btn btn-sm btn-blue" onclick="loadAutomationStatus()">↻ Actualizar</button></div>
+      <div class="automation-card">
+        <div class="automation-status"><span id="automation-dot" class="dot"></span><div><h3 id="automation-state">Cargando estado…</h3><p id="automation-description">—</p></div></div>
+        <label class="automation-switch"><input type="checkbox" id="automation-enabled" onchange="saveAutomationStatus()"><span class="switch-slider"></span><span>Automatización disponible</span></label>
+        <div class="inp-group"><label>Mensaje que verá el cliente cuando esté desactivada</label><textarea id="automation-message" maxlength="500" placeholder="La automatización está temporalmente fuera de servicio. No realices el pago hasta que vuelva a estar disponible."></textarea></div>
+        <button class="btn btn-primary btn-sm" style="width:auto" onclick="saveAutomationStatus(true)">Guardar mensaje</button>
+        <p class="automation-hint">Desactiva esto antes de desconectar el teléfono. La app debe consultar /api/system/status y bloquear el flujo de pago cuando automation_enabled sea false.</p>
+      </div>
     </div>
   </main>
 </div>
@@ -1233,6 +1446,7 @@ function renderClients(clients) {
         '<button class="btn btn-sm btn-blue" data-id="' + id + '" onclick="openWebhooksById(this.dataset.id)">Webhooks</button>' +
         '<button class="btn btn-sm btn-purple" data-id="' + id + '" onclick="renewToken(this.dataset.id, this.dataset.name)" data-name="' + name + '">↺ Token</button>' +
         '<button class="btn btn-sm btn-blue" data-id="' + id + '" onclick="showInfo(this.dataset.id)">Detalles</button>' +
+        '<button class="btn btn-sm btn-purple" data-id="' + id + '" data-role="' + escapeHtml(c.role || 'client') + '" data-name="' + name + '" onclick="changeRole(this.dataset.id, this.dataset.role, this.dataset.name)">' + (c.role === 'admin' ? 'Hacer cliente' : 'Hacer admin') + '</button>' +
         '<button class="btn btn-sm btn-red" data-id="' + id + '" onclick="deleteClient(this.dataset.id, this.dataset.name)" data-name="' + name + '">Eliminar</button>'
     }
 
@@ -1333,8 +1547,9 @@ async function showInfo(id) {
       <div class="detail-item"><div class="detail-key">Monedero</div><div class="detail-val">\${c.wallet || '—'}</div></div>
       <div class="detail-item"><div class="detail-key">Número a confirmar</div><div class="detail-val">\${cfg.confirmation_phone || '—'}</div></div>
       <div class="detail-item"><div class="detail-key">Tarjeta receptora</div><div class="detail-val">\${cfg.card || '—'}</div></div>
-      <div class="detail-item"><div class="detail-key">Precio licencia</div><div class="detail-val">\${cfg.amount || '—'} \${cfg.currency || ''}</div></div>
-      <div class="detail-item"><div class="detail-key">Último pago</div><div class="detail-val">\${p.status || '—'} · \${p.amount || '—'} \${p.currency || ''}</div></div>
+      <div class="detail-item"><div class="detail-key">Precio de esta activación</div><div class="detail-val">\${a.payment?.amount || cfg.amount || '—'} \${cfg.currency || ''} · \${a.payment?.price_type === 'renewal' ? 'Renovación' : 'Primer pago'}</div></div>
+      <div class="detail-item"><div class="detail-key">Tarifas</div><div class="detail-val">Primer pago: \${cfg.amount || '—'} · Renovación: \${cfg.renewal_amount || 10000} \${cfg.currency || 'CUP'}</div>
+      <div class="detail-item"><div class="detail-key">Último pago</div><div class="detail-val">\${p.status || '—'} · \${p.amount || '—'} \${p.currency || ''}</div></div></div>
       <div class="detail-item full"><div class="detail-key">TX / motivo</div><div class="detail-val">\${p.transaction_id || '—'} \${p.reason ? ' · ' + p.reason : ''}</div></div>
       <div class="detail-item full"><div class="detail-key">Webhooks</div><div class="detail-val">1: \${c.webhook_url || '—'}<br>2: \${c.webhook_url_2 || '—'}<br>3: \${c.webhook_url_3 || '—'}</div></div>
       <div class="detail-item full"><div class="detail-key">WebHook Secret</div><div class="detail-val">\${c.webhook_secret || 'No generado'}</div></div>
@@ -1403,12 +1618,99 @@ function renderLogs(logs) {
   }).join('')
 }
 
+// ── Support inbox ─────────────────────────────────────────────────────────────
+let SUPPORT_THREADS = []
+let SUPPORT_CLIENT_ID = null
+let SUPPORT_REFRESH = null
+
+async function loadSupportThreads() {
+  const list = document.getElementById('support-thread-list')
+  if (!list) return
+  const data = await api('/support/threads')
+  if (!data || data.error || !Array.isArray(data.threads)) {
+    list.innerHTML = '<div class="empty">' + escapeHtml(data?.error || 'No se pudo cargar soporte. Ejecuta la migración SQL.') + '</div>'
+    return
+  }
+  SUPPORT_THREADS = data.threads
+  const unread = SUPPORT_THREADS.reduce((n,t)=>n+Number(t.unread_count||0),0)
+  const badge = document.getElementById('support-unread-badge')
+  if (badge) { badge.textContent = unread; badge.style.display = unread ? 'inline-flex' : 'none' }
+  list.innerHTML = SUPPORT_THREADS.length ? SUPPORT_THREADS.map(t=>{
+    const c=t.client||{}
+    const selected=String(SUPPORT_CLIENT_ID)===String(t.client_id)
+    return '<div class="support-thread '+(selected?'selected':'')+'" data-id="'+escapeHtml(t.client_id)+'" onclick="openSupportThread(this.dataset.id)"><strong>'+escapeHtml(c.name||c.phone_number||t.client_id)+(t.unread_count?' <span class="badge badge-off">'+t.unread_count+'</span>':'')+'</strong><small>'+escapeHtml(c.phone_number||'Sin teléfono')+' · '+escapeHtml(new Date(t.latest_at).toLocaleString('es'))+'</small><div class="support-preview">'+escapeHtml(t.latest_message||'')+'</div></div>'
+  }).join('') : '<div class="empty">No hay conversaciones todavía.</div>'
+}
+
+async function openSupportThread(clientId) {
+  SUPPORT_CLIENT_ID=clientId
+  const data=await api('/support/threads/'+encodeURIComponent(clientId)+'/messages')
+  if(data.error) return toast(data.error,true)
+  const c=data.client||{}
+  document.getElementById('support-conversation-title').textContent=(c.name||'Cliente')+' · '+(c.phone_number||clientId)
+  const messages=Array.isArray(data.messages)?data.messages:[]
+  document.getElementById('support-messages').innerHTML=messages.length?messages.map(m=>'<div class="support-message '+(m.sender_role==='admin'?'admin':'client')+'">'+escapeHtml(m.message)+'<small>'+(m.sender_role==='admin'?'TÚ':'CLIENTE')+' · '+escapeHtml(new Date(m.created_at).toLocaleString('es'))+'</small></div>').join(''):'<div class="empty">Todavía no hay mensajes.</div>'
+  const box=document.getElementById('support-messages'); box.scrollTop=box.scrollHeight
+  await loadSupportThreads()
+}
+
+async function sendSupportReply() {
+  if(!SUPPORT_CLIENT_ID) return toast('Selecciona una conversación',true)
+  const field=document.getElementById('support-reply-text')
+  const message=String(field.value||'').trim()
+  if(!message) return toast('Escribe la respuesta',true)
+  const data=await api('/support/threads/'+encodeURIComponent(SUPPORT_CLIENT_ID)+'/messages',{method:'POST',body:JSON.stringify({message})})
+  if(data.error) return toast(data.error,true)
+  field.value=''
+  toast('Respuesta enviada a la bandeja del cliente')
+  await openSupportThread(SUPPORT_CLIENT_ID)
+}
+
+// ── Global automation status ──────────────────────────────────────────────────
+async function loadAutomationStatus() {
+  const data=await api('/system/automation')
+  if(data.error) return toast(data.error,true)
+  const enabled=data.enabled===true
+  document.getElementById('automation-enabled').checked=enabled
+  document.getElementById('automation-state').textContent=enabled?'AUTOMATIZACIÓN ACTIVA':'AUTOMATIZACIÓN DESACTIVADA'
+  document.getElementById('automation-description').textContent=enabled?'Los clientes pueden iniciar el flujo de pago.':'Los nuevos clientes deben ver el aviso y no iniciar pagos.'
+  document.getElementById('automation-dot').style.background=enabled?'var(--green)':'var(--error)'
+  document.getElementById('automation-dot').style.boxShadow=enabled?'0 0 8px var(--green)':'0 0 8px var(--error)'
+  document.getElementById('automation-message').value=data.message||''
+}
+
+async function saveAutomationStatus(messageOnly=false) {
+  const enabled=document.getElementById('automation-enabled').checked
+  const message=String(document.getElementById('automation-message').value||'').trim()
+  const data=await api('/system/automation',{method:'PUT',body:JSON.stringify({enabled,message})})
+  if(data.error) { toast(data.error,true); return loadAutomationStatus() }
+  toast(enabled?'Automatización activada':'Automatización desactivada')
+  await loadAutomationStatus()
+}
+
+async function changeRole(id,currentRole,name) {
+  const nextRole=currentRole==='admin'?'client':'admin'
+  const label=nextRole==='admin'?'ADMINISTRADOR':'CLIENTE'
+  if(!confirm('¿Cambiar el rol de '+name+' a '+label+'?')) return
+  const data=await api('/clients/'+encodeURIComponent(id)+'/role',{method:'PUT',body:JSON.stringify({role:nextRole})})
+  if(data.error) return toast(data.error,true)
+  toast('Rol actualizado: '+label)
+  await loadClients()
+}
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function tab(name) {
-  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('on',['clients','logs'][i]===name))
-  document.getElementById('tab-clients').style.display = name==='clients'?'block':'none'
-  document.getElementById('tab-logs').style.display = name==='logs'?'block':'none'
+  const names=['clients','logs','support','automation']
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('on',names[i]===name))
+  for (const key of names) {
+    const el=document.getElementById('tab-'+key)
+    if(el) el.style.display=key===name?'block':'none'
+  }
   if (name==='logs') loadLogs()
+  if (name==='support') loadSupportThreads()
+  if (name==='automation') loadAutomationStatus()
+  if (SUPPORT_REFRESH) { clearInterval(SUPPORT_REFRESH); SUPPORT_REFRESH=null }
+  if (name==='support') SUPPORT_REFRESH=setInterval(()=>{loadSupportThreads();if(SUPPORT_CLIENT_ID)openSupportThread(SUPPORT_CLIENT_ID)},10000)
 }
 
 function toggleForm() { document.getElementById('new-form').classList.toggle('open') }
