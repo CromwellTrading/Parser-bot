@@ -205,13 +205,33 @@ function decodeImage(body = {}) {
 }
 
 async function uploadImage(bucket, path, image) {
-  const { error } = await supabase.storage.from(bucket).upload(path, image.bytes, {
-    contentType: image.type,
-    cacheControl: '3600',
-    upsert: false,
-  })
-  if (error) throw error
-  return path
+  try {
+    const { error } = await supabase.storage.from(bucket).upload(path, image.bytes, {
+      contentType: image.type,
+      cacheControl: '3600',
+      upsert: false,
+    })
+    if (error) throw error
+    return path
+  } catch (storageError) {
+    const detail = String(storageError?.message || storageError || 'Error desconocido')
+    const lower = detail.toLowerCase()
+    const bucketMissing = /bucket.{0,30}(not found|does not exist|missing)|no such bucket|bucket not found/.test(lower)
+      || (Number(storageError?.statusCode || storageError?.status) === 404 && lower.includes('bucket'))
+    // Keep provider/configuration details in private server logs only; never return
+    // bucket names, storage errors or infrastructure details to the Android client.
+    console.error('[Game Market] Falló la carga de una imagen. Verifica la configuración del almacenamiento y la clave de servicio.', {
+      bucket,
+      statusCode: storageError?.statusCode || storageError?.status || null,
+      errorCode: storageError?.error || storageError?.code || null,
+      bucketMissing,
+      message: detail,
+    })
+    const safeError = new Error('No se pudo guardar la imagen en este momento. Inténtalo de nuevo más tarde.')
+    safeError.status = 503
+    safeError.code = bucketMissing ? 'IMAGE_BUCKET_NOT_CONFIGURED' : 'IMAGE_STORAGE_UNAVAILABLE'
+    throw safeError
+  }
 }
 
 async function loadCatalog({ admin = false, storeId = null } = {}) {
