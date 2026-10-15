@@ -14,7 +14,8 @@ app.use((req, res, next) => {
 })
 
 app.use(express.json({
-  limit: '64kb',
+  // Optimized gallery images are sent as base64 to the backend before upload to Supabase Storage.
+  limit: '3mb',
   verify: (req, res, buf) => {
     req.rawBody = buf.toString('utf8')
   }
@@ -27,6 +28,7 @@ const panelRoutes = require('./routes/panel')
 const adminRoutes = require('./routes/admin')
 const supportRoutes = require('./routes/support')
 const systemRoutes = require('./routes/system')
+const gameMarketRoutes = require('./routes/gameMarket')
 const { startWebhookWorker } = require('./utils/webhookDelivery')
 const { startLicenseExpiryWorker } = require('./utils/licenseExpiry')
 
@@ -37,6 +39,7 @@ app.use('/panel', panelRoutes)
 app.use('/api/admin', adminRoutes)
 app.use('/api/support', supportRoutes)
 app.use('/api/system', systemRoutes)
+app.use('/api/game-market', gameMarketRoutes)
 
 startWebhookWorker()
 startLicenseExpiryWorker()
