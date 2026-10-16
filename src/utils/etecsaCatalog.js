@@ -113,9 +113,11 @@ async function fetchJson(path) {
     throw error
   }
   if (!response.ok) {
-    const error = new Error(`El proveedor respondió con estado ${response.status}.`)
+    const error = new Error(`El proveedor respondió con estado HTTP ${response.status}.`)
     error.code = response.status === 401 || response.status === 403 ? 'SOKY_AUTH_ERROR' : 'SOKY_HTTP_ERROR'
     error.status = response.status
+    // Safe diagnostics only: never include the Authorization header or token.
+    error.endpoint = String(path).split('?')[0]
     throw error
   }
   try {
@@ -295,6 +297,14 @@ async function getCatalogResponse() {
   }
 }
 
+function safeProviderErrorDetails(error) {
+  return {
+    code: String(error?.code || 'REFRESH_FAILED'),
+    http_status: Number.isInteger(error?.status) ? error.status : null,
+    endpoint: typeof error?.endpoint === 'string' ? error.endpoint : null,
+  }
+}
+
 function startCatalogWorker() {
   if (workerStarted) return
   workerStarted = true
@@ -304,13 +314,13 @@ function startCatalogWorker() {
       if (error.code === 'SOKY_TOKEN_NOT_CONFIGURED') {
         console.warn('Catálogo ETECSA pendiente: configura SOKY_APP_TOKEN en el servidor.')
       } else {
-        console.error('No se pudo actualizar el catálogo ETECSA:', error.code || error.message)
+        console.error('No se pudo actualizar el catálogo ETECSA:', JSON.stringify(safeProviderErrorDetails(error)))
       }
     })
   }, 5_000)
   setInterval(() => {
     refreshCatalog().catch(error => {
-      console.error('No se pudo actualizar el catálogo ETECSA:', error.code || error.message)
+      console.error('No se pudo actualizar el catálogo ETECSA:', JSON.stringify(safeProviderErrorDetails(error)))
     })
   }, REFRESH_INTERVAL_MS)
 }
