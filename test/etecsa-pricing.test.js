@@ -14,6 +14,7 @@ const {
   verifiedCategoryIds,
   verifiedPromotionCategoryIds,
   normalizeOffer,
+  normalizeCatalogOffers,
   sanitizeCustomerText,
 } = require('../src/utils/etecsaOfferFilter')
 
@@ -59,6 +60,52 @@ test('ETECSA filter includes verified named offers or linked verified operators 
   assert.equal(offerMatchesEtecsa({ id: 11, type: 'recharge', name: 'Bono 25 GB', category: { name: 'Promociones' } }, ids), true)
   assert.equal(offerMatchesEtecsa({ id: 12, type: 'nauta', name: 'Cuenta Nauta', category: { name: 'Promociones' } }, ids), true)
   assert.equal(offerMatchesEtecsa({ id: 13, type: 'sim', name: 'SIM promocional', category: { name: 'Promociones' } }, ids), false)
+})
+
+
+test('catalog includes all available recharge and Nauta offers even when identity metadata is missing', () => {
+  const rawOffers = Array.from({ length: 8 }, (_, index) => ({
+    id: index + 1,
+    type: 'recharge',
+    name: `Promoción móvil ${index + 1}`,
+    available: true,
+    currency: { code: 'USD' },
+    prices: [{ id: `price-${index + 1}`, label: `${index + 1} GB`, value: '2.50' }],
+  }))
+  rawOffers.push({
+    id: 9,
+    type: 'nauta',
+    name: 'Cuenta Nauta',
+    available: true,
+    currency: { code: 'USD' },
+    prices: [{ id: 'price-nauta', label: 'Nauta', value: '1.50' }],
+  })
+  rawOffers.push({
+    id: 10,
+    type: 'sim',
+    name: 'SIM excluded',
+    available: true,
+    currency: { code: 'USD' },
+    prices: [{ id: 'price-sim', label: 'SIM', value: '3.00' }],
+  })
+
+  const result = normalizeCatalogOffers(rawOffers)
+  assert.equal(result.offers.length, 9)
+  assert.equal(result.diagnostics.unsupported_type_count, 1)
+  assert.equal(result.diagnostics.invalid_currency_or_price_count, 0)
+  assert.equal(result.offers.some(offer => offer.name === 'Promoción móvil 1'), true)
+  assert.equal(result.offers.some(offer => offer.name === 'Cuenta Nauta'), true)
+  assert.equal(result.offers.some(offer => offer.name === 'SIM excluded'), false)
+})
+
+test('catalog reports offers that cannot be priced instead of silently treating them as ETECSA offers', () => {
+  const result = normalizeCatalogOffers([
+    { id: 1, type: 'recharge', name: 'Promotion without price', available: true, currency: { code: 'USD' }, prices: [] },
+    { id: 2, type: 'recharge', name: 'Unavailable', available: false, currency: { code: 'USD' }, prices: [{ id: 'a', label: '1 GB', value: '2' }] },
+  ])
+  assert.equal(result.offers.length, 0)
+  assert.equal(result.diagnostics.unavailable_count, 1)
+  assert.equal(result.diagnostics.invalid_currency_or_price_count, 1)
 })
 
 test('offers with an unverified currency or no valid priced line are excluded', () => {
