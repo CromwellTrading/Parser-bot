@@ -145,9 +145,18 @@ router.post('/admin/refresh', requireAdmin, async (req, res) => {
       return res.status(503).json({ error: 'El catálogo todavía no está conectado.' })
     }
     if (error.code === 'SOKY_AUTH_ERROR') {
+      console.error('Error de autenticación con SokyRecargas:', JSON.stringify({
+        code: error.code,
+        http_status: Number.isInteger(error.status) ? error.status : null,
+        endpoint: typeof error.endpoint === 'string' ? error.endpoint : null,
+      }))
       return res.status(503).json({ error: 'No se pudo actualizar el catálogo. Comprueba la configuración del servicio.' })
     }
-    console.error('Error actualizando catálogo ETECSA:', error.code || error.message)
+    console.error('Error actualizando catálogo ETECSA:', JSON.stringify({
+      code: error.code || 'ETECSA_REFRESH_FAILED',
+      http_status: Number.isInteger(error.status) ? error.status : null,
+      endpoint: typeof error.endpoint === 'string' ? error.endpoint : null,
+    }))
     return res.status(503).json({ error: 'No se pudo actualizar el catálogo ahora mismo.' })
   }
 })
