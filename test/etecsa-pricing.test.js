@@ -43,6 +43,8 @@ test('ETECSA filter includes verified named offers or linked verified operators 
   assert.equal(offerMatchesEtecsa({ id: 3, type: 'recharge', name: 'Generic Mobile Credit', operator_id: 9 }, ids), true)
   assert.equal(offerMatchesEtecsa({ id: 4, type: 'recharge', name: 'Generic Mobile Credit', operator_id: 10 }, ids), false)
   assert.equal(offerMatchesEtecsa({ id: 5, type: 'other', name: 'Cubacel 500 CUP' }, ids), false)
+  assert.equal(offerMatchesEtecsa({ id: 8, type: 'sim', name: 'Cubacel SIM' }, ids), false)
+  assert.equal(offerMatchesEtecsa({ id: 9, type: 'subscription', name: 'Cubacel Subscription' }, ids), false)
   assert.equal(offerMatchesEtecsa({ id: 6, type: 'nauta', name: 'Unknown offer', category_id: 2 }, ids, categoryIds), true)
   assert.equal(offerMatchesEtecsa({ id: 7, type: 'recharge', name: 'Generic top-up', category_id: 3 }, ids, categoryIds), false)
 })
