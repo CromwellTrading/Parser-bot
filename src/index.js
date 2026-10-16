@@ -29,6 +29,8 @@ const adminRoutes = require('./routes/admin')
 const supportRoutes = require('./routes/support')
 const systemRoutes = require('./routes/system')
 const gameMarketRoutes = require('./routes/gameMarket')
+const etecsaRoutes = require('./routes/etecsa')
+const { startCatalogWorker: startEtecsaCatalogWorker } = require('./utils/etecsaCatalog')
 const { startWebhookWorker } = require('./utils/webhookDelivery')
 const { startLicenseExpiryWorker } = require('./utils/licenseExpiry')
 
@@ -40,9 +42,11 @@ app.use('/api/admin', adminRoutes)
 app.use('/api/support', supportRoutes)
 app.use('/api/system', systemRoutes)
 app.use('/api/game-market', gameMarketRoutes)
+app.use('/api/etecsa', etecsaRoutes)
 
 startWebhookWorker()
 startLicenseExpiryWorker()
+startEtecsaCatalogWorker()
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'SynthesisOne Backend' })
