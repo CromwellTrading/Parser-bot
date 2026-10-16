@@ -113,11 +113,44 @@ async function fetchJson(path) {
     throw error
   }
   if (!response.ok) {
+    // Read the provider's validation response, but expose only allow-listed
+    // message/errors fields. Never log headers, raw response bodies, or tokens.
+    let providerPayload = null
+    try {
+      const rawBody = await response.text()
+      if (rawBody && rawBody.length <= 20000) providerPayload = JSON.parse(rawBody)
+    } catch (_) {
+      providerPayload = null
+    }
+
+    const cleanText = (value, maxLength = 240) => {
+      if (typeof value !== 'string') return null
+      return value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maxLength) || null
+    }
+    const cleanValidationErrors = (errors) => {
+      if (!errors || typeof errors !== 'object' || Array.isArray(errors)) return null
+      const safe = {}
+      for (const [field, details] of Object.entries(errors).slice(0, 8)) {
+        const safeField = String(field).replace(/[^a-zA-Z0-9_.\-[\]]/g, '').slice(0, 80)
+        if (!safeField) continue
+        const values = Array.isArray(details) ? details : [details]
+        const messages = values.slice(0, 3).map(item => {
+          if (typeof item === 'string' || typeof item === 'number') return cleanText(String(item), 180)
+          return null
+        }).filter(Boolean)
+        if (messages.length) safe[safeField] = messages
+      }
+      return Object.keys(safe).length ? safe : null
+    }
+
     const error = new Error(`El proveedor respondió con estado HTTP ${response.status}.`)
     error.code = response.status === 401 || response.status === 403 ? 'SOKY_AUTH_ERROR' : 'SOKY_HTTP_ERROR'
     error.status = response.status
     // Safe diagnostics only: never include the Authorization header or token.
     error.endpoint = String(path).split('?')[0]
+    error.providerMessage = cleanText(providerPayload?.message)
+    error.providerErrorCode = cleanText(providerPayload?.error?.code || providerPayload?.code, 100)
+    error.validationErrors = response.status === 422 ? cleanValidationErrors(providerPayload?.errors) : null
     throw error
   }
   try {
@@ -298,11 +331,23 @@ async function getCatalogResponse() {
 }
 
 function safeProviderErrorDetails(error) {
-  return {
+  const details = {
     code: String(error?.code || 'REFRESH_FAILED'),
     http_status: Number.isInteger(error?.status) ? error.status : null,
     endpoint: typeof error?.endpoint === 'string' ? error.endpoint : null,
   }
+  // Validation detail is particularly important for HTTP 422. Include only
+  // parsed, allow-listed fields; never include the raw body or Authorization.
+  if (error?.status === 422) {
+    if (typeof error.providerMessage === 'string' && error.providerMessage) {
+      details.provider_message = error.providerMessage
+    }
+    if (typeof error.providerErrorCode === 'string' && error.providerErrorCode) {
+      details.provider_error_code = error.providerErrorCode
+    }
+    if (error.validationErrors) details.validation_errors = error.validationErrors
+  }
+  return details
 }
 
 function startCatalogWorker() {
