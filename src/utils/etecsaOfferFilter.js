@@ -1,7 +1,7 @@
 'use strict'
 
 const { normalizeRate } = require('./etecsaPricing')
-const ALLOWED_TYPES = new Set(['recharge', 'nauta', 'sim', 'subscription'])
+const ALLOWED_TYPES = new Set(['recharge', 'nauta'])
 const VERIFIED_TERMS = /\b(etecsa|cubacel|nauta)\b/i
 const USD_CODES = new Set(['USD', 'USDT'])
 

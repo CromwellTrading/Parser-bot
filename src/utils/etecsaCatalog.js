@@ -164,7 +164,7 @@ async function fetchJson(path) {
 }
 
 async function fetchAndNormalizeCatalog() {
-  const types = ['recharge', 'nauta', 'sim', 'subscription']
+  const types = ['recharge', 'nauta']
     .map(type => `types%5B%5D=${encodeURIComponent(type)}`).join('&')
 
   const [offersResult, operatorsResult, categoriesResult] = await Promise.allSettled([
@@ -285,7 +285,10 @@ async function getCatalogForDisplay({ forceRefresh = false } = {}) {
 }
 
 function mapCatalogForClient(cache, settings) {
-  return cache.offers.map(offer => {
+  // Keep the chosen scope even when falling back to an older persisted cache.
+  return cache.offers
+    .filter(offer => ['recharge', 'nauta'].includes(String(offer?.type || '').trim().toLowerCase()))
+    .map(offer => {
     const prices = offer.prices.map(price => {
       const label = sanitizeCustomerText(price.label, 120)
       const converted = calculateOfferPrices(price.cost_usd, settings)
