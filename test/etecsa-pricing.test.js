@@ -8,7 +8,14 @@ const {
   calculateOfferPrices,
   isPricingConfigured,
 } = require('../src/utils/etecsaPricing')
-const { offerMatchesEtecsa, verifiedOperatorIds, verifiedCategoryIds, normalizeOffer, sanitizeCustomerText } = require('../src/utils/etecsaOfferFilter')
+const {
+  offerMatchesEtecsa,
+  verifiedOperatorIds,
+  verifiedCategoryIds,
+  verifiedPromotionCategoryIds,
+  normalizeOffer,
+  sanitizeCustomerText,
+} = require('../src/utils/etecsaOfferFilter')
 
 test('ETECSA retail prices always round UP to a multiple of five', () => {
   assert.equal(calculateRetailPrice('7', '1'), 10)
@@ -38,6 +45,7 @@ test('rates are normalized as decimal strings and invalid values rejected', () =
 test('ETECSA filter includes verified named offers or linked verified operators only', () => {
   const ids = verifiedOperatorIds([{ id: 9, name: 'Cubacel' }, { id: 10, name: 'Another operator' }])
   const categoryIds = verifiedCategoryIds([{ id: 2, name: 'Nauta' }, { id: 3, name: 'Recargas' }])
+  const promotionCategoryIds = verifiedPromotionCategoryIds([{ id: 7, name: 'Promociones' }])
   assert.equal(offerMatchesEtecsa({ id: 1, type: 'recharge', name: 'Cubacel 500 CUP' }, ids), true)
   assert.equal(offerMatchesEtecsa({ id: 2, type: 'nauta', name: 'Cuenta Nauta' }, ids), true)
   assert.equal(offerMatchesEtecsa({ id: 3, type: 'recharge', name: 'Generic Mobile Credit', operator_id: 9 }, ids), true)
@@ -47,6 +55,10 @@ test('ETECSA filter includes verified named offers or linked verified operators 
   assert.equal(offerMatchesEtecsa({ id: 9, type: 'subscription', name: 'Cubacel Subscription' }, ids), false)
   assert.equal(offerMatchesEtecsa({ id: 6, type: 'nauta', name: 'Unknown offer', category_id: 2 }, ids, categoryIds), true)
   assert.equal(offerMatchesEtecsa({ id: 7, type: 'recharge', name: 'Generic top-up', category_id: 3 }, ids, categoryIds), false)
+  assert.equal(offerMatchesEtecsa({ id: 10, type: 'recharge', name: 'Bono 25 GB', category_id: 7 }, ids, categoryIds, promotionCategoryIds), true)
+  assert.equal(offerMatchesEtecsa({ id: 11, type: 'recharge', name: 'Bono 25 GB', category: { name: 'Promociones' } }, ids), true)
+  assert.equal(offerMatchesEtecsa({ id: 12, type: 'nauta', name: 'Cuenta Nauta', category: { name: 'Promociones' } }, ids), true)
+  assert.equal(offerMatchesEtecsa({ id: 13, type: 'sim', name: 'SIM promocional', category: { name: 'Promociones' } }, ids), false)
 })
 
 test('offers with an unverified currency or no valid priced line are excluded', () => {
