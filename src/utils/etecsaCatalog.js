@@ -6,7 +6,14 @@ const {
   calculateOfferPrices,
   isPricingConfigured,
 } = require('./etecsaPricing')
-const { sanitizeCustomerText, verifiedOperatorIds, verifiedCategoryIds, offerMatchesEtecsa, normalizeOffer } = require('./etecsaOfferFilter')
+const {
+  sanitizeCustomerText,
+  verifiedOperatorIds,
+  verifiedCategoryIds,
+  verifiedPromotionCategoryIds,
+  offerMatchesEtecsa,
+  normalizeOffer,
+} = require('./etecsaOfferFilter')
 
 const SOKY_API_BASE = 'https://api.sokyrecargas.com/api/v1'
 const SETTINGS_KEY = 'etecsa_pricing'
@@ -191,9 +198,13 @@ async function fetchAndNormalizeCatalog() {
   const categories = categoriesResult.status === 'fulfilled' ? (extractRows(categoriesResult.value) || []) : []
   const operatorIds = verifiedOperatorIds(operators)
   const categoryIds = verifiedCategoryIds(categories)
-  const normalized = rawOffers
-    .filter(offer => offer?.available !== false)
-    .filter(offer => offerMatchesEtecsa(offer, operatorIds, categoryIds))
+  const promotionCategoryIds = verifiedPromotionCategoryIds(categories)
+  const availableOffers = rawOffers.filter(offer => offer?.available !== false)
+  const allowedTypeOffers = availableOffers.filter(offer => ['recharge', 'nauta'].includes(String(offer?.type || '').trim().toLowerCase()))
+  const identityVerifiedOffers = allowedTypeOffers.filter(offer =>
+    offerMatchesEtecsa(offer, operatorIds, categoryIds, promotionCategoryIds),
+  )
+  const normalized = identityVerifiedOffers
     .map(normalizeOffer)
     .filter(Boolean)
     .sort((a, b) => a.name.localeCompare(b.name, 'es'))
@@ -208,6 +219,15 @@ async function fetchAndNormalizeCatalog() {
     checked_at: new Date().toISOString(),
     source_offer_count: rawOffers.length,
     verified_offer_count: normalized.length,
+    // Counts help distinguish identity-filter issues from malformed/unpriced
+    // provider rows without exposing provider costs or authentication data.
+    catalog_diagnostics: {
+      unavailable_count: rawOffers.length - availableOffers.length,
+      unsupported_type_count: availableOffers.length - allowedTypeOffers.length,
+      identity_unverified_count: allowedTypeOffers.length - identityVerifiedOffers.length,
+      invalid_currency_or_price_count: identityVerifiedOffers.length - normalized.length,
+      promotion_category_count: promotionCategoryIds.size,
+    },
   }
 }
 
@@ -234,6 +254,7 @@ async function refreshCatalog() {
       event: 'ETECSA_CATALOG_REFRESHED',
       source_offer_count: next.source_offer_count,
       verified_offer_count: next.verified_offer_count,
+      ...next.catalog_diagnostics,
     }))
     return next
   })()

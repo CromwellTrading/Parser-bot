@@ -3,6 +3,12 @@
 const { normalizeRate } = require('./etecsaPricing')
 const ALLOWED_TYPES = new Set(['recharge', 'nauta'])
 const VERIFIED_TERMS = /\b(etecsa|cubacel|nauta)\b/i
+// Soky's /recharges/offers catalog is specifically for Cuban recharge offers.
+// Some current ETECSA top-up promotions are categorized simply as "Promociones"
+// and their offer name/description does not contain the operator name. We only
+// use that generic category as identity evidence for type=recharge, never for
+// other offer types.
+const PROMOTION_CATEGORY_TERMS = /\b(promocion(?:es)?|promotion(?:s)?)\b/i
 const USD_CODES = new Set(['USD', 'USDT'])
 
 const FOREIGN_CURRENCY_CODES = /\b(?:USD|USDT|USDC|EUR|GBP|CAD|AUD|NZD|MXN|MLC|BTC|ETH|DOP|BRL|COP|CLP|ARS|CNY|JPY|CHF|RUB|TRY|PEN)\b/i
@@ -47,7 +53,22 @@ function verifiedCategoryIds(categories) {
   return ids
 }
 
-function offerMatchesEtecsa(offer, validOperatorIds = new Set(), validCategoryIds = new Set()) {
+function verifiedPromotionCategoryIds(categories) {
+  const ids = new Set()
+  for (const category of categories) {
+    if (!category || category.id === undefined || category.id === null) continue
+    const text = normalizeText(`${category.name || ''} ${category.slug || ''}`)
+    if (PROMOTION_CATEGORY_TERMS.test(text)) ids.add(String(category.id))
+  }
+  return ids
+}
+
+function offerMatchesEtecsa(
+  offer,
+  validOperatorIds = new Set(),
+  validCategoryIds = new Set(),
+  promotionCategoryIds = new Set(),
+) {
   const type = normalizeText(offer?.type)
   if (!ALLOWED_TYPES.has(type)) return false
   const explicitText = [
@@ -71,7 +92,21 @@ function offerMatchesEtecsa(offer, validOperatorIds = new Set(), validCategoryId
   const categoryIds = [offer?.category_id, offer?.category?.id]
     .filter(value => value !== undefined && value !== null)
     .map(String)
-  return categoryIds.some(id => validCategoryIds.has(id))
+  if (categoryIds.some(id => validCategoryIds.has(id))) return true
+
+  // Current ETECSA promo rows may only identify the generic "Promociones"
+  // category. The source endpoint is Soky's Cuban recharge catalog, so accept
+  // those rows as ETECSA recharge promotions while keeping other types out.
+  if (type === 'recharge') {
+    const categoryText = normalizeText([
+      offer?.category?.name,
+      offer?.category?.slug,
+      offer?.category_name,
+    ].filter(Boolean).join(' '))
+    if (PROMOTION_CATEGORY_TERMS.test(categoryText)) return true
+    if (categoryIds.some(id => promotionCategoryIds.has(id))) return true
+  }
+  return false
 }
 
 function readProviderValue(price) {
@@ -113,4 +148,12 @@ function normalizeOffer(offer) {
   }
 }
 
-module.exports = { normalizeText, sanitizeCustomerText, verifiedOperatorIds, verifiedCategoryIds, offerMatchesEtecsa, normalizeOffer }
+module.exports = {
+  normalizeText,
+  sanitizeCustomerText,
+  verifiedOperatorIds,
+  verifiedCategoryIds,
+  verifiedPromotionCategoryIds,
+  offerMatchesEtecsa,
+  normalizeOffer,
+}
