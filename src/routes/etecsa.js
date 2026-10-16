@@ -2,6 +2,13 @@
 
 const express = require('express')
 const supabase = require('../supabase')
+const { getLicenseConfig } = require('../utils/onboarding')
+const { getAutomationAvailability } = require('../utils/systemSettings')
+const {
+  getCheckoutConfig, getCurrentOrder, getRecentOrders, getOwnedOrderPublic,
+  createPaymentOrder, cancelPaymentOrder, submitRecipientDetails,
+  verifySokyWebhookSignature, handleSokyWebhook, listAdminOrders,
+} = require('../utils/etecsaOrders')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const {
   getPricingSettings,
@@ -78,7 +85,108 @@ function sendCatalogError(res, error) {
   return res.status(503).json({ code: error.code || 'ETECSA_CATALOG_UNAVAILABLE', error: 'No se pudo cargar el catálogo en este momento.' })
 }
 
+// Soky callback endpoint is public but accepts only signed, recent webhook events.
+router.post('/webhook', async (req, res) => {
+  const secret = String(process.env.SOKY_WEBHOOK_SECRET || '').trim()
+  const rawBody = typeof req.rawBody === 'string' ? req.rawBody : ''
+  const signature = String(req.headers['x-soky-signature'] || '')
+  if (!secret || !verifySokyWebhookSignature(rawBody, signature, secret)) {
+    return res.status(401).json({ error: 'Firma de proveedor inválida.' })
+  }
+  try {
+    const result = await handleSokyWebhook(req.body || {})
+    return res.status(200).json({ ok: true, ...result })
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ error: error.message })
+    console.error('Error procesando aviso Soky ETECSA:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudo procesar el aviso.' })
+  }
+})
+
 router.use(requireClient)
+
+router.get('/checkout/config', async (req, res) => {
+  try {
+    const config = await getCheckoutConfig()
+    return res.json({ ok: true, ...config })
+  } catch (error) {
+    console.error('Error leyendo configuración de pago ETECSA:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudo comprobar la disponibilidad de pagos.' })
+  }
+})
+
+router.get('/orders/current', async (req, res) => {
+  try {
+    return res.json({ ok: true, order: await getCurrentOrder(req.client.id) })
+  } catch (error) {
+    console.error('Error leyendo ticket ETECSA:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudo consultar la operación actual.' })
+  }
+})
+
+router.get('/orders/recent', async (req, res) => {
+  try {
+    return res.json({ ok: true, orders: await getRecentOrders(req.client.id) })
+  } catch (error) {
+    console.error('Error leyendo pedidos recientes ETECSA:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudieron consultar tus operaciones.' })
+  }
+})
+
+router.get('/orders/:id', async (req, res) => {
+  try {
+    const order = await getOwnedOrderPublic(req.client.id, req.params.id)
+    if (!order) return res.status(404).json({ error: 'No se encontró esta operación.' })
+    return res.json({ ok: true, order })
+  } catch (error) {
+    console.error('Error leyendo ticket ETECSA:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudo consultar la operación.' })
+  }
+})
+
+router.post('/orders', async (req, res) => {
+  try {
+    const order = await createPaymentOrder(req.client, req.body || {})
+    return res.status(201).json({ ok: true, order })
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({
+      code: error.code || 'ETECSA_ORDER_ERROR', error: error.message,
+      ...(error.order ? { order: error.order } : {}),
+    })
+    console.error('Error creando ticket ETECSA:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudo crear el ticket. Inténtalo de nuevo.' })
+  }
+})
+
+router.post('/orders/:id/cancel', async (req, res) => {
+  try {
+    const order = await cancelPaymentOrder(req.client.id, req.params.id)
+    return res.json({ ok: true, order })
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ code: error.code || 'ETECSA_ORDER_ERROR', error: error.message })
+    console.error('Error cancelando ticket ETECSA:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudo cancelar la operación.' })
+  }
+})
+
+router.post('/orders/:id/recipient', async (req, res) => {
+  try {
+    const order = await submitRecipientDetails(req.client.id, req.params.id, req.body || {})
+    return res.json({ ok: true, order })
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ code: error.code || 'ETECSA_ORDER_ERROR', error: error.message })
+    console.error('Error enviando pedido ETECSA a Soky:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudo enviar la solicitud. No realices otro pago.' })
+  }
+})
+
+router.get('/admin/orders', requireAdmin, async (req, res) => {
+  try { return res.json({ ok: true, orders: await listAdminOrders() }) }
+  catch (error) {
+    console.error('Error consultando tickets ETECSA de administración:', error.code || error.message)
+    return res.status(500).json({ error: 'No se pudieron cargar los tickets.' })
+  }
+})
 
 router.get('/catalog', async (req, res) => {
   res.set('Cache-Control', 'no-store')
@@ -145,18 +253,9 @@ router.post('/admin/refresh', requireAdmin, async (req, res) => {
       return res.status(503).json({ error: 'El catálogo todavía no está conectado.' })
     }
     if (error.code === 'SOKY_AUTH_ERROR') {
-      console.error('Error de autenticación con SokyRecargas:', JSON.stringify({
-        code: error.code,
-        http_status: Number.isInteger(error.status) ? error.status : null,
-        endpoint: typeof error.endpoint === 'string' ? error.endpoint : null,
-      }))
       return res.status(503).json({ error: 'No se pudo actualizar el catálogo. Comprueba la configuración del servicio.' })
     }
-    console.error('Error actualizando catálogo ETECSA:', JSON.stringify({
-      code: error.code || 'ETECSA_REFRESH_FAILED',
-      http_status: Number.isInteger(error.status) ? error.status : null,
-      endpoint: typeof error.endpoint === 'string' ? error.endpoint : null,
-    }))
+    console.error('Error actualizando catálogo ETECSA:', error.code || error.message)
     return res.status(503).json({ error: 'No se pudo actualizar el catálogo ahora mismo.' })
   }
 })

@@ -8,6 +8,7 @@ const { parseSms, normalizePhone } = require('../utils/parser')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { createEventId, ensureWebhookSecret, queueWebhookDeliveries } = require('../utils/webhookDelivery')
 const { expireDueLicenses } = require('../utils/licenseExpiry')
+const { processIncomingTransfer } = require('../utils/etecsaOrders')
 
 const MAX_SMS_AGE_MS = Number(process.env.MAX_SMS_AGE_MS || 30 * 24 * 60 * 60 * 1000)
 const MAX_FUTURE_SKEW_MS = Number(process.env.MAX_SMS_FUTURE_SKEW_MS || 5 * 60 * 1000)
@@ -162,7 +163,10 @@ router.post('/ingest', async (req, res) => {
         webhookClient = await ensureWebhookSecret(client)
         await queueWebhookDeliveries({ client: webhookClient, payload: webhookPayload, eventId, logId: existing.id })
       }
-      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, event_id: eventId, status: 'QUEUED' })
+      let etecsaOrderUpdate = null
+      try { etecsaOrderUpdate = await processIncomingTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
+      catch (orderError) { console.error('Error comprobando pago de ticket ETECSA:', orderError.code || orderError.message) }
+      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, event_id: eventId, status: 'QUEUED', ...(etecsaOrderUpdate ? { etecsa_order_update: etecsaOrderUpdate } : {}) })
     }
 
     const payload = {
@@ -204,6 +208,10 @@ router.post('/ingest', async (req, res) => {
       return res.status(500).json({ error: 'Error interno' })
     }
 
+    let etecsaOrderUpdate = null
+    try { etecsaOrderUpdate = await processIncomingTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
+    catch (orderError) { console.error('Error comprobando pago de ticket ETECSA:', orderError.code || orderError.message) }
+
     const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, log?.id, messageHash)
     const hasWebhooks = Boolean(client.webhook_url || client.webhook_url_2 || client.webhook_url_3)
 
@@ -222,6 +230,7 @@ router.post('/ingest', async (req, res) => {
       log_id: log?.id,
       event_id: eventId,
       status: hasWebhooks ? 'QUEUED' : 'STORED',
+      ...(etecsaOrderUpdate ? { etecsa_order_update: etecsaOrderUpdate } : {}),
     })
   } catch (error) {
     if (error.code === 'TOKEN_REVOKED') {
