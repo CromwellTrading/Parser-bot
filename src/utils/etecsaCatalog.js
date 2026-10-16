@@ -8,11 +8,11 @@ const {
 } = require('./etecsaPricing')
 const {
   sanitizeCustomerText,
-  verifiedOperatorIds,
-  verifiedCategoryIds,
-  verifiedPromotionCategoryIds,
+  normalizeCatalogOffers,
   offerMatchesEtecsa,
   normalizeOffer,
+  verifiedOperatorIds,
+  verifiedCategoryIds,
 } = require('./etecsaOfferFilter')
 
 const SOKY_API_BASE = 'https://api.sokyrecargas.com/api/v1'
@@ -174,60 +174,34 @@ async function fetchAndNormalizeCatalog() {
   const types = ['recharge', 'nauta']
     .map(type => `types%5B%5D=${encodeURIComponent(type)}`).join('&')
 
-  const [offersResult, operatorsResult, categoriesResult] = await Promise.allSettled([
-    fetchJson(`/recharges/offers?${types}`),
-    fetchJson('/recharges/operators'),
-    fetchJson('/recharges/categories'),
-  ])
-  if (offersResult.status !== 'fulfilled') throw offersResult.reason
-  const rawOffers = extractRows(offersResult.value)
+  // The user asked for every recharge and Nauta offer Soky returns. Do not
+  // make inclusion depend on category/operator/name metadata, as live ETECSA
+  // promotions may not expose those fields consistently.
+  const payload = await fetchJson(`/recharges/offers?${types}`)
+  const rawOffers = extractRows(payload)
   if (!rawOffers) {
     const error = new Error('La respuesta de ofertas no contiene un catálogo válido.')
     error.code = 'SOKY_INVALID_CATALOG'
     throw error
   }
-  const operators = operatorsResult.status === 'fulfilled' ? (extractRows(operatorsResult.value) || []) : []
-  // Categories are fetched for verification/diagnostics even though a generic
-  // category name such as “Recargas” is not enough to prove an ETECSA offer.
-  if (categoriesResult.status === 'rejected') {
-    console.warn('No se pudieron verificar las categorías del catálogo ETECSA.')
-  }
-  if (operatorsResult.status === 'rejected') {
-    console.warn('No se pudieron verificar los operadores del catálogo ETECSA.')
-  }
-  const categories = categoriesResult.status === 'fulfilled' ? (extractRows(categoriesResult.value) || []) : []
-  const operatorIds = verifiedOperatorIds(operators)
-  const categoryIds = verifiedCategoryIds(categories)
-  const promotionCategoryIds = verifiedPromotionCategoryIds(categories)
-  const availableOffers = rawOffers.filter(offer => offer?.available !== false)
-  const allowedTypeOffers = availableOffers.filter(offer => ['recharge', 'nauta'].includes(String(offer?.type || '').trim().toLowerCase()))
-  const identityVerifiedOffers = allowedTypeOffers.filter(offer =>
-    offerMatchesEtecsa(offer, operatorIds, categoryIds, promotionCategoryIds),
-  )
-  const normalized = identityVerifiedOffers
-    .map(normalizeOffer)
-    .filter(Boolean)
-    .sort((a, b) => a.name.localeCompare(b.name, 'es'))
-  if (rawOffers.length > 0 && normalized.length === 0) {
-    const error = new Error('No se encontraron ofertas que se pudieran verificar como ETECSA.')
-    error.code = 'ETECSA_NO_VERIFIED_OFFERS'
+
+  const result = normalizeCatalogOffers(rawOffers)
+  if (rawOffers.length > 0 && result.offers.length === 0) {
+    const error = new Error('Soky devolvió ofertas, pero ninguna tiene un precio y una moneda utilizables.')
+    error.code = 'ETECSA_NO_PRICED_OFFERS'
+    error.catalogDiagnostics = result.diagnostics
     throw error
   }
 
   return {
-    offers: normalized,
+    offers: result.offers,
     checked_at: new Date().toISOString(),
     source_offer_count: rawOffers.length,
-    verified_offer_count: normalized.length,
-    // Counts help distinguish identity-filter issues from malformed/unpriced
-    // provider rows without exposing provider costs or authentication data.
-    catalog_diagnostics: {
-      unavailable_count: rawOffers.length - availableOffers.length,
-      unsupported_type_count: availableOffers.length - allowedTypeOffers.length,
-      identity_unverified_count: allowedTypeOffers.length - identityVerifiedOffers.length,
-      invalid_currency_or_price_count: identityVerifiedOffers.length - normalized.length,
-      promotion_category_count: promotionCategoryIds.size,
-    },
+    // Keep this legacy field for compatibility with existing app/admin code.
+    // It now means the count actually included in the ETECSA/Nauta catalog.
+    verified_offer_count: result.offers.length,
+    offer_count: result.offers.length,
+    catalog_diagnostics: result.diagnostics,
   }
 }
 
@@ -254,6 +228,7 @@ async function refreshCatalog() {
       event: 'ETECSA_CATALOG_REFRESHED',
       source_offer_count: next.source_offer_count,
       verified_offer_count: next.verified_offer_count,
+      offer_count: next.offers.length,
       ...next.catalog_diagnostics,
     }))
     return next

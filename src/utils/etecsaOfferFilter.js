@@ -116,6 +116,30 @@ function readProviderValue(price) {
   return normalizeRate(value)
 }
 
+function normalizeCatalogOffers(rawOffers) {
+  const rows = Array.isArray(rawOffers) ? rawOffers : []
+  const availableOffers = rows.filter(offer => offer?.available !== false)
+  const allowedTypeOffers = availableOffers.filter(offer => ALLOWED_TYPES.has(normalizeText(offer?.type)))
+
+  // Soky's /recharges/offers endpoint already supplies the integration's
+  // recharge catalog. Do not require names/operator/category fields to mention
+  // ETECSA: promotion rows may omit those identity labels. Include every
+  // available recharge/Nauta offer that has a usable provider price.
+  const offers = allowedTypeOffers
+    .map(normalizeOffer)
+    .filter(Boolean)
+    .sort((a, b) => a.name.localeCompare(b.name, 'es'))
+
+  return {
+    offers,
+    diagnostics: {
+      unavailable_count: rows.length - availableOffers.length,
+      unsupported_type_count: availableOffers.length - allowedTypeOffers.length,
+      invalid_currency_or_price_count: allowedTypeOffers.length - offers.length,
+    },
+  }
+}
+
 function normalizeOffer(offer) {
   const currencyCode = String(offer?.currency?.code || offer?.currency_code || '').trim().toUpperCase()
   if (!USD_CODES.has(currencyCode)) return null
@@ -156,4 +180,5 @@ module.exports = {
   verifiedPromotionCategoryIds,
   offerMatchesEtecsa,
   normalizeOffer,
+  normalizeCatalogOffers,
 }
