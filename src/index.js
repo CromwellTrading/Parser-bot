@@ -31,6 +31,7 @@ const systemRoutes = require('./routes/system')
 const gameMarketRoutes = require('./routes/gameMarket')
 const etecsaRoutes = require('./routes/etecsa')
 const { startCatalogWorker: startEtecsaCatalogWorker } = require('./utils/etecsaCatalog')
+const { startEtecsaOrderWorker } = require('./utils/etecsaOrders')
 const { startWebhookWorker } = require('./utils/webhookDelivery')
 const { startLicenseExpiryWorker } = require('./utils/licenseExpiry')
 
@@ -47,6 +48,7 @@ app.use('/api/etecsa', etecsaRoutes)
 startWebhookWorker()
 startLicenseExpiryWorker()
 startEtecsaCatalogWorker()
+startEtecsaOrderWorker()
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'SynthesisOne Backend' })
