@@ -16,6 +16,7 @@ const {
   normalizeOffer,
   normalizeCatalogOffers,
   sanitizeCustomerText,
+  readProviderPriceId,
 } = require('../src/utils/etecsaOfferFilter')
 
 test('ETECSA retail prices always round UP to a multiple of five', () => {
@@ -112,9 +113,17 @@ test('catalog keeps provider price IDs from documented field and common aliases'
   const documented = normalizeOffer({ id: 1, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ id: 'price-doc', label: '500 CUP', value: '4.2' }] })
   const alias = normalizeOffer({ id: 2, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ price_id: 'price-alias', label: '500 CUP', value: '4.2' }] })
   const uuidAlias = normalizeOffer({ id: 3, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ uuid: 'price-uuid', label: '500 CUP', value: '4.2' }] })
+  const priceUuidAlias = normalizeOffer({ id: 4, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ price_uuid: 'price-price-uuid', label: '500 CUP', value: '4.2' }] })
+  const camelAlias = normalizeOffer({ id: 5, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ priceId: 'price-camel', label: '500 CUP', value: '4.2' }] })
+  const nestedAlias = normalizeOffer({ id: 6, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ price: { id: 'price-nested' }, label: '500 CUP', value: '4.2' }] })
   assert.equal(documented.prices[0].price_id, 'price-doc')
   assert.equal(alias.prices[0].price_id, 'price-alias')
   assert.equal(uuidAlias.prices[0].price_id, 'price-uuid')
+  assert.equal(priceUuidAlias.prices[0].price_id, 'price-price-uuid')
+  assert.equal(camelAlias.prices[0].price_id, 'price-camel')
+  assert.equal(nestedAlias.prices[0].price_id, 'price-nested')
+  assert.equal(readProviderPriceId({ id: 'legacy-cache-id' }), 'legacy-cache-id')
+  assert.equal(readProviderPriceId({ price_id: '  ' }), '')
 })
 
 test('offers with an unverified currency or no valid priced line are excluded', () => {
