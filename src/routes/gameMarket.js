@@ -6,6 +6,7 @@ const supabase = require('../supabase')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { DEFAULT_MARKET_PRICING, normalizeMarketPricing, calculateOfferPrices } = require('../utils/gamePricing')
 const { clientSafePackageData } = require('../utils/clientSafePackageData')
+const { readAllRows } = require('../utils/supabasePagination')
 
 const router = express.Router()
 const AVATAR_BUCKET = 'so-profile-avatars'
@@ -236,25 +237,31 @@ async function uploadImage(bucket, path, image) {
 }
 
 async function loadCatalog({ admin = false, storeId = null } = {}) {
-  let gameQuery = supabase.from('game_market_games')
-    .select('id, slug, name, description, category, thumbnail_path, badge, is_active, sort_order, created_at, updated_at')
-    .order('sort_order', { ascending: true }).order('name', { ascending: true })
-  if (storeId) gameQuery = gameQuery.eq('store_id', storeId)
-  if (!admin) gameQuery = gameQuery.eq('is_active', true)
-  const { data: games, error: gameError } = await gameQuery
-  if (gameError) throw gameError
-  if (!games?.length) return { games: [] }
+  const games = await readAllRows(() => {
+    let query = supabase.from('game_market_games')
+      .select('id, slug, name, description, category, thumbnail_path, thumbnail_url, badge, is_active, sort_order, created_at, updated_at')
+      .order('sort_order', { ascending: true }).order('name', { ascending: true })
+    if (storeId) query = query.eq('store_id', storeId)
+    if (!admin) query = query.eq('is_active', true)
+    return query
+  }, { pageSize: 500, maxRows: 20000 })
+  if (!games.length) return { games: [] }
 
   const ids = games.map(game => game.id)
-  let offerQuery = supabase.from('game_market_offers')
-    .select('id, game_id, title, description, category, package_data, price_cup, price_saldo, base_cost_usd, auto_pricing, available, published, sort_order, created_at, updated_at')
-    .in('game_id', ids).order('sort_order', { ascending: true }).order('title', { ascending: true })
-  if (storeId) offerQuery = offerQuery.eq('store_id', storeId)
-  if (!admin) offerQuery = offerQuery.eq('published', true).eq('available', true)
-  const { data: offers, error: offerError } = await offerQuery
-  if (offerError) throw offerError
+  const offers = await readAllRows(() => {
+    let query = supabase.from('game_market_offers')
+      .select('id, game_id, title, description, category, package_data, price_cup, price_saldo, base_cost_usd, auto_pricing, available, published, sort_order, provider, created_at, updated_at')
+      .in('game_id', ids).order('sort_order', { ascending: true }).order('title', { ascending: true })
+    if (storeId) query = query.eq('store_id', storeId)
+    if (!admin) query = query.eq('published', true)
+    return query
+  }, { pageSize: 500, maxRows: 100000 })
+
   const offersByGame = new Map()
   for (const offer of offers || []) {
+    // Provider-marked out-of-stock packages remain visible with a disabled purchase
+    // action; manual offers that an admin marked unavailable remain hidden from buyers.
+    if (!admin && !offer.available && offer.provider !== 'rechargegames') continue
     const bucket = offersByGame.get(offer.game_id) || []
     const safeOffer = {
       id: offer.id,
@@ -285,7 +292,8 @@ async function loadCatalog({ admin = false, storeId = null } = {}) {
       description: game.description || '',
       category: game.category || 'Juegos',
       thumbnail_path: game.thumbnail_path || null,
-      thumbnail_url: storagePublicUrl(GAME_IMAGE_BUCKET, game.thumbnail_path),
+      // Manually uploaded artwork wins; automatically discovered URLs are the fallback.
+      thumbnail_url: (game.thumbnail_path ? storagePublicUrl(GAME_IMAGE_BUCKET, game.thumbnail_path) : null) || game.thumbnail_url || null,
       badge: game.badge || '',
       is_active: !!game.is_active,
       sort_order: game.sort_order || 0,
