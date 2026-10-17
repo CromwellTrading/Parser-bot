@@ -11,6 +11,8 @@ let workerStarted = false
 let refreshInFlight = null
 
 const { cleanText, normalizeCatalog } = require('./rechargeGamesCatalogParser')
+const { lookupWikipediaThumbnail, mapWithConcurrency } = require('./gameThumbnailResolver')
+const { readAllRows } = require('./supabasePagination')
 
 async function getPlatformStoreId() {
   const { data, error } = await supabase.from('game_market_stores')
@@ -57,9 +59,20 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
       const pricing = await getPricingSettings()
       const now = new Date().toISOString()
       const gameIds = new Map()
+      const existingGames = await readAllRows(() => supabase.from('game_market_games')
+        .select('id, slug, thumbnail_path, thumbnail_url')
+        .eq('store_id', storeId), { pageSize: 500, maxRows: 10000 })
+      const existingBySlug = new Map(existingGames.map(row => [String(row.slug), row]))
+      const thumbnailUrls = await mapWithConcurrency(catalog.games, 6, async game => {
+        const existing = existingBySlug.get(game.slug)
+        if (game.image_url) return game.image_url
+        if (existing?.thumbnail_path || existing?.thumbnail_url) return existing.thumbnail_url || null
+        return lookupWikipediaThumbnail(game.name)
+      })
+      const thumbnailBySlug = new Map(catalog.games.map((game, index) => [game.slug, thumbnailUrls[index]]))
 
-      // Create/update one game row per provider category. Existing manually created offers on
-      // the same game remain untouched; only provider-owned offers are synchronized below.
+      // Create/update one game row per provider category. Existing manually uploaded images
+      // are preserved; provider/Wikimedia URLs are stored separately as a fallback thumbnail.
       for (const game of catalog.games) {
         const isGiftcard = game.kind === 'giftcard'
         const gameRow = {
@@ -67,6 +80,7 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
           slug: game.slug,
           provider_game_slug: game.source_slug,
           name: game.name,
+          thumbnail_url: thumbnailBySlug.get(game.slug) || existingBySlug.get(game.slug)?.thumbnail_url || null,
           description: isGiftcard ? `Tarjetas regalo de ${game.name}.` : `Recargas automáticas para ${game.name}.`,
           category: isGiftcard ? 'Tarjetas regalo' : 'Recargas automáticas',
           badge: isGiftcard ? 'GIFT CARD' : 'AUTOMÁTICO',
@@ -156,8 +170,8 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
       }
       const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
       if (stateError) throw stateError
-      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, product_count: offerRows.length, available_product_count: availableProducts }))
-      return { ok: true, games: catalog.games.length, products: offerRows.length, available_products: availableProducts, last_success_at: now }
+      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
+      return { ok: true, games: catalog.games.length, source_groups: catalog.stats.source_group_count, source_products: catalog.stats.source_product_count, products: offerRows.length, available_products: availableProducts, last_success_at: now }
     } catch (error) {
       await writeCatalogError(error)
       console.error('[RechargeGames] No se pudo actualizar el catálogo:', JSON.stringify({ code: error?.code || 'catalog_error', http_status: error?.status || null }))
