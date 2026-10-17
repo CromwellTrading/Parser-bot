@@ -6,7 +6,7 @@ const { bot, ADMINS } = require('../telegram')
 const { getLicenseConfig, cardMatches } = require('./onboarding')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
-const { normalizePayerPhone, evaluateEtecsaPayment } = require('./etecsaPaymentMatching')
+const { normalizePayerPhone, isConfiguredPaymentReceiver, evaluateEtecsaPayment } = require('./etecsaPaymentMatching')
 const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
 const { getPlatformStoreId } = require('./rechargeGamesCatalog')
 const { verifyWebhookSignature } = require('./rechargeGamesWebhookSecurity')
@@ -388,6 +388,9 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   if (error) throw error
   const matchedCandidates = []
   for (const candidate of candidates || []) {
+    // Cross-client RECIBIDO receipts are accepted only from the configured
+    // payment destination phone; ENVIADO remains scoped to the ticket owner.
+    if (isDestinationReceipt && !isConfiguredPaymentReceiver(client, candidate)) continue
     if (candidate.status === 'EXPIRED' && !parsed?.transaction_at) continue
     const result = evaluateEtecsaPayment(parsed, candidate, receivedAt)
     if (result.matched) matchedCandidates.push({ order: candidate, evaluation: result })
@@ -410,6 +413,7 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
       .in('status', ['WAITING_PAYMENT', 'EXPIRED']).order('created_at', { ascending: false }).limit(500)
     if (etecsaError) throw etecsaError
     const etecsaMatches = (etecsaCandidates || []).filter(candidate =>
+      isConfiguredPaymentReceiver(client, candidate) &&
       !(candidate.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateEtecsaPayment(parsed, candidate, receivedAt).matched)
     if (etecsaMatches.length) {
       console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', direction, matching_etecsa_ticket_count: etecsaMatches.length }))

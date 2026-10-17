@@ -7,7 +7,7 @@ const { getLicenseConfig, cardMatches } = require('./onboarding')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
 const { getCatalogResponse } = require('./etecsaCatalog')
-const { normalizePayerPhone, evaluateEtecsaPayment } = require('./etecsaPaymentMatching')
+const { normalizePayerPhone, isConfiguredPaymentReceiver, evaluateEtecsaPayment } = require('./etecsaPaymentMatching')
 
 const SOKY_API_BASE = 'https://api.sokyrecargas.com/api/v1'
 const PAYMENT_WINDOW_MS = 30 * 60 * 1000
@@ -275,6 +275,9 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
 
   const matchedCandidates = []
   for (const candidate of candidates || []) {
+    // Only the phone configured to receive payments may confirm global tickets
+    // from a RECIBIDO SMS; an arbitrary free-store session cannot forge a receipt.
+    if (isDestinationReceipt && !isConfiguredPaymentReceiver(client, candidate)) continue
     // Once the UI ticket expired, auto-confirm only when Transfermóvil includes
     // its own transaction timestamp and proves the transfer happened in-window.
     if (candidate.status === 'EXPIRED' && !parsed?.transaction_at) continue
@@ -303,6 +306,7 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
       .in('status', ['WAITING_PAYMENT', 'EXPIRED']).order('created_at', { ascending: false }).limit(500)
     if (gameError) throw gameError
     const gameMatches = (gameCandidates || []).filter(candidate =>
+      isConfiguredPaymentReceiver(client, candidate) &&
       !(candidate.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateEtecsaPayment(parsed, candidate, receivedAt).matched)
     if (gameMatches.length) {
       console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'ETECSA', direction, matching_game_ticket_count: gameMatches.length }))

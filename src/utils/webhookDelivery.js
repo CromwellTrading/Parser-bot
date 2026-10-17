@@ -3,6 +3,7 @@ const dns = require('dns').promises
 const https = require('https')
 const net = require('net')
 const supabase = require('../supabase')
+const { canDispatchPersonalWebhook } = require('./storeSessionAccess')
 const { createEventId, hmacHex, validateWebhookUrl, isPrivateOrReservedIp } = require('./webhookSecurity')
 const { logWebhook, persistWebhookEvent } = require('./observability')
 
@@ -301,13 +302,25 @@ async function processWebhookDeliveries(limit = 20) {
       try {
         const { data: client, error: clientError } = await supabase
           .from('clients')
-          .select('id, webhook_secret')
+          .select('id, webhook_secret, active, expires_at, store_only')
           .eq('id', claimed.client_id)
           .maybeSingle()
 
         if (clientError) {
           logWebhook('ERROR', 'CLIENT_SECRET_LOOKUP_FAILED', { delivery_id: claimed.id, event_id: claimed.event_id, client_id: claimed.client_id, error: clientError.message })
           throw clientError
+        }
+        // Enforce paid license at delivery time too. A queue created before a
+        // license expires/revokes must not continue dispatching personal payloads.
+        if (!canDispatchPersonalWebhook(client)) {
+          const reason = client?.store_only ? 'FREE_STORE_SESSION' : 'LICENSE_INACTIVE_OR_EXPIRED'
+          await supabase.from('webhook_deliveries').update({
+            status: 'FAILED', locked_at: null, locked_by: null,
+            last_error: reason, next_attempt_at: new Date().toISOString(),
+          }).eq('id', claimed.id)
+          logWebhook('WARN', 'DELIVERY_BLOCKED_LICENSE', { delivery_id: claimed.id, event_id: claimed.event_id, client_id: claimed.client_id, reason })
+          await persistWebhookEvent({ clientId: claimed.client_id, eventId: claimed.event_id, deliveryId: claimed.id, level: 'WARN', stage: 'DELIVER', status: 'BLOCKED', error: reason })
+          continue
         }
         if (!client?.webhook_secret) {
           const update = {

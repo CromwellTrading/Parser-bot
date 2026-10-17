@@ -8,6 +8,12 @@ function normalizePayerPhone(value) {
   return normalized.replace(/\D/g, '')
 }
 
+function isConfiguredPaymentReceiver(client, order) {
+  const receivedOn = normalizePayerPhone(client?.phone_number)
+  const configuredReceiver = normalizePayerPhone(order?.confirmation_phone)
+  return Boolean(receivedOn && configuredReceiver && receivedOn === configuredReceiver)
+}
+
 function amountMatches(actual, expected) {
   if (actual === null || actual === undefined || expected === null || expected === undefined) return false
   const a = Number(actual)
@@ -61,4 +67,4 @@ function evaluateEtecsaPayment(parsed, order, receivedAt, toleranceMs = 120_000)
   }
 }
 
-module.exports = { normalizePayerPhone, amountMatches, evaluateEtecsaPayment }
+module.exports = { normalizePayerPhone, isConfiguredPaymentReceiver, amountMatches, evaluateEtecsaPayment }
