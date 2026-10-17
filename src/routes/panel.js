@@ -465,7 +465,8 @@ router.get('/api/clients', async (req, res) => {
     await expireDueLicenses()
     const { data, error } = await supabase
       .from('clients')
-      .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret')
+      .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret, store_only')
+      .eq('store_only', false)
       .order('created_at', { ascending: false })
 
     if (error) throw error

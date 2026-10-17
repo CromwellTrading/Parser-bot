@@ -6,6 +6,7 @@ const { bot, ADMINS } = require('../telegram')
 const { verifySignature } = require('../utils/hmac')
 const { parseSms, normalizePhone } = require('../utils/parser')
 const { requireNonRevokedToken } = require('../utils/tokenState')
+const { canUseOfficialStore, canDispatchPersonalWebhook } = require('../utils/storeSessionAccess')
 const { createEventId, ensureWebhookSecret, queueWebhookDeliveries } = require('../utils/webhookDelivery')
 const { expireDueLicenses } = require('../utils/licenseExpiry')
 const { processIncomingTransfer } = require('../utils/etecsaOrders')
@@ -112,7 +113,7 @@ router.post('/ingest', async (req, res) => {
 
     const { data: client, error: clientError } = await supabase
       .from('clients')
-      .select('id, name, token, active, token_used, device_id, phone_number, wallet, card1, card2, card3, expires_at, webhook_url, webhook_url_2, webhook_url_3, webhook_secret')
+      .select('id, name, token, active, token_used, device_id, phone_number, wallet, card1, card2, card3, expires_at, webhook_url, webhook_url_2, webhook_url_3, webhook_secret, store_only')
       .eq('token', token)
       .maybeSingle()
 
@@ -121,10 +122,7 @@ router.post('/ingest', async (req, res) => {
       return res.status(500).json({ error: 'Error interno' })
     }
     if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
-    if (!client.active) return res.status(403).json({ error: 'Licencia inactiva' })
-    if (client.expires_at && new Date(client.expires_at) < new Date()) {
-      return res.status(403).json({ error: 'Licencia expirada' })
-    }
+    if (!canUseOfficialStore(client)) return res.status(403).json({ error: 'La licencia no está activa o ha expirado.' })
 
     if (client.device_id && (!deviceId || client.device_id !== deviceId)) {
       return res.status(403).json({
@@ -160,7 +158,7 @@ router.post('/ingest', async (req, res) => {
     if (existing) {
       const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, existing.id, messageHash)
       let webhookClient = client
-      if (client.webhook_url || client.webhook_url_2 || client.webhook_url_3) {
+      if (canDispatchPersonalWebhook(client) && (client.webhook_url || client.webhook_url_2 || client.webhook_url_3)) {
         webhookClient = await ensureWebhookSecret(client)
         await queueWebhookDeliveries({ client: webhookClient, payload: webhookPayload, eventId, logId: existing.id })
       }
@@ -202,7 +200,7 @@ router.post('/ingest', async (req, res) => {
           .maybeSingle()
         if (raced) {
           const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, raced.id, messageHash)
-          if (client.webhook_url || client.webhook_url_2 || client.webhook_url_3) {
+          if (canDispatchPersonalWebhook(client) && (client.webhook_url || client.webhook_url_2 || client.webhook_url_3)) {
             const webhookClient = await ensureWebhookSecret(client)
             await queueWebhookDeliveries({ client: webhookClient, payload: webhookPayload, eventId, logId: raced.id })
           }
@@ -220,17 +218,19 @@ router.post('/ingest', async (req, res) => {
     catch (orderError) { console.error('Error comprobando pago de recarga de juego:', orderError.code || orderError.message) }
 
     const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, log?.id, messageHash)
-    const hasWebhooks = Boolean(client.webhook_url || client.webhook_url_2 || client.webhook_url_3)
+    const hasWebhooks = Boolean(canDispatchPersonalWebhook(client) && (client.webhook_url || client.webhook_url_2 || client.webhook_url_3))
 
     if (hasWebhooks) {
       const webhookClient = await ensureWebhookSecret(client)
       await queueWebhookDeliveries({ client: webhookClient, payload: webhookPayload, eventId, logId: log?.id })
     }
 
-    sendTelegramAlert(parsed, sender, client.name, receivedIso)
-      .catch(error => console.error('❌ Telegram alert:', error.message))
+    if (canDispatchPersonalWebhook(client)) {
+      sendTelegramAlert(parsed, sender, client.name, receivedIso)
+        .catch(error => console.error('❌ Telegram alert:', error.message))
+    }
 
-    console.log(`✅ SMS de "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount ?? '—'} ${parsed.currency ?? ''} | event=${eventId}`)
+    console.log(`${client.store_only ? '🛒 SMS tienda gratuita' : '✅ SMS de'} "${client.name}" | ${parsed.direction} | ${parsed.type} | ${parsed.amount ?? '—'} ${parsed.currency ?? ''} | event=${eventId}`)
     return res.status(200).json({
       ok: true,
       parsed,

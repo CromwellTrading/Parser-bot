@@ -10,6 +10,7 @@ const {
   verifySokyWebhookSignature, handleSokyWebhook, listAdminOrders,
 } = require('../utils/etecsaOrders')
 const { requireNonRevokedToken } = require('../utils/tokenState')
+const { canUseOfficialStore } = require('../utils/storeSessionAccess')
 const {
   getPricingSettings,
   savePricingSettings,
@@ -39,13 +40,12 @@ async function requireClient(req, res, next) {
     await requireNonRevokedToken(token)
     const { data: client, error } = await supabase
       .from('clients')
-      .select('id, token, active, role, expires_at, device_id')
+      .select('id, token, active, role, expires_at, device_id, store_only')
       .eq('token', token)
       .maybeSingle()
     if (error) throw error
     if (!client) return res.status(401).json({ error: 'La sesión no es válida.' })
-    if (client.active === false) return res.status(403).json({ error: 'La licencia no está activa.' })
-    if (isExpired(client.expires_at)) return res.status(403).json({ error: 'La licencia ha expirado.' })
+    if (!canUseOfficialStore(client)) return res.status(403).json({ error: 'La licencia no está activa o ha expirado.' })
 
     const boundDevice = String(client.device_id || '').trim()
     const requestedDevice = String(req.headers['x-device-id'] || '').trim()

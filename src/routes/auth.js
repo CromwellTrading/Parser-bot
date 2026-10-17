@@ -26,7 +26,7 @@ function extractToken(req) {
 async function fetchClientByToken(token) {
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at, role')
+    .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at, role, store_only')
     .eq('token', token)
     .maybeSingle()
 
@@ -39,7 +39,7 @@ async function updateClient(clientId, patch) {
     .from('clients')
     .update(patch)
     .eq('id', clientId)
-    .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at, role')
+    .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at, role, store_only')
     .single()
 
   if (error) throw error
@@ -58,6 +58,7 @@ router.post('/verify', async (req, res) => {
 
     const client = await fetchClientByToken(token)
     if (!client) return res.status(401).json({ error: 'Token inválido' })
+    if (client.store_only) return res.status(403).json({ error: 'La sesión gratuita solo permite compras en la tienda oficial.', status: 'LICENSE_REQUIRED' })
 
     if (isExpired(client.expires_at)) {
       return res.status(403).json({ error: 'Licencia expirada', status: 'expired', client: publicClient({ ...client, active: false }) })
@@ -118,6 +119,7 @@ router.get('/me', async (req, res) => {
 
     const client = await fetchClientByToken(token)
     if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
+    if (client.store_only) return res.status(403).json({ error: 'La sesión gratuita solo permite compras en la tienda oficial.', status: 'LICENSE_REQUIRED' })
 
     return res.json({ ok: true, status: clientStatus(client), client: publicClient(client) })
   } catch (error) {
@@ -140,6 +142,7 @@ router.put('/profile', async (req, res) => {
 
     const client = await fetchClientByToken(token)
     if (!client) return res.status(404).json({ error: 'Cliente no encontrado' })
+    if (client.store_only) return res.status(403).json({ error: 'La sesión gratuita solo permite compras en la tienda oficial.', status: 'LICENSE_REQUIRED' })
 
     if (!client.active) return res.status(403).json({ error: 'Licencia inactiva', status: 'inactive' })
     if (isExpired(client.expires_at)) return res.status(403).json({ error: 'Licencia expirada', status: 'expired' })

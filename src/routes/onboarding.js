@@ -100,6 +100,7 @@ async function findActiveClientByPhone(phoneNumber) {
     .select('id, name, token, active, token_used, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, role, webhook_secret, webhook_url, webhook_url_2, webhook_url_3')
     .eq('phone_number', phoneNumber)
     .eq('role', 'client')
+    .eq('store_only', false)
     .eq('active', true)
     .order('created_at', { ascending: false })
     .limit(10)
@@ -116,6 +117,7 @@ async function getPriceForPhone(phoneNumber) {
     .select('id, created_at')
     .eq('phone_number', phoneNumber)
     .eq('role', 'client')
+    .eq('store_only', false)
     .order('created_at', { ascending: false })
     .limit(1)
   if (error) throw error

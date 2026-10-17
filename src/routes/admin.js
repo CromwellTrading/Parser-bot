@@ -21,7 +21,8 @@ router.get('/clients', async (req, res) => {
   await expireDueLicenses()
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at')
+    .select('id, name, token, active, token_used, webhook_url, webhook_url_2, webhook_url_3, phone_number, card1, card2, card3, wallet, device_id, created_at, expires_at, store_only')
+    .eq('store_only', false)
     .order('created_at', { ascending: false })
 
   if (error) return res.status(500).json({ error: error.message })
@@ -72,11 +73,11 @@ router.post('/clients', async (req, res) => {
 router.put('/clients/:id/toggle', async (req, res) => {
   const { data: client, error: fetchError } = await supabase
     .from('clients')
-    .select('id, active, token, name, expires_at')
+    .select('id, active, token, name, expires_at, store_only')
     .eq('id', req.params.id)
     .single()
 
-  if (fetchError || !client) return res.status(404).json({ error: 'Cliente no encontrado' })
+  if (fetchError || !client || client.store_only) return res.status(404).json({ error: 'Cliente no encontrado' })
 
   const nowActive = !client.active
 
@@ -132,8 +133,8 @@ router.put('/clients/:id/profile', async (req, res) => {
 
 router.put('/clients/:id/renew-token', async (req, res) => {
   const { data: client, error: fetchError } = await supabase
-    .from('clients').select('id, name, token, role').eq('id', req.params.id).single()
-  if (fetchError || !client) return res.status(404).json({ error: 'Cliente no encontrado' })
+    .from('clients').select('id, name, token, role, store_only').eq('id', req.params.id).single()
+  if (fetchError || !client || client.store_only) return res.status(404).json({ error: 'Cliente no encontrado' })
 
   if (client.token) {
     await supabase.from('token_blacklist').delete().eq('token', client.token)
@@ -162,8 +163,8 @@ router.put('/clients/:id/renew-token', async (req, res) => {
 router.delete('/clients/:id', async (req, res) => {
   try {
     const { data: client, error: fetchError } = await supabase
-      .from('clients').select('id, token, name').eq('id', req.params.id).single();
-    if (fetchError || !client) return res.status(404).json({ error: 'Cliente no encontrado' });
+      .from('clients').select('id, token, name, store_only').eq('id', req.params.id).single();
+    if (fetchError || !client || client.store_only) return res.status(404).json({ error: 'Cliente no encontrado' });
 
     if (client.token) {
       await supabase.from('token_blacklist').delete().eq('token', client.token);

@@ -4,6 +4,7 @@ const express = require('express')
 const crypto = require('crypto')
 const supabase = require('../supabase')
 const { requireNonRevokedToken } = require('../utils/tokenState')
+const { canAccessGameMarket } = require('../utils/storeSessionAccess')
 const { DEFAULT_MARKET_PRICING, normalizeMarketPricing, calculateOfferPrices } = require('../utils/gamePricing')
 const { clientSafePackageData } = require('../utils/clientSafePackageData')
 const { readAllRows } = require('../utils/supabasePagination')
@@ -34,19 +35,20 @@ async function requireClient(req, res, next) {
     await requireNonRevokedToken(token)
     const { data: client, error } = await supabase
       .from('clients')
-      .select('id, name, token, active, token_used, device_id, expires_at, role')
+      .select('id, name, token, active, token_used, device_id, expires_at, role, store_only')
       .eq('token', token)
       .maybeSingle()
     if (error) throw error
     if (!client) return res.status(401).json({ error: 'Token inválido' })
-    if (client.active === false) return res.status(403).json({ error: 'Licencia inactiva' })
-    if (isExpired(client.expires_at)) return res.status(403).json({ error: 'Licencia expirada' })
-    // Do not create a side door around the existing device-bound license flow.
-    // The current app has no account-level login independent of its license yet.
+    // Device binding applies to free store sessions too. A leaked store token
+    // must not be reusable from a different installation.
     const boundDevice = String(client.device_id || '').trim()
     const requestedDevice = String(req.headers['x-device-id'] || '').trim()
     if (boundDevice && (!requestedDevice || requestedDevice !== boundDevice)) {
       return res.status(403).json({ error: 'Dispositivo no autorizado para esta licencia' })
+    }
+    if (!canAccessGameMarket(client, req.method, req.path)) {
+      return res.status(403).json({ code: 'LICENSE_REQUIRED', error: 'Esta función requiere una licencia activa. Las compras de la tienda oficial siguen siendo gratuitas.' })
     }
     req.client = client
     return next()
