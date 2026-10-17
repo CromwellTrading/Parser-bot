@@ -11,6 +11,7 @@ const {
   normalizeCatalogOffers,
   offerMatchesEtecsa,
   normalizeOffer,
+  readProviderPriceId,
   verifiedOperatorIds,
   verifiedCategoryIds,
 } = require('./etecsaOfferFilter')
@@ -193,6 +194,27 @@ async function fetchAndNormalizeCatalog() {
     throw error
   }
 
+  const normalizedPriceRows = result.offers.flatMap(offer => offer.prices || [])
+  const identifiedPriceRows = normalizedPriceRows.filter(price => Boolean(readProviderPriceId(price)))
+  if (normalizedPriceRows.length > 0 && identifiedPriceRows.length === 0) {
+    // Do not cache or offer prices that cannot be linked to Soky's required price_id.
+    // Log property names only so diagnostics never disclose offer/customer values.
+    const rawPriceRows = rawOffers.flatMap(offer => Array.isArray(offer?.prices) ? offer.prices : [])
+    const sourcePriceKeyShapes = [...new Set(rawPriceRows
+      .filter(price => !readProviderPriceId(price))
+      .slice(0, 8)
+      .map(price => Object.keys(price || {}).sort().join(',')))]
+    const error = new Error('Soky devolvió precios sin identificador de proveedor.')
+    error.code = 'ETECSA_PRICE_IDS_MISSING'
+    error.catalogDiagnostics = {
+      ...result.diagnostics,
+      price_row_count: normalizedPriceRows.length,
+      identified_price_id_count: identifiedPriceRows.length,
+      source_price_key_shapes: sourcePriceKeyShapes,
+    }
+    throw error
+  }
+
   return {
     offers: result.offers,
     checked_at: new Date().toISOString(),
@@ -256,18 +278,26 @@ async function getCatalogMetadata() {
   }
 }
 
+function catalogHasAnyProviderPriceId(cache) {
+  const rows = Array.isArray(cache?.offers) ? cache.offers.flatMap(offer => Array.isArray(offer?.prices) ? offer.prices : []) : []
+  return rows.some(price => Boolean(readProviderPriceId(price)))
+}
+
 async function getCatalogForDisplay({ forceRefresh = false } = {}) {
   const cache = await getStoredCache()
-  if (forceRefresh) {
-    const updated = await refreshCatalog()
-    return { cache: updated, stale: false, age_ms: 0 }
-  }
-  if (!cache || cacheAgeMs(cache) >= REFRESH_INTERVAL_MS) {
+  const needsIdRepair = Boolean(cache) && !catalogHasAnyProviderPriceId(cache)
+  if (forceRefresh || !cache || cacheAgeMs(cache) >= REFRESH_INTERVAL_MS || needsIdRepair) {
     try {
       const updated = await refreshCatalog()
+      if (updated.offers?.length && !catalogHasAnyProviderPriceId(updated)) {
+        const error = new Error('El catálogo recibido no contiene identificadores de precio utilizables.')
+        error.code = 'ETECSA_PRICE_IDS_MISSING'
+        throw error
+      }
       return { cache: updated, stale: false, age_ms: 0 }
     } catch (error) {
-      if (!cache || cacheAgeMs(cache) > MAX_CACHE_AGE_MS) throw error
+      // A malformed legacy cache must not be served as if its offers were purchasable.
+      if (!cache || cacheAgeMs(cache) > MAX_CACHE_AGE_MS || !catalogHasAnyProviderPriceId(cache)) throw error
       return { cache, stale: true, age_ms: cacheAgeMs(cache), refresh_error: error.code || 'REFRESH_FAILED' }
     }
   }
@@ -287,9 +317,11 @@ function mapCatalogForClient(cache, settings) {
     .map(offer => {
     const prices = offer.prices.map(price => {
       const label = sanitizeCustomerText(price.label, 120)
+      const priceId = readProviderPriceId(price)
       const converted = calculateOfferPrices(price.cost_usd, settings)
-      if (!converted || !label) return null
+      if (!converted || !label || !priceId) return null
       return {
+        price_id: priceId,
         label,
         price_cup: converted.cup,
         price_saldo: converted.saldo,
@@ -302,6 +334,9 @@ function mapCatalogForClient(cache, settings) {
       description: sanitizeCustomerText(offer.description, 600),
       type: sanitizeCustomerText(offer.type, 30),
       category_name: sanitizeCustomerText(offer.category_name, 120),
+      required_inputs: Array.isArray(offer.required_inputs) ? offer.required_inputs : ['recipient'],
+      has_email: offer.has_email === true,
+      is_preorder: offer.is_preorder === true,
       prices,
     }
   }).filter(Boolean)
@@ -346,6 +381,9 @@ function safeProviderErrorDetails(error) {
     }
     if (error.validationErrors) details.validation_errors = error.validationErrors
   }
+  if (error?.code === 'ETECSA_PRICE_IDS_MISSING' && error.catalogDiagnostics) {
+    details.catalog_diagnostics = error.catalogDiagnostics
+  }
   return details
 }
 
@@ -382,6 +420,7 @@ module.exports = {
   // Exported for focused unit tests.
   offerMatchesEtecsa,
   normalizeOffer,
+  readProviderPriceId,
   verifiedOperatorIds,
   verifiedCategoryIds,
   _resetMemoryForTests() { memoryCache = null; refreshPromise = null; workerStarted = false },

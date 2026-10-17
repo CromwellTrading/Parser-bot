@@ -130,14 +130,36 @@ function normalizeCatalogOffers(rawOffers) {
     .filter(Boolean)
     .sort((a, b) => a.name.localeCompare(b.name, 'es'))
 
+  const normalizedPriceRows = offers.flatMap(offer => offer.prices || [])
+  const missingPriceIds = normalizedPriceRows.filter(price => !readProviderPriceId(price)).length
   return {
     offers,
     diagnostics: {
       unavailable_count: rows.length - availableOffers.length,
       unsupported_type_count: availableOffers.length - allowedTypeOffers.length,
       invalid_currency_or_price_count: allowedTypeOffers.length - offers.length,
+      missing_price_id_count: missingPriceIds,
     },
   }
+}
+
+function readProviderPriceId(price) {
+  const candidates = [
+    price?.price_id,
+    price?.id,
+    price?.uuid,
+    price?.price_uuid,
+    price?.priceId,
+    price?.price?.id,
+    price?.price?.price_id,
+    price?.price?.uuid,
+  ]
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null || typeof candidate === 'object') continue
+    const value = cleanString(candidate, 100)
+    if (value && value.toLowerCase() !== 'null' && value.toLowerCase() !== 'undefined' && value !== '[object Object]') return value
+  }
+  return ''
 }
 
 function normalizeOffer(offer) {
@@ -149,9 +171,9 @@ function normalizeOffer(offer) {
     const label = cleanString(price?.label || price?.name, 120)
     if (!cost || !label) return null
     return {
-      // Support both the documented provider field (`id`) and equivalent aliases
-      // if Soky's response version uses them. Missing IDs are diagnosed by checkout UI.
-      price_id: cleanString(price?.id || price?.price_id || price?.uuid, 100),
+      // Soky documents prices[].id. Aliases cover older persisted cache shapes
+      // and minor response-version differences without inventing identifiers.
+      price_id: readProviderPriceId(price),
       label,
       cost_usd: cost,
     }
@@ -189,4 +211,5 @@ module.exports = {
   offerMatchesEtecsa,
   normalizeOffer,
   normalizeCatalogOffers,
+  readProviderPriceId,
 }
