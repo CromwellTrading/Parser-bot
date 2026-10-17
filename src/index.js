@@ -37,6 +37,7 @@ const { startRechargeGamesCatalogWorker } = require('./utils/rechargeGamesCatalo
 const { startRechargeGamesOrderWorker } = require('./utils/rechargeGamesOrders')
 const { startWebhookWorker } = require('./utils/webhookDelivery')
 const { startLicenseExpiryWorker } = require('./utils/licenseExpiry')
+const { startPaymentSmsReconciler } = require('./utils/paymentSmsReconciler')
 
 app.use('/api/auth', authRoutes)
 app.use('/api/sms', smsRoutes)
@@ -55,6 +56,7 @@ startEtecsaCatalogWorker()
 startEtecsaOrderWorker()
 startRechargeGamesCatalogWorker()
 startRechargeGamesOrderWorker()
+startPaymentSmsReconciler()
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'SynthesisOne Backend' })
