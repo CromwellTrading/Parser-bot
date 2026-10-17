@@ -77,8 +77,14 @@ test('rejects payments that are not identified as Transfermovil/Pago x Móvil', 
   assert.ok(result.reasons.includes('UNSUPPORTED_PAYMENT_NETWORK'))
 })
 
-test('rejects incoming transfers even when phone, card and amount match', () => {
+test('accepts a received receipt on the destination phone when payer, card, amount and time match', () => {
   const result = evaluateEtecsaPayment(outgoing({ direction: 'RECIBIDO' }), order, '2026-10-16T06:11:00.000Z')
+  assert.equal(result.matched, true)
+  assert.deepEqual(result.reasons, [])
+})
+
+test('does not accept an unsupported direction even when other details match', () => {
+  const result = evaluateEtecsaPayment(outgoing({ direction: 'UNKNOWN' }), order, '2026-10-16T06:11:00.000Z')
   assert.equal(result.matched, false)
-  assert.ok(result.reasons.includes('NOT_OUTGOING_TRANSFER'))
+  assert.ok(result.reasons.includes('UNSUPPORTED_TRANSFER_DIRECTION'))
 })
