@@ -149,7 +149,9 @@ function normalizeOffer(offer) {
     const label = cleanString(price?.label || price?.name, 120)
     if (!cost || !label) return null
     return {
-      price_id: cleanString(price?.id, 100),
+      // Support both the documented provider field (`id`) and equivalent aliases
+      // if Soky's response version uses them. Missing IDs are diagnosed by checkout UI.
+      price_id: cleanString(price?.id || price?.price_id || price?.uuid, 100),
       label,
       cost_usd: cost,
     }
@@ -159,6 +161,9 @@ function normalizeOffer(offer) {
   const id = offer?.id
   if (id === undefined || id === null || String(id).trim() === '') return null
   const image = cleanString(offer?.image || offer?.image_url, 1000)
+  const inputFields = Array.isArray(offer?.metadata?.inputs)
+    ? offer.metadata.inputs.map(item => cleanString(item, 40).toLowerCase()).filter(item => ['recipient', 'email', 'recipient_name'].includes(item))
+    : ['recipient']
   return {
     id: String(id).slice(0, 100),
     name: cleanString(offer?.name, 180) || 'Oferta ETECSA',
@@ -166,6 +171,9 @@ function normalizeOffer(offer) {
     type: normalizeText(offer?.type),
     category_name: cleanString(offer?.category?.name || offer?.category_name, 120),
     image_url: /^https:\/\//i.test(image) ? image : null,
+    required_inputs: [...new Set(inputFields.length ? inputFields : ['recipient'])],
+    has_email: offer?.metadata?.has_email === true,
+    is_preorder: offer?.is_preorder === true,
     available: offer?.available !== false,
     currency_code: currencyCode,
     prices,
