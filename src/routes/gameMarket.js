@@ -574,9 +574,52 @@ router.post('/admin/images', requireAdmin, async (req, res) => {
     const extension = image.type === 'image/png' ? 'png' : (image.type === 'image/webp' ? 'webp' : 'jpg')
     const path = `games/${crypto.randomUUID()}.${extension}`
     await uploadImage(GAME_IMAGE_BUCKET, path, image)
-    return res.status(201).json({ path, url: storagePublicUrl(GAME_IMAGE_BUCKET, path) })
+    // Android's uploader intentionally requires an explicit success flag. Without it,
+    // a valid upload was incorrectly treated as failed and never attached to the game.
+    return res.status(201).json({ ok: true, path, url: storagePublicUrl(GAME_IMAGE_BUCKET, path) })
   } catch (error) {
     return handleError(res, error, 'Error uploading Game Market image:')
+  }
+})
+
+// Upload and persist a thumbnail for a specific game in one server-side operation.
+// This is the dedicated admin fallback when automatic artwork cannot be found.
+router.post('/admin/games/:id/thumbnail', requireAdmin, async (req, res) => {
+  let uploadedPath = null
+  try {
+    const image = decodeImage(req.body || {})
+    const storeId = await getPlatformStoreId()
+    const { data: existing, error: fetchError } = await supabase.from('game_market_games')
+      .select('id, thumbnail_path').eq('id', req.params.id).eq('store_id', storeId).maybeSingle()
+    if (fetchError) throw fetchError
+    if (!existing) return res.status(404).json({ error: 'Juego no encontrado' })
+
+    const extension = image.type === 'image/png' ? 'png' : (image.type === 'image/webp' ? 'webp' : 'jpg')
+    uploadedPath = `games/${crypto.randomUUID()}.${extension}`
+    await uploadImage(GAME_IMAGE_BUCKET, uploadedPath, image)
+    const { data: updated, error: updateError } = await supabase.from('game_market_games')
+      .update({ thumbnail_path: uploadedPath, updated_at: new Date().toISOString() })
+      .eq('id', existing.id).eq('store_id', storeId)
+      .select('id, name, thumbnail_path, thumbnail_url').single()
+    if (updateError) {
+      await supabase.storage.from(GAME_IMAGE_BUCKET).remove([uploadedPath]).catch(() => {})
+      uploadedPath = null
+      throw updateError
+    }
+
+    if (existing.thumbnail_path && existing.thumbnail_path !== uploadedPath) {
+      const { error: removeError } = await supabase.storage.from(GAME_IMAGE_BUCKET).remove([existing.thumbnail_path])
+      if (removeError) console.warn('[Game Market] No se pudo borrar la miniatura sustituida:', removeError.message)
+    }
+    return res.status(201).json({
+      ok: true,
+      path: uploadedPath,
+      url: storagePublicUrl(GAME_IMAGE_BUCKET, uploadedPath),
+      game: updated,
+    })
+  } catch (error) {
+    if (uploadedPath) await supabase.storage.from(GAME_IMAGE_BUCKET).remove([uploadedPath]).catch(() => {})
+    return handleError(res, error, 'Error saving Game Market game thumbnail:')
   }
 })
 
