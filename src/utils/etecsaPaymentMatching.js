@@ -20,7 +20,10 @@ function evaluateEtecsaPayment(parsed, order, receivedAt, toleranceMs = 120_000)
   const direction = String(parsed?.direction || '').toUpperCase()
   const type = String(parsed?.type || '').toUpperCase()
   const network = String(parsed?.network || '').toUpperCase()
-  if (direction !== 'ENVIADO') reasons.push('NOT_OUTGOING_TRANSFER')
+  // A transfer can be observed either on the payer's phone (ENVIADO) or
+  // on the destination account's phone (RECIBIDO). Both are acceptable only
+  // when the rest of the payment details match the ticket exactly.
+  if (!['ENVIADO', 'RECIBIDO'].includes(direction)) reasons.push('UNSUPPORTED_TRANSFER_DIRECTION')
   if (network !== 'PAGOMOVIL') reasons.push('UNSUPPORTED_PAYMENT_NETWORK')
   if (!['TARJETA_TARJETA', 'MONEDERO_TARJETA'].includes(type)) reasons.push('NOT_CARD_TRANSFER')
   if (String(parsed?.currency || '').toUpperCase() !== 'CUP') reasons.push('CURRENCY_MISMATCH')

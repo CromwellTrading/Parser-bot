@@ -157,6 +157,14 @@ async function createPaymentOrder(client, body) {
   if (!/^5\d{7}$/.test(payerPhone)) throw errorWithStatus('Introduce el móvil cubano desde el que realizarás la transferencia.', 400, 'INVALID_PAYER_PHONE')
 
   const offer = await getProviderOffer(offerId)
+  const playerId = cleanText(body?.player_id, 200) || null
+  const serverId = cleanText(body?.server_id, 200) || null
+  if (offer.provider_delivery === 'player_id' && !playerId) {
+    throw errorWithStatus('Introduce el ID del jugador antes de crear el ticket de pago.', 400, 'PLAYER_ID_REQUIRED')
+  }
+  if (offer.provider_delivery === 'player_id' && /mobile[-_ ]?legends/i.test(String(offer.provider_game_slug || '')) && !serverId) {
+    throw errorWithStatus('Introduce también el ID del servidor antes de crear el ticket.', 400, 'SERVER_ID_REQUIRED')
+  }
   const amount = basis === 'CUP' ? Number(offer.price_cup) : Number(offer.price_saldo)
   if (!Number.isSafeInteger(amount) || amount <= 0) throw errorWithStatus('El precio seleccionado no es válido. Actualiza el catálogo e inténtalo de nuevo.', 409, 'INVALID_LOCAL_PRICE')
   const providerMeta = offer.package_data?.rechargegames || {}
@@ -183,6 +191,8 @@ async function createPaymentOrder(client, body) {
     price_basis: basis,
     payment_amount: amount,
     payer_phone: payerPhone,
+    player_id: playerId,
+    server_id: serverId,
     destination_card: paymentConfig.paymentCard,
     confirmation_phone: paymentConfig.paymentPhone,
     status: 'WAITING_PAYMENT',
@@ -366,25 +376,46 @@ async function submitRecipientDetails(clientId, orderId, body) {
 }
 
 async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId }) {
-  const { data: candidates, error } = await supabase.from('game_recharge_orders').select('*')
-    .eq('client_id', client.id).in('status', ['WAITING_PAYMENT', 'EXPIRED'])
-    .order('created_at', { ascending: false }).limit(12)
+  const direction = String(parsed?.direction || '').toUpperCase()
+  const isDestinationReceipt = direction === 'RECIBIDO'
+  // A received SMS is emitted by the payment destination's phone, which is often
+  // an admin/merchant client rather than the buyer that owns the order.
+  let candidateQuery = supabase.from('game_recharge_orders').select('*')
+    .in('status', ['WAITING_PAYMENT', 'EXPIRED'])
+    .order('created_at', { ascending: false }).limit(isDestinationReceipt ? 500 : 12)
+  if (!isDestinationReceipt) candidateQuery = candidateQuery.eq('client_id', client.id)
+  const { data: candidates, error } = await candidateQuery
   if (error) throw error
-  let selected = null
-  let evaluation = null
+  const matchedCandidates = []
   for (const candidate of candidates || []) {
     if (candidate.status === 'EXPIRED' && !parsed?.transaction_at) continue
     const result = evaluateEtecsaPayment(parsed, candidate, receivedAt)
-    if (result.matched) { selected = candidate; evaluation = result; break }
+    if (result.matched) matchedCandidates.push({ order: candidate, evaluation: result })
     const potentiallyRelevant = ['AMOUNT_MISMATCH', 'DESTINATION_CARD_MISMATCH', 'PAYER_PHONE_MISMATCH', 'PAYER_PHONE_NOT_IN_SMS', 'PAYMENT_OUTSIDE_WINDOW']
     if (candidate.status === 'WAITING_PAYMENT' && Date.now() > Date.parse(candidate.payment_deadline_at || '') &&
-      String(parsed?.direction).toUpperCase() === 'ENVIADO' && Number(parsed?.amount) === Number(candidate.payment_amount) &&
+      ['ENVIADO', 'RECIBIDO'].includes(direction) && Number(parsed?.amount) === Number(candidate.payment_amount) &&
       parsed?.receiver_account && cardMatches(parsed.receiver_account, candidate.destination_card) &&
       result.reasons.every(reason => potentiallyRelevant.includes(reason))) {
       await expireOrderIfNeeded(candidate)
     }
   }
-  if (!selected || !evaluation) return null
+  if (matchedCandidates.length !== 1) {
+    if (matchedCandidates.length > 1) console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', direction, matching_ticket_count: matchedCandidates.length }))
+    return null
+  }
+  const { order: selected, evaluation } = matchedCandidates[0]
+
+  if (isDestinationReceipt) {
+    const { data: etecsaCandidates, error: etecsaError } = await supabase.from('etecsa_orders').select('*')
+      .in('status', ['WAITING_PAYMENT', 'EXPIRED']).order('created_at', { ascending: false }).limit(500)
+    if (etecsaError) throw etecsaError
+    const etecsaMatches = (etecsaCandidates || []).filter(candidate =>
+      !(candidate.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateEtecsaPayment(parsed, candidate, receivedAt).matched)
+    if (etecsaMatches.length) {
+      console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', direction, matching_etecsa_ticket_count: etecsaMatches.length }))
+      return null
+    }
+  }
 
   if (parsed?.transaction_id) {
     const [dupeGame, dupeEtecsa] = await Promise.all([
@@ -396,7 +427,10 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     if (dupeGame.data || dupeEtecsa.data) return null
   }
 
-  const nextStatus = selected.provider_delivery === 'code' ? 'SUBMITTING_TO_PROVIDER' : 'PAYMENT_RECEIVED_WAITING_DETAILS'
+  const requiresServer = /mobile[-_ ]?legends/i.test(String(selected.provider_game_slug || ''))
+  const hasAllRecipientDetails = selected.provider_delivery === 'code' ||
+    (selected.provider_delivery === 'player_id' && Boolean(cleanText(selected.player_id, 200)) && (!requiresServer || Boolean(cleanText(selected.server_id, 200))))
+  const nextStatus = hasAllRecipientDetails ? 'SUBMITTING_TO_PROVIDER' : 'PAYMENT_RECEIVED_WAITING_DETAILS'
   const { data: updated, error: updateError } = await supabase.from('game_recharge_orders').update({
     status: nextStatus,
     paid_at: nowIso(),
@@ -411,9 +445,9 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   }
   if (!updated) return null
   console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_PAYMENT_MATCHED', order_id: updated.id, client_id: client.id, transaction_id: updated.payment_transaction_id || null, status: updated.status }))
-  notifyAdmins(`✅ Pago recibido para recarga de juego · ${makeTicket(updated.id)}\nJuego: ${updated.game_name}\nPaquete: ${updated.offer_title}\nImporte: ${updated.payment_amount} CUP\nPagador: ${updated.payer_phone}\n${updated.provider_delivery === 'code' ? 'Enviando el pedido al proveedor.' : 'El cliente debe completar el ID del jugador.'}`).catch(() => {})
-  if (updated.provider_delivery === 'code') {
-    const submitted = await submitProviderOrder(updated.id)
+  notifyAdmins(`✅ Pago recibido para recarga de juego · ${makeTicket(updated.id)}\nJuego: ${updated.game_name}\nPaquete: ${updated.offer_title}\nImporte: ${updated.payment_amount} CUP\nPagador: ${updated.payer_phone}\n${nextStatus === 'SUBMITTING_TO_PROVIDER' ? 'Enviando el pedido al proveedor.' : 'Faltan datos del jugador; el cliente debe completarlos.'}`).catch(() => {})
+  if (nextStatus === 'SUBMITTING_TO_PROVIDER') {
+    const submitted = await submitProviderOrder(updated.id, { playerId: updated.player_id, serverId: updated.server_id })
     return { order_id: updated.id, status: submitted.status, ticket: makeTicket(updated.id) }
   }
   return { order_id: updated.id, status: updated.status, ticket: makeTicket(updated.id) }
