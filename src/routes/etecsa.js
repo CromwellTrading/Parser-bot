@@ -81,6 +81,10 @@ function sendCatalogError(res, error) {
   if (error.code === 'SOKY_AUTH_ERROR') {
     return res.status(503).json({ code: error.code, error: 'No se pudo actualizar el catálogo. Comprueba la configuración del servicio.' })
   }
+  if (error.code === 'ETECSA_PRICE_IDS_MISSING') {
+    console.error('Soky devolvió precios sin identificadores utilizables:', JSON.stringify(error.catalogDiagnostics || {}))
+    return res.status(503).json({ code: error.code, error: 'El catálogo se está actualizando. Vuelve a intentarlo en un momento.' })
+  }
   console.error('Error consultando catálogo ETECSA:', error.code || error.message)
   return res.status(503).json({ code: error.code || 'ETECSA_CATALOG_UNAVAILABLE', error: 'No se pudo cargar el catálogo en este momento.' })
 }
