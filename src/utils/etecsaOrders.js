@@ -153,6 +153,21 @@ async function createPaymentOrder(client, body) {
     const error = new Error('Ya tienes una operación ETECSA en curso. Complétala o cancélala antes de empezar otra.')
     error.code = 'ETECSA_ORDER_ACTIVE'; error.status = 409; error.order = publicOrder(active); throw error
   }
+  const { data: activeGameOrders, error: gameOrderError } = await supabase.from('game_recharge_orders')
+    .select('*').eq('client_id', client.id).eq('status', 'WAITING_PAYMENT').order('created_at', { ascending: false }).limit(1)
+  if (gameOrderError) throw gameOrderError
+  const activeGame = activeGameOrders?.[0]
+  if (activeGame) {
+    if (Date.now() > Date.parse(activeGame.payment_deadline_at || '')) {
+      await supabase.from('game_recharge_orders').update({ status: 'EXPIRED', failure_reason: 'PAYMENT_WINDOW_EXPIRED', updated_at: nowIso() })
+        .eq('id', activeGame.id).eq('status', 'WAITING_PAYMENT')
+    } else {
+      const conflict = new Error('Ya tienes una compra de juegos pendiente de pago. Complétala o cancélala antes de empezar otra.')
+      conflict.code = 'ETECSA_ORDER_ACTIVE'; conflict.status = 409
+      conflict.order = { id: activeGame.id, ticket: `RG-${String(activeGame.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`, status: activeGame.status }
+      throw conflict
+    }
+  }
 
   const offerId = normalizeText(body?.offer_id, 100)
   const priceId = normalizeText(body?.price_id, 100)
