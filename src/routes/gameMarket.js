@@ -5,6 +5,7 @@ const crypto = require('crypto')
 const supabase = require('../supabase')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { DEFAULT_MARKET_PRICING, normalizeMarketPricing, calculateOfferPrices } = require('../utils/gamePricing')
+const { clientSafePackageData } = require('../utils/clientSafePackageData')
 
 const router = express.Router()
 const AVATAR_BUCKET = 'so-profile-avatars'
@@ -261,7 +262,7 @@ async function loadCatalog({ admin = false, storeId = null } = {}) {
       title: offer.title,
       description: offer.description || '',
       category: offer.category || 'Paquete',
-      package_data: offer.package_data || {},
+      package_data: admin ? (offer.package_data || {}) : clientSafePackageData(offer.package_data || {}),
       price_cup: Number(offer.price_cup || 0),
       price_saldo: Number(offer.price_saldo || 0),
       available: !!offer.available,

@@ -9,6 +9,7 @@ const { requireNonRevokedToken } = require('../utils/tokenState')
 const { createEventId, ensureWebhookSecret, queueWebhookDeliveries } = require('../utils/webhookDelivery')
 const { expireDueLicenses } = require('../utils/licenseExpiry')
 const { processIncomingTransfer } = require('../utils/etecsaOrders')
+const { processIncomingTransfer: processGameRechargeTransfer } = require('../utils/rechargeGamesOrders')
 
 const MAX_SMS_AGE_MS = Number(process.env.MAX_SMS_AGE_MS || 30 * 24 * 60 * 60 * 1000)
 const MAX_FUTURE_SKEW_MS = Number(process.env.MAX_SMS_FUTURE_SKEW_MS || 5 * 60 * 1000)
@@ -164,9 +165,12 @@ router.post('/ingest', async (req, res) => {
         await queueWebhookDeliveries({ client: webhookClient, payload: webhookPayload, eventId, logId: existing.id })
       }
       let etecsaOrderUpdate = null
+      let gameRechargeOrderUpdate = null
       try { etecsaOrderUpdate = await processIncomingTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
       catch (orderError) { console.error('Error comprobando pago de ticket ETECSA:', orderError.code || orderError.message) }
-      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, event_id: eventId, status: 'QUEUED', ...(etecsaOrderUpdate ? { etecsa_order_update: etecsaOrderUpdate } : {}) })
+      try { gameRechargeOrderUpdate = await processGameRechargeTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
+      catch (orderError) { console.error('Error comprobando pago de recarga de juego:', orderError.code || orderError.message) }
+      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, event_id: eventId, status: 'QUEUED', ...(etecsaOrderUpdate ? { etecsa_order_update: etecsaOrderUpdate } : {}), ...(gameRechargeOrderUpdate ? { game_recharge_order_update: gameRechargeOrderUpdate } : {}) })
     }
 
     const payload = {
@@ -209,8 +213,11 @@ router.post('/ingest', async (req, res) => {
     }
 
     let etecsaOrderUpdate = null
+    let gameRechargeOrderUpdate = null
     try { etecsaOrderUpdate = await processIncomingTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
     catch (orderError) { console.error('Error comprobando pago de ticket ETECSA:', orderError.code || orderError.message) }
+    try { gameRechargeOrderUpdate = await processGameRechargeTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
+    catch (orderError) { console.error('Error comprobando pago de recarga de juego:', orderError.code || orderError.message) }
 
     const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, log?.id, messageHash)
     const hasWebhooks = Boolean(client.webhook_url || client.webhook_url_2 || client.webhook_url_3)
@@ -231,6 +238,7 @@ router.post('/ingest', async (req, res) => {
       event_id: eventId,
       status: hasWebhooks ? 'QUEUED' : 'STORED',
       ...(etecsaOrderUpdate ? { etecsa_order_update: etecsaOrderUpdate } : {}),
+      ...(gameRechargeOrderUpdate ? { game_recharge_order_update: gameRechargeOrderUpdate } : {}),
     })
   } catch (error) {
     if (error.code === 'TOKEN_REVOKED') {
