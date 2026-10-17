@@ -108,6 +108,15 @@ test('catalog reports offers that cannot be priced instead of silently treating 
   assert.equal(result.diagnostics.invalid_currency_or_price_count, 1)
 })
 
+test('catalog keeps provider price IDs from documented field and common aliases', () => {
+  const documented = normalizeOffer({ id: 1, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ id: 'price-doc', label: '500 CUP', value: '4.2' }] })
+  const alias = normalizeOffer({ id: 2, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ price_id: 'price-alias', label: '500 CUP', value: '4.2' }] })
+  const uuidAlias = normalizeOffer({ id: 3, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ uuid: 'price-uuid', label: '500 CUP', value: '4.2' }] })
+  assert.equal(documented.prices[0].price_id, 'price-doc')
+  assert.equal(alias.prices[0].price_id, 'price-alias')
+  assert.equal(uuidAlias.prices[0].price_id, 'price-uuid')
+})
+
 test('offers with an unverified currency or no valid priced line are excluded', () => {
   assert.equal(normalizeOffer({ id: 1, type: 'recharge', name: 'Cubacel', currency: { code: 'USD' }, prices: [{ id: 'a', label: '500 CUP', value: '4.2' }] }).prices.length, 1)
   assert.equal(normalizeOffer({ id: 2, type: 'recharge', name: 'Cubacel', currency: { code: 'EUR' }, prices: [{ id: 'a', label: '500 CUP', value: '4.2' }] }), null)
