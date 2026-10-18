@@ -69,8 +69,17 @@ startHealthMonitor()
 app.get('/healthz', (_req, res) => res.json({ ok: true, status: 'UP', uptime_seconds: Math.floor(process.uptime()), checked_at: new Date().toISOString() }))
 app.get('/readyz', async (_req, res) => {
   try {
-    const { error } = await supabase.from('clients').select('id').limit(1)
-    if (error) throw error
+    // Check key schema contracts too: a live database with missing store migrations is
+    // not ready to accept paid orders. Do not expose table/column names or DB errors.
+    const checks = await Promise.all([
+      supabase.from('clients').select('id').limit(1),
+      supabase.from('store_wallet_topups').select('payment_review_at').limit(0),
+      supabase.from('game_recharge_orders').select('wallet_refunded_at,payment_source').limit(0),
+      supabase.from('store_wallet_transactions').select('id').limit(0),
+      supabase.from('service_incidents').select('id').limit(0),
+    ])
+    const failed = checks.find(result => result.error)
+    if (failed) throw failed.error
     return res.json({ ok: true, status: 'READY', database: 'UP', checked_at: new Date().toISOString() })
   } catch (_) {
     return res.status(503).json({ ok: false, status: 'NOT_READY', database: 'DOWN', checked_at: new Date().toISOString() })
