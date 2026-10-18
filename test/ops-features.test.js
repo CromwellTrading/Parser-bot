@@ -1,0 +1,141 @@
+'use strict'
+
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+const backend = path.join(__dirname, '..')
+const android = path.join(__dirname, '../../SMS-relay-main')
+const read = (p) => fs.readFileSync(p, 'utf8')
+
+test('ops panel exposes health metrics, incident resolution, manual reconciliation and announcements only behind admin middleware', () => {
+  const panel = read(path.join(backend, 'src/routes/panel.js'))
+  const admin = read(path.join(backend, 'src/routes/admin.js'))
+  assert.match(panel, /router\.use\('\/api',[\s\S]*adminAuth/)
+  for (const route of ["'/api/ops/summary'", "'/api/ops/incidents'", "'/api/ops/reconcile-payments'", "'/api/ops/announcements'"]) assert.ok(panel.includes(route), `missing panel route ${route}`)
+  for (const route of ["'/ops/summary'", "'/ops/incidents'", "'/ops/reconcile-payments'", "'/ops/announcements'"]) assert.ok(admin.includes(route), `missing API admin route ${route}`)
+  assert.match(panel, /function reconcilePayments\(\)/)
+  assert.match(panel, /function createAnnouncement\(\)/)
+})
+
+test('public health endpoints separate process liveness from database readiness without exposing errors', () => {
+  const index = read(path.join(backend, 'src/index.js'))
+  assert.match(index, /app\.get\('\/healthz'/)
+  assert.match(index, /app\.get\('\/readyz'/)
+  assert.match(index, /res\.status\(503\)\.json\(\{ ok: false, status: 'NOT_READY', database: 'DOWN'/)
+  assert.match(index, /startHealthMonitor\(\)/)
+})
+
+test('webhook health queries use timestamped failure-attempt logs, not nonexistent delivery updated_at', () => {
+  const ops = read(path.join(backend, 'src/utils/opsDashboard.js'))
+  const monitor = read(path.join(backend, 'src/utils/healthMonitor.js'))
+  assert.match(ops, /webhook_event_logs[\s\S]*?\.gte\('created_at'/)
+  assert.match(monitor, /webhook_event_logs[\s\S]*?\.gte\('created_at'/)
+  assert.doesNotMatch(ops, /webhook_deliveries[^\n]*\.gte\('updated_at'/)
+  assert.doesNotMatch(monitor, /webhook_deliveries[^\n]*\.gte\('updated_at'/)
+})
+
+test('health monitor alerts by Telegram once during a database outage and announces recovery', () => {
+  const monitor = read(path.join(backend, 'src/utils/healthMonitor.js'))
+  assert.match(monitor, /databaseWasDown/)
+  assert.match(monitor, /Supabase no responde/)
+  assert.match(monitor, /La conexión con Supabase volvió a responder/)
+})
+
+test('migration 019 deduplicates operational incidents and constrains announcement dates/severity', () => {
+  const sql = read(path.join(backend, 'supabase/migrations/019_ops_incidents_announcements.sql'))
+  assert.match(sql, /fingerprint text NOT NULL UNIQUE/)
+  assert.match(sql, /ON CONFLICT \(fingerprint\) DO UPDATE/)
+  assert.match(sql, /CHECK \(severity IN \('INFO','PROMO','WARN'\)\)/)
+  assert.match(sql, /CHECK \(ends_at IS NULL OR ends_at > starts_at\)/)
+  assert.match(sql, /GRANT EXECUTE ON FUNCTION public\.record_service_incident/)
+})
+
+test('announcement date changes are validated before UPDATE and store route is authenticated', () => {
+  const ops = read(path.join(backend, 'src/utils/opsDashboard.js'))
+  const route = read(path.join(backend, 'src/routes/storeAccount.js'))
+  assert.ok(ops.indexOf('Validate the resulting interval BEFORE writing') < ops.indexOf(".from('store_announcements').update(update)"))
+  assert.match(route, /router\.use\(requireStoreClient\)/)
+  assert.match(route, /router\.get\('\/announcements'/)
+  assert.match(route, /router\.get\('\/status'/)
+})
+
+test('support checks revocation and permits active store-only sessions even where active flag is false', () => {
+  const support = read(path.join(backend, 'src/routes/support.js'))
+  assert.match(support, /requireNonRevokedToken\(token\)/)
+  assert.match(support, /data\.active === false && data\.store_only !== true/)
+  const main = read(path.join(android, 'app/src/main/java/com/synthesisone/app/MainActivity.kt'))
+  assert.match(main, /private fun showSupportInbox\(\)[\s\S]{0,180}val token = storeAccessToken\(\)/)
+})
+
+test('store history has stable receipts and a Wallet credit movement references the original top-up ticket', () => {
+  const wallet = read(path.join(backend, 'src/utils/storeWallet.js'))
+  assert.match(wallet, /receipt_code: `SO-ET-/)
+  assert.match(wallet, /receipt_code: `SO-GM-/)
+  assert.match(wallet, /receipt_code: `SO-WL-/)
+  assert.match(wallet, /row\.reference_type === 'WALLET_TOPUP' && row\.reference_id \? `SO-WL-/)
+  assert.match(wallet, /ticket_id: row\.reference_type === 'WALLET_TOPUP' \? row\.reference_id : row\.id/)
+  assert.match(wallet, /async function getStoreStatusSnapshot/)
+  assert.match(wallet, /getStoreStatusSnapshot,/)
+  assert.match(wallet, /return \(includeAll \? base : activeFilter\(base\)\)\.order/)
+  assert.match(wallet, /maxRows: 10000/)
+  assert.match(wallet, /PAYMENT_RECEIVED_WAITING_DETAILS.*PROCESSING.*SUBMITTING_TO_PROVIDER/)
+  assert.match(wallet, /recentCutoff = new Date\(Date\.now\(\) - 7 \* 24 \* 60 \* 60 \* 1000\)/)
+  assert.match(wallet, /status\.eq\.WAITING_PAYMENT,payment_review_at\.not\.is\.null/)
+  assert.match(wallet, /payment_review_at\.not\.is\.null'\), \{ includeAll: true \}/)
+  assert.match(wallet, /top-ups are read across the full account history/)
+  assert.doesNotMatch(wallet.slice(wallet.indexOf('async function getStoreStatusSnapshot'), wallet.indexOf('async function getStoreHistory')), /entries\.slice\(0, 120\)/)
+})
+
+test('Android schedules constrained background polling and notifies only after a known status changes', () => {
+  const worker = read(path.join(android, 'app/src/main/java/com/synthesisone/app/service/StoreStatusWorker.kt'))
+  const notification = read(path.join(android, 'app/src/main/java/com/synthesisone/app/service/NotificationService.kt'))
+  const gradle = read(path.join(android, 'app/build.gradle'))
+  assert.match(gradle, /androidx\.work:work-runtime-ktx:2\.9\.0/)
+  assert.match(worker, /PeriodicWorkRequestBuilder<StoreStatusWorker>\(15, TimeUnit\.MINUTES\)/)
+  assert.match(worker, /previous\.isNotBlank\(\) && previous != status/)
+  assert.match(worker, /wallet_topup_status_\$referenceId/)
+  assert.match(notification, /fun showStoreStatusUpdate\(/)
+})
+
+test('Android Wallet tickets seed background status and store history opens a copyable receipt', () => {
+  const main = read(path.join(android, 'app/src/main/java/com/synthesisone/app/MainActivity.kt'))
+  assert.match(main, /StoreStatusWorker\.seedStatus\(this@MainActivity, "WALLET"/)
+  assert.match(main, /StoreStatusWorker\.seedStatus\(this@MainActivity, "ETECSA"/)
+  assert.match(main, /StoreStatusWorker\.seedStatus\(this@MainActivity, "GAMEMARKET"/)
+  assert.match(main, /card\.setOnClickListener \{ showStoreReceiptDialog\(entry\) \}/)
+  assert.match(main, /COPIAR ID/)
+  assert.match(main, /loadStoreAnnouncements\(storeAnnouncementsHost\)/)
+})
+
+test('Gradle CI verifies the official wrapper JAR and distribution checksums before build', () => {
+  const workflow = read(path.join(android, '.github/workflows/build.yml'))
+  const properties = read(path.join(android, 'gradle/wrapper/gradle-wrapper.properties'))
+  assert.match(workflow, /https:\/\/services\.gradle\.org\/distributions\/gradle-8\.1\.1-bin\.zip/)
+  const shellWrapper = read(path.join(android, 'gradlew'))
+  const windowsWrapper = read(path.join(android, 'gradlew.bat'))
+  const windowsBootstrap = read(path.join(android, 'gradle/wrapper/bootstrap-wrapper.ps1'))
+  assert.match(shellWrapper, /DIST_SHA256/)
+  assert.match(shellWrapper, /--gradle-version 8\.1\.1 --distribution-type bin/)
+  assert.match(windowsWrapper, /bootstrap-wrapper\.ps1/)
+  assert.match(windowsBootstrap, /Get-FileHash -LiteralPath \$Path -Algorithm SHA256/)
+  assert.match(windowsBootstrap, /gradle-8\.1\.1-bin\.zip/)
+  const wrapperChecksum = read(path.join(android, 'gradle/wrapper/gradle-wrapper.jar.sha256'))
+  assert.match(wrapperChecksum, /^ed2c26eba7cfb93cc2b7785d05e534f07b5b48b5e7fc941921cd098628abca58/m)
+  assert.match(workflow, /ed2c26eba7cfb93cc2b7785d05e534f07b5b48b5e7fc941921cd098628abca58/)
+  assert.match(workflow, /wrapper --gradle-version 8\.1\.1 --distribution-type bin/)
+  assert.doesNotMatch(workflow, /gradle-8\.1\.1-wrapper\.jar['\" ]/)
+  assert.match(workflow, /sha256sum --check/)
+  assert.match(properties, /distributionSha256Sum=e111cb9948407e26351227dabce49822fb88c37ee72f1d1582a69c68af2e702f/)
+})
+
+
+test('external uptime monitor checks liveness and readiness and supports secret-backed Telegram alerting', () => {
+  const workflow = read(path.join(backend, '.github/workflows/uptime-monitor.yml'))
+  assert.match(workflow, /cron: '\*\/5 \* \* \* \*'/)
+  assert.match(workflow, /\/healthz/)
+  assert.match(workflow, /\/readyz/)
+  assert.match(workflow, /SYNTHESISONE_MONITOR_TELEGRAM_BOT_TOKEN/)
+  assert.match(workflow, /SYNTHESISONE_MONITOR_TELEGRAM_CHAT_ID/)
+  assert.match(workflow, /if: failure\(\)/)
+})
