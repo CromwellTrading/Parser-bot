@@ -3,8 +3,10 @@
 const express = require('express')
 const crypto = require('crypto')
 const supabase = require('../supabase')
+const { createIpRateLimiter } = require('../utils/ipRateLimit')
 
 const router = express.Router()
+const registrationRateLimit = createIpRateLimiter({ windowMs: 15 * 60 * 1000, max: 30, message: 'Demasiados intentos de preparar la tienda desde esta conexión. Espera unos minutos e inténtalo otra vez.' })
 
 function normalizePhone(value) {
   let digits = String(value || '').replace(/\D/g, '')
@@ -45,7 +47,7 @@ function createClientPayload({ phone, deviceId, secretHash }) {
   }
 }
 
-router.post('/register', async (req, res) => {
+router.post('/register', registrationRateLimit, async (req, res) => {
   try {
     const deviceId = String(req.body?.device_id || req.body?.deviceId || '').trim()
     const phone = normalizePhone(req.body?.phone_number || req.body?.phoneNumber)

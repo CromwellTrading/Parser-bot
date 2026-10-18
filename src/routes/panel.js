@@ -9,9 +9,11 @@ const { decryptActivationSecret } = require('../utils/activationSecretVault')
 const { getAutomationAvailability, setAutomationAvailability } = require('../utils/systemSettings')
 const opsDashboard = require('../utils/opsDashboard')
 const { reconcileRecentPaymentSms } = require('../utils/paymentSmsReconciler')
+const { createIpRateLimiter } = require('../utils/ipRateLimit')
 
 const ADMIN_SESSION_COOKIE = 'synthesisone_admin_session'
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000
+const adminLoginRateLimit = createIpRateLimiter({ windowMs: 15 * 60 * 1000, max: 8, message: 'Demasiados intentos de acceso. Espera 15 minutos.' })
 
 router.use(express.urlencoded({ extended: false }))
 
@@ -34,7 +36,8 @@ function makeAdminSession(secret) {
 function getAdminCookie(req) {
   const raw = String(req.headers.cookie || '')
   const part = raw.split(';').map(v => v.trim()).find(v => v.startsWith(ADMIN_SESSION_COOKIE + '='))
-  return part ? decodeURIComponent(part.slice(ADMIN_SESSION_COOKIE.length + 1)) : ''
+  if (!part) return ''
+  try { return decodeURIComponent(part.slice(ADMIN_SESSION_COOKIE.length + 1)) } catch (_) { return '' }
 }
 
 function validAdminSession(req) {
@@ -61,7 +64,7 @@ function panelHtml(req, loginError = '') {
 
 router.get('/', (req, res) => res.send(panelHtml(req, String(req.query?.login || '') === 'error' ? 'Clave incorrecta' : '')))
 
-router.post('/login', (req, res) => {
+router.post('/login', adminLoginRateLimit, (req, res) => {
   const provided = String(req.body?.password || '').trim()
   if (!getConfiguredAdminSecret()) return res.redirect('/panel?login=error')
   if (!secretsMatch(provided)) return res.redirect('/panel?login=error')
