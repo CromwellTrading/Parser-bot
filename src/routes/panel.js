@@ -7,6 +7,8 @@ const { validateWebhookUrl } = require('../utils/webhookDelivery')
 const { expireDueLicenses, isExpired } = require('../utils/licenseExpiry')
 const { decryptActivationSecret } = require('../utils/activationSecretVault')
 const { getAutomationAvailability, setAutomationAvailability } = require('../utils/systemSettings')
+const opsDashboard = require('../utils/opsDashboard')
+const { reconcileRecentPaymentSms } = require('../utils/paymentSmsReconciler')
 
 const ADMIN_SESSION_COOKIE = 'synthesisone_admin_session'
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000
@@ -94,6 +96,47 @@ router.use('/api', (req, res, next) => {
   // /api/auth/verify es llamado por la app Android — no requiere admin secret
   if (req.path === '/auth/verify') return next()
   adminAuth(req, res, next)
+})
+
+// ── Operations, Wallet reliability and customer announcements ─────────────────
+router.get('/api/ops/summary', async (_req, res) => {
+  try { res.set('Cache-Control', 'no-store'); res.json(await opsDashboard.getOpsSummary()) }
+  catch (error) { res.status(error.status || 500).json({ ok: false, error: 'No se pudo cargar el estado operativo.' }) }
+})
+
+router.get('/api/ops/incidents', async (req, res) => {
+  try {
+    const incidents = await opsDashboard.listIncidents({ status: String(req.query.status || 'OPEN').toUpperCase(), limit: req.query.limit })
+    res.set('Cache-Control', 'no-store'); res.json({ ok: true, incidents })
+  } catch (error) { res.status(error.status || 500).json({ ok: false, error: 'No se pudieron cargar las incidencias.' }) }
+})
+
+router.post('/api/ops/incidents/:id/resolve', async (req, res) => {
+  try { res.json({ ok: true, incident: await opsDashboard.resolveIncident(req.params.id, 'panel-admin', req.body?.note || '') }) }
+  catch (error) { res.status(error.status || 500).json({ ok: false, error: error.status ? error.message : 'No se pudo cerrar la incidencia.' }) }
+})
+
+router.post('/api/ops/reconcile-payments', async (_req, res) => {
+  try {
+    const result = await reconcileRecentPaymentSms({ source: 'admin-panel' })
+    console.warn(JSON.stringify({ ts: new Date().toISOString(), event: 'PAYMENT_RECONCILIATION_MANUAL', source: 'admin-panel' }))
+    res.json({ ok: true, result })
+  } catch (error) { res.status(500).json({ ok: false, error: 'No se pudo iniciar la reconciliación. El worker automático sigue activo.' }) }
+})
+
+router.get('/api/ops/announcements', async (_req, res) => {
+  try { res.json({ ok: true, announcements: await opsDashboard.listAnnouncements({ limit: 100 }) }) }
+  catch (error) { res.status(500).json({ ok: false, error: 'No se pudieron cargar los avisos.' }) }
+})
+
+router.post('/api/ops/announcements', async (req, res) => {
+  try { res.status(201).json({ ok: true, announcement: await opsDashboard.publishAnnouncement(req.body || {}, 'panel-admin') }) }
+  catch (error) { res.status(error.status || 500).json({ ok: false, error: error.status ? error.message : 'No se pudo publicar el aviso.' }) }
+})
+
+router.patch('/api/ops/announcements/:id', async (req, res) => {
+  try { res.json({ ok: true, announcement: await opsDashboard.updateAnnouncement(req.params.id, req.body || {}) }) }
+  catch (error) { res.status(error.status || 500).json({ ok: false, error: error.status ? error.message : 'No se pudo actualizar el aviso.' }) }
 })
 
 // Explicit panel authentication endpoint used by the web UI.
@@ -1153,6 +1196,7 @@ tr:hover td{background:#ffffff04}
       <div class="tab" onclick="tab('logs')">SMS Logs</div>
       <div class="tab" onclick="tab('support')">Soporte <span id="support-unread-badge" class="badge badge-off" style="display:none">0</span></div>
       <div class="tab" onclick="tab('automation')">Automatización</div>
+      <div class="tab" onclick="tab('ops')">Salud y pagos</div>
     </div>
 
     <!-- CLIENTES -->
@@ -1231,6 +1275,40 @@ tr:hover td{background:#ffffff04}
         <button class="btn btn-primary btn-sm" style="width:auto" onclick="saveAutomationStatus(true)">Guardar mensaje</button>
         <p class="automation-hint">Desactiva esto antes de desconectar el teléfono. La app debe consultar /api/system/status y bloquear el flujo de pago cuando automation_enabled sea false.</p>
       </div>
+    </div>
+
+    <!-- OPERACIONES / WALLET -->
+    <div id="tab-ops" style="display:none">
+      <div class="sec-head">
+        <span class="sec-title">Salud del servicio · Wallet · Pagos</span>
+        <div class="acts">
+          <button class="btn btn-sm btn-blue" onclick="loadOps()">↻ Actualizar</button>
+          <button class="btn btn-sm btn-purple" onclick="reconcilePayments()">Conciliar SMS guardados</button>
+        </div>
+      </div>
+      <div id="ops-overall" class="log-card" style="border-left-color:var(--green)">Consultando servicios…</div>
+      <div id="ops-summary" class="stats">
+        <div class="stat"><div class="stat-label">Base de datos</div><div class="stat-val">—</div></div>
+      </div>
+      <div class="sec-head"><span class="sec-title">Incidencias abiertas</span><button class="btn btn-sm btn-blue" onclick="loadOpsIncidents()">Actualizar incidencias</button></div>
+      <div id="ops-incidents"><div class="loading">Cargando incidencias…</div></div>
+
+      <div class="sec-head" style="margin-top:28px"><span class="sec-title">Avisos y promociones de la tienda</span><button class="btn btn-sm btn-blue" onclick="loadAnnouncements()">↻ Actualizar</button></div>
+      <div class="form-panel open" style="display:block">
+        <div class="form-row" style="grid-template-columns:1fr 1fr">
+          <div class="inp-group"><label>Título</label><input id="announcement-title" maxlength="100" placeholder="Ej.: Oferta especial" /></div>
+          <div class="inp-group"><label>Tipo</label><select id="announcement-severity"><option value="INFO">Información</option><option value="PROMO">Promoción</option><option value="WARN">Aviso importante</option></select></div>
+        </div>
+        <div class="inp-group"><label>Mensaje</label><textarea id="announcement-message" maxlength="1500" placeholder="Texto visible en la tienda…"></textarea></div>
+        <div class="form-row" style="grid-template-columns:1fr 1fr">
+          <div class="inp-group"><label>Inicio (opcional)</label><input type="datetime-local" id="announcement-start" /></div>
+          <div class="inp-group"><label>Fin (opcional)</label><input type="datetime-local" id="announcement-end" /></div>
+        </div>
+        <label style="display:flex;gap:8px;align-items:center;margin-bottom:12px"><input type="checkbox" id="announcement-enabled" checked /> Publicar inmediatamente cuando comience</label>
+        <button class="btn btn-primary btn-sm" style="width:auto" onclick="createAnnouncement()">Publicar aviso</button>
+      </div>
+      <div id="ops-announcements"><div class="loading">Cargando avisos…</div></div>
+      <p class="automation-hint">La conciliación vuelve a examinar SMS ya almacenados; nunca solicita otro pago ni acredita comprobantes ambiguos. Resolver una incidencia solo cierra la alerta, no cambia el saldo ni el estado financiero.</p>
     </div>
   </main>
 </div>
@@ -1320,6 +1398,8 @@ let LOGS_RANGE = 'TODAY'
 async function loadAll() {
   await loadClients()
   await loadLogs()
+  await loadOps()
+  await loadAnnouncements()
 }
 if (window.PANEL_AUTHENTICATED) { loadAll().catch(e => console.error('Error cargando panel:', e)) }
 
@@ -1699,9 +1779,126 @@ async function changeRole(id,currentRole,name) {
   await loadClients()
 }
 
+// ── Operations centre: diagnostics, safe reconciliation and announcements ────
+async function loadOps() {
+  const overall = document.getElementById('ops-overall')
+  try {
+    const data = await api('/ops/summary')
+    if (data.error) throw new Error(data.error)
+    const dbUp = data.database?.status === 'UP'
+    const ok = data.ok && dbUp
+    overall.style.borderLeftColor = ok ? 'var(--green)' : 'var(--error)'
+    overall.innerHTML = '<div class="log-top"><strong>' + (ok ? 'Servicios operativos' : 'Atención requerida') + '</strong><span class="badge ' + (ok ? 'badge-on' : 'badge-off') + '">' + escapeHtml(data.service?.status || 'UNKNOWN') + '</span></div>' +
+      '<div class="log-body">Base de datos: ' + escapeHtml(data.database?.status || 'UNKNOWN') + ' · Última comprobación: ' + escapeHtml(data.checked_at || '—') + '</div>' +
+      (data.warnings?.length ? '<div class="log-body" style="margin-top:8px;color:var(--error)">' + data.warnings.map(escapeHtml).join('<br>') + '</div>' : '') +
+      (data.migrations_required ? '<div class="log-body" style="color:var(--error);margin-top:8px">Falta aplicar la migración 019 en el proyecto Supabase activo.</div>' : '')
+    const metrics = [
+      ['Incidencias abiertas', data.incidents?.open ?? '—'], ['Errores críticos', data.incidents?.critical ?? '—'],
+      ['Wallet en revisión', data.wallet?.payment_review ?? '—'], ['Wallet vencida pendiente', data.wallet?.overdue_waiting ?? '—'],
+      ['Pedidos ETECSA atascados', data.orders?.etecsa_stuck ?? '—'], ['Pedidos Game atascados', data.orders?.game_stuck ?? '—'],
+      ['Fallos recientes webhook', data.webhook_failures ?? '—'], ['Tiempo activo (s)', data.service?.uptime_seconds ?? '—']
+    ]
+    document.getElementById('ops-summary').innerHTML = metrics.map(([label, value]) => '<div class="stat"><div class="stat-label">' + escapeHtml(label) + '</div><div class="stat-val">' + escapeHtml(String(value)) + '</div></div>').join('')
+    await loadOpsIncidents()
+  } catch (e) {
+    overall.style.borderLeftColor = 'var(--error)'
+    overall.textContent = 'No se pudo consultar la salud operativa: ' + String(e.message || e)
+  }
+}
+
+async function loadOpsIncidents() {
+  const host = document.getElementById('ops-incidents')
+  try {
+    const data = await api('/ops/incidents?status=OPEN&limit=100')
+    if (data.error) throw new Error(data.error)
+    const rows = data.incidents || []
+    if (!rows.length) { host.innerHTML = '<div class="empty">No hay incidencias abiertas.</div>'; return }
+    host.innerHTML = rows.map(item => {
+      const id = String(item.id || '')
+      const sev = String(item.severity || 'WARN')
+      return '<div class="log-card" style="border-left-color:' + (sev === 'CRITICAL' || sev === 'ERROR' ? 'var(--error)' : 'var(--red)') + '">' +
+        '<div class="log-top"><strong>' + escapeHtml(item.title || 'Incidencia') + '</strong><span class="badge ' + (sev === 'CRITICAL' || sev === 'ERROR' ? 'badge-off' : 'badge-used') + '">' + escapeHtml(sev) + '</span></div>' +
+        '<div class="log-body">' + escapeHtml(item.message || '') + '</div>' +
+        '<div class="log-time" style="margin-top:8px">' + escapeHtml(item.component || 'servicio') + ' · Ocurrencias: ' + escapeHtml(String(item.occurrence_count || 1)) + ' · Última: ' + escapeHtml(item.last_seen_at || '—') + '</div>' +
+        '<div class="acts" style="margin-top:10px"><button class="btn btn-sm btn-green" onclick="resolveOpsIncident(&quot;' + escapeHtml(id) + '&quot;)">Marcar resuelta</button></div></div>'
+    }).join('')
+  } catch (e) { host.innerHTML = '<div class="empty">' + escapeHtml(String(e.message || e)) + '</div>' }
+}
+
+async function resolveOpsIncident(id) {
+  const note = prompt('Nota de resolución (opcional):', 'Revisado por administración')
+  if (note === null) return
+  const data = await api('/ops/incidents/' + encodeURIComponent(id) + '/resolve', {method:'POST', body:JSON.stringify({note})})
+  if (data.error) return toast(data.error, true)
+  toast('Incidencia marcada como resuelta')
+  await loadOps()
+}
+
+async function reconcilePayments() {
+  if (!confirm('Se volverán a analizar los SMS de pago ya guardados. No se creará ningún cobro. ¿Continuar?')) return
+  const btn = document.querySelector('#tab-ops button[onclick="reconcilePayments()"]')
+  if (btn) { btn.disabled = true; btn.textContent = 'Conciliando…' }
+  try {
+    const data = await api('/ops/reconcile-payments', {method:'POST', body:'{}'})
+    if (data.error) throw new Error(data.error)
+    const result = data.result || {}
+    toast('Conciliación terminada · SMS revisados: ' + (result.scanned ?? 0) + ' · coincidencias: ' + (result.matched ?? 0) + (result.error ? ' · Atención: ' + result.error : ''))
+    await loadOps()
+  } catch (e) { toast(String(e.message || e), true) }
+  finally { if (btn) { btn.disabled = false; btn.textContent = 'Conciliar SMS guardados' } }
+}
+
+async function loadAnnouncements() {
+  const host = document.getElementById('ops-announcements')
+  try {
+    const data = await api('/ops/announcements')
+    if (data.error) throw new Error(data.error)
+    const items = data.announcements || []
+    if (!items.length) { host.innerHTML = '<div class="empty">Todavía no hay avisos guardados.</div>'; return }
+    host.innerHTML = items.map(item => {
+      const id = String(item.id || '')
+      const enabled = Boolean(item.enabled)
+      return '<div class="log-card" style="border-left-color:' + (item.severity === 'WARN' ? 'var(--error)' : item.severity === 'PROMO' ? 'var(--green)' : 'var(--blue)') + '">' +
+        '<div class="log-top"><strong>' + escapeHtml(item.title || '') + '</strong><span class="badge ' + (enabled ? 'badge-on' : 'badge-off') + '">' + (enabled ? 'Publicado' : 'Pausado') + '</span></div>' +
+        '<div class="log-body">' + escapeHtml(item.message || '') + '</div>' +
+        '<div class="log-time" style="margin-top:8px">' + escapeHtml(item.severity || 'INFO') + ' · Desde: ' + escapeHtml(item.starts_at || '—') + ' · Hasta: ' + escapeHtml(item.ends_at || 'sin fecha final') + '</div>' +
+        '<div class="acts" style="margin-top:10px"><button class="btn btn-sm ' + (enabled ? 'btn-red' : 'btn-green') + '" onclick="toggleAnnouncement(&quot;' + escapeHtml(id) + '&quot;,' + (!enabled) + ')">' + (enabled ? 'Pausar' : 'Publicar') + '</button></div></div>'
+    }).join('')
+  } catch (e) { host.innerHTML = '<div class="empty">' + escapeHtml(String(e.message || e)) + '</div>' }
+}
+
+async function toggleAnnouncement(id, enabled) {
+  const data = await api('/ops/announcements/' + encodeURIComponent(id), {method:'PATCH', body:JSON.stringify({enabled})})
+  if (data.error) return toast(data.error, true)
+  toast(enabled ? 'Aviso publicado' : 'Aviso pausado')
+  await loadAnnouncements()
+}
+
+async function createAnnouncement() {
+  const title = document.getElementById('announcement-title').value.trim()
+  const message = document.getElementById('announcement-message').value.trim()
+  const severity = document.getElementById('announcement-severity').value
+  const startRaw = document.getElementById('announcement-start').value
+  const endRaw = document.getElementById('announcement-end').value
+  const body = {title, message, severity, enabled:document.getElementById('announcement-enabled').checked}
+  if (startRaw) body.starts_at = new Date(startRaw).toISOString()
+  if (endRaw) body.ends_at = new Date(endRaw).toISOString()
+  if (body.starts_at && body.ends_at && new Date(body.ends_at) <= new Date(body.starts_at)) return toast('La fecha final debe ser posterior al inicio.', true)
+  try {
+    const data = await api('/ops/announcements', {method:'POST', body:JSON.stringify(body)})
+    if (data.error) throw new Error(data.error)
+    document.getElementById('announcement-title').value = ''
+    document.getElementById('announcement-message').value = ''
+    document.getElementById('announcement-start').value = ''
+    document.getElementById('announcement-end').value = ''
+    toast('Aviso guardado')
+    await loadAnnouncements()
+  } catch (e) { toast(String(e.message || e), true) }
+}
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function tab(name) {
-  const names=['clients','logs','support','automation']
+  const names=['clients','logs','support','automation','ops']
   document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('on',names[i]===name))
   for (const key of names) {
     const el=document.getElementById('tab-'+key)
@@ -1710,6 +1907,7 @@ function tab(name) {
   if (name==='logs') loadLogs()
   if (name==='support') loadSupportThreads()
   if (name==='automation') loadAutomationStatus()
+  if (name==='ops') { loadOps(); loadAnnouncements() }
   if (SUPPORT_REFRESH) { clearInterval(SUPPORT_REFRESH); SUPPORT_REFRESH=null }
   if (name==='support') SUPPORT_REFRESH=setInterval(()=>{loadSupportThreads();if(SUPPORT_CLIENT_ID)openSupportThread(SUPPORT_CLIENT_ID)},10000)
 }

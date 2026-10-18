@@ -1,6 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const supabase = require('../supabase')
+const { requireNonRevokedToken } = require('../utils/tokenState')
 const { bot, ADMINS } = require('../telegram')
 
 function extractToken(req) {
@@ -15,17 +16,21 @@ async function getClient(req, res) {
     res.status(401).json({ error: 'Token requerido' })
     return null
   }
+  try { await requireNonRevokedToken(token) } catch (tokenError) {
+    res.status(401).json({ error: 'La sesión ya no está activa. Vuelve a conectarte.' })
+    return null
+  }
   const { data, error } = await supabase
     .from('clients')
-    .select('id, name, role, active, expires_at')
+    .select('id, name, role, active, expires_at, store_only')
     .eq('token', token)
     .maybeSingle()
   if (error) {
     res.status(500).json({ error: 'No se pudo validar el cliente' })
     return null
   }
-  if (!data) {
-    res.status(401).json({ error: 'Token inválido' })
+  if (!data || (data.active === false && data.store_only !== true)) {
+    res.status(401).json({ error: 'La sesión no está activa.' })
     return null
   }
   return data

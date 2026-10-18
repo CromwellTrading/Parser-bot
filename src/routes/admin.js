@@ -5,6 +5,8 @@ const supabase = require('../supabase')
 const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
 const { validateWebhookUrl } = require('../utils/webhookDelivery')
 const { expireDueLicenses, isExpired } = require('../utils/licenseExpiry')
+const opsDashboard = require('../utils/opsDashboard')
+const { reconcileRecentPaymentSms } = require('../utils/paymentSmsReconciler')
 
 function adminAuth(req, res, next) {
   const secret = req.headers['x-admin-secret']
@@ -202,6 +204,36 @@ router.get('/logs', async (req, res) => {
   const { data, error } = await query
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
+})
+
+
+router.get('/ops/summary', async (_req, res) => {
+  try { res.set('Cache-Control', 'no-store'); res.json(await opsDashboard.getOpsSummary()) }
+  catch (_) { res.status(500).json({ ok: false, error: 'No se pudo cargar el estado operativo.' }) }
+})
+router.get('/ops/incidents', async (req, res) => {
+  try { res.set('Cache-Control', 'no-store'); res.json({ ok: true, incidents: await opsDashboard.listIncidents({ status: String(req.query.status || 'OPEN').toUpperCase(), limit: req.query.limit }) }) }
+  catch (_) { res.status(500).json({ ok: false, error: 'No se pudieron cargar las incidencias.' }) }
+})
+router.post('/ops/incidents/:id/resolve', async (req, res) => {
+  try { res.json({ ok: true, incident: await opsDashboard.resolveIncident(req.params.id, 'api-admin', req.body?.note || '') }) }
+  catch (error) { res.status(error.status || 500).json({ ok: false, error: error.status ? error.message : 'No se pudo cerrar la incidencia.' }) }
+})
+router.post('/ops/reconcile-payments', async (_req, res) => {
+  try { res.json({ ok: true, result: await reconcileRecentPaymentSms({ source: 'admin-api' }) }) }
+  catch (_) { res.status(500).json({ ok: false, error: 'No se pudo iniciar la reconciliación.' }) }
+})
+router.get('/ops/announcements', async (_req, res) => {
+  try { res.json({ ok: true, announcements: await opsDashboard.listAnnouncements({ limit: 100 }) }) }
+  catch (_) { res.status(500).json({ ok: false, error: 'No se pudieron cargar los avisos.' }) }
+})
+router.post('/ops/announcements', async (req, res) => {
+  try { res.status(201).json({ ok: true, announcement: await opsDashboard.publishAnnouncement(req.body || {}, 'api-admin') }) }
+  catch (error) { res.status(error.status || 500).json({ ok: false, error: error.status ? error.message : 'No se pudo publicar el aviso.' }) }
+})
+router.patch('/ops/announcements/:id', async (req, res) => {
+  try { res.json({ ok: true, announcement: await opsDashboard.updateAnnouncement(req.params.id, req.body || {}) }) }
+  catch (error) { res.status(error.status || 500).json({ ok: false, error: error.status ? error.message : 'No se pudo actualizar el aviso.' }) }
 })
 
 module.exports = router

@@ -4,8 +4,9 @@ const express = require('express')
 const supabase = require('../supabase')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { canUseOfficialStore } = require('../utils/storeSessionAccess')
-const { getWalletSummary, createTopup, getTopup, refreshTopupStatus, getStoreHistory } = require('../utils/storeWallet')
+const { getWalletSummary, createTopup, getTopup, refreshTopupStatus, getStoreHistory, getStoreStatusSnapshot } = require('../utils/storeWallet')
 const { createWalletGameOrder } = require('../utils/rechargeGamesOrders')
+const { listAnnouncements } = require('../utils/opsDashboard')
 
 const router = express.Router()
 
@@ -77,6 +78,21 @@ router.post('/wallet/topups/:id/refresh', async (req, res) => {
 router.post('/wallet/game-orders', async (req, res) => {
   try { return res.status(201).json({ ok: true, order: await createWalletGameOrder(req.storeClient, req.body || {}) }) }
   catch (error) { return respondError(res, error, 'No se pudo completar la compra con Wallet.') }
+})
+
+router.get('/announcements', async (_req, res) => {
+  try {
+    const announcements = await listAnnouncements({ activeOnly: true, limit: 20 })
+    return res.json({ ok: true, announcements })
+  } catch (error) { return respondError(res, error, 'No se pudieron cargar los avisos de la tienda.') }
+})
+
+router.get('/status', async (req, res) => {
+  try {
+    const entries = await getStoreStatusSnapshot(req.storeClient.id)
+    res.set('Cache-Control', 'no-store')
+    return res.json({ ok: true, checked_at: new Date().toISOString(), entries })
+  } catch (error) { return respondError(res, error, 'No se pudieron consultar los estados de tus operaciones.') }
 })
 
 router.get('/history', async (req, res) => {
