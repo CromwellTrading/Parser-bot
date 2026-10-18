@@ -2,11 +2,13 @@
 
 const crypto = require('crypto')
 const supabase = require('../supabase')
+const { readAllRows } = require('./supabasePagination')
 const { bot, ADMINS } = require('../telegram')
 const { getLicenseConfig, cardMatches } = require('./onboarding')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
-const { normalizePayerPhone, isConfiguredPaymentReceiver, evaluateEtecsaPayment } = require('./etecsaPaymentMatching')
+const { normalizePayerPhone, isConfiguredPaymentReceiver } = require('./etecsaPaymentMatching')
+const { evaluateOfficialStorePayment } = require('./walletPaymentMatching')
 const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
 const { getPlatformStoreId } = require('./rechargeGamesCatalog')
 const { verifyWebhookSignature } = require('./rechargeGamesWebhookSecurity')
@@ -467,19 +469,22 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   const isDestinationReceipt = direction === 'RECIBIDO'
   // A received SMS is emitted by the payment destination's phone, which is often
   // an admin/merchant client rather than the buyer that owns the order.
-  let candidateQuery = supabase.from('game_recharge_orders').select('*')
-    .in('status', ['WAITING_PAYMENT', 'EXPIRED'])
-    .order('created_at', { ascending: false }).limit(isDestinationReceipt ? 500 : 12)
-  if (!isDestinationReceipt) candidateQuery = candidateQuery.eq('client_id', client.id)
-  const { data: candidates, error } = await candidateQuery
-  if (error) throw error
+  const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString()
+  const buildCandidateQuery = () => {
+    let query = supabase.from('game_recharge_orders').select('*')
+      .in('status', ['WAITING_PAYMENT', 'EXPIRED'])
+      .gte('created_at', cutoff).order('created_at', { ascending: false })
+    if (!isDestinationReceipt) query = query.eq('client_id', client.id)
+    return query
+  }
+  const candidates = await readAllRows(buildCandidateQuery, { pageSize: 500, maxRows: 100_000 })
   const matchedCandidates = []
   for (const candidate of candidates || []) {
     // Cross-client RECIBIDO receipts are accepted only from the configured
     // payment destination phone; ENVIADO remains scoped to the ticket owner.
     if (isDestinationReceipt && !isConfiguredPaymentReceiver(client, candidate)) continue
     if (candidate.status === 'EXPIRED' && !parsed?.transaction_at) continue
-    const result = evaluateEtecsaPayment(parsed, candidate, receivedAt)
+    const result = evaluateOfficialStorePayment(parsed, candidate, receivedAt)
     if (result.matched) matchedCandidates.push({ order: candidate, evaluation: result })
     const potentiallyRelevant = ['AMOUNT_MISMATCH', 'DESTINATION_CARD_MISMATCH', 'PAYER_PHONE_MISMATCH', 'PAYER_PHONE_NOT_IN_SMS', 'PAYMENT_OUTSIDE_WINDOW']
     if (candidate.status === 'WAITING_PAYMENT' && Date.now() > Date.parse(candidate.payment_deadline_at || '') &&
@@ -502,12 +507,13 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
       return null
     }
 
-    const { data: etecsaCandidates, error: etecsaError } = await supabase.from('etecsa_orders').select('*')
-      .in('status', ['WAITING_PAYMENT', 'EXPIRED']).order('created_at', { ascending: false }).limit(500)
-    if (etecsaError) throw etecsaError
-    const etecsaMatches = (etecsaCandidates || []).filter(candidate =>
+    const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString()
+    const etecsaCandidates = await readAllRows(() => supabase.from('etecsa_orders').select('*')
+      .in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', cutoff).order('created_at', { ascending: false }),
+      { pageSize: 500, maxRows: 100_000 })
+    const etecsaMatches = etecsaCandidates.filter(candidate =>
       isConfiguredPaymentReceiver(client, candidate) &&
-      !(candidate.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateEtecsaPayment(parsed, candidate, receivedAt).matched)
+      !(candidate.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateOfficialStorePayment(parsed, candidate, receivedAt).matched)
     if (etecsaMatches.length) {
       console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', direction, matching_etecsa_ticket_count: etecsaMatches.length }))
       return null
@@ -526,10 +532,8 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     if (dupeGame.data || dupeEtecsa.data || dupeWallet.data) return null
   }
 
-  if (parsed?.transaction_id) {
-    const claimed = await claimPaymentTransaction({ transactionId: parsed.transaction_id, clientId: selected.client_id, source: 'GAMEMARKET', orderId: selected.id })
-    if (!claimed) return null
-  }
+  const claimed = await claimPaymentTransaction({ transactionId: parsed?.transaction_id, smsLogId, clientId: selected.client_id, source: 'GAMEMARKET', orderId: selected.id })
+  if (!claimed) return null
 
   const requiresServer = /mobile[-_ ]?legends/i.test(String(selected.provider_game_slug || ''))
   const hasAllRecipientDetails = selected.provider_delivery === 'code' ||

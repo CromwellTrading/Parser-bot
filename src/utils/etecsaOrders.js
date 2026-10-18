@@ -2,12 +2,14 @@
 
 const crypto = require('crypto')
 const supabase = require('../supabase')
+const { readAllRows } = require('./supabasePagination')
 const { bot, ADMINS } = require('../telegram')
 const { getLicenseConfig, cardMatches } = require('./onboarding')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
 const { getCatalogResponse } = require('./etecsaCatalog')
 const { normalizePayerPhone, isConfiguredPaymentReceiver, evaluateEtecsaPayment } = require('./etecsaPaymentMatching')
+const { evaluateOfficialStorePayment } = require('./walletPaymentMatching')
 const { findMatchingTopups } = require('./storeWallet')
 const { claimPaymentTransaction } = require('./paymentTransactionClaims')
 
@@ -282,12 +284,15 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   // The SMS on the destination/payment phone belongs to the receiver's SynthesisOne
   // installation, not to the buyer who owns the ticket. Search all open tickets only
   // for a received receipt; outgoing SMS remains scoped to the ticket owner.
-  let candidateQuery = supabase.from('etecsa_orders').select('*')
-    .in('status', ['WAITING_PAYMENT', 'EXPIRED'])
-    .order('created_at', { ascending: false }).limit(isDestinationReceipt ? 500 : 12)
-  if (!isDestinationReceipt) candidateQuery = candidateQuery.eq('client_id', client.id)
-  const { data: candidates, error: candidateError } = await candidateQuery
-  if (candidateError) throw candidateError
+  const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString()
+  const buildCandidateQuery = () => {
+    let query = supabase.from('etecsa_orders').select('*')
+      .in('status', ['WAITING_PAYMENT', 'EXPIRED'])
+      .gte('created_at', cutoff).order('created_at', { ascending: false })
+    if (!isDestinationReceipt) query = query.eq('client_id', client.id)
+    return query
+  }
+  const candidates = await readAllRows(buildCandidateQuery, { pageSize: 500, maxRows: 100_000 })
 
   const matchedCandidates = []
   for (const candidate of candidates || []) {
@@ -297,7 +302,7 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     // Once the UI ticket expired, auto-confirm only when Transfermóvil includes
     // its own transaction timestamp and proves the transfer happened in-window.
     if (candidate.status === 'EXPIRED' && !parsed?.transaction_at) continue
-    const candidateEvaluation = evaluateEtecsaPayment(parsed, candidate, receivedAt)
+    const candidateEvaluation = evaluateOfficialStorePayment(parsed, candidate, receivedAt)
     if (candidateEvaluation.matched) matchedCandidates.push({ order: candidate, evaluation: candidateEvaluation })
     const potentiallyRelevant = ['AMOUNT_MISMATCH', 'DESTINATION_CARD_MISMATCH', 'PAYER_PHONE_MISMATCH', 'PAYER_PHONE_NOT_IN_SMS', 'PAYMENT_OUTSIDE_WINDOW']
     if (candidate.status === 'WAITING_PAYMENT' && Date.now() > Date.parse(candidate.payment_deadline_at || '') &&
@@ -327,12 +332,13 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   // If this same received receipt matches both product types, leave both pending
   // and raise a diagnostic instead of choosing whichever route runs first.
   if (isDestinationReceipt) {
-    const { data: gameCandidates, error: gameError } = await supabase.from('game_recharge_orders').select('*')
-      .in('status', ['WAITING_PAYMENT', 'EXPIRED']).order('created_at', { ascending: false }).limit(500)
-    if (gameError) throw gameError
-    const gameMatches = (gameCandidates || []).filter(candidate =>
+    const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString()
+    const gameCandidates = await readAllRows(() => supabase.from('game_recharge_orders').select('*')
+      .in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', cutoff).order('created_at', { ascending: false }),
+      { pageSize: 500, maxRows: 100_000 })
+    const gameMatches = gameCandidates.filter(candidate =>
       isConfiguredPaymentReceiver(client, candidate) &&
-      !(candidate.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateEtecsaPayment(parsed, candidate, receivedAt).matched)
+      !(candidate.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateOfficialStorePayment(parsed, candidate, receivedAt).matched)
     if (gameMatches.length) {
       console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'ETECSA', direction, matching_game_ticket_count: gameMatches.length }))
       return null
@@ -350,10 +356,8 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     if (duplicateWallet.error) throw duplicateWallet.error
     if (duplicate.data || duplicateGame.data || duplicateWallet.data) return null
   }
-  if (parsed?.transaction_id) {
-    const claimed = await claimPaymentTransaction({ transactionId: parsed.transaction_id, clientId: order.client_id, source: 'ETECSA', orderId: order.id })
-    if (!claimed) return null
-  }
+  const claimed = await claimPaymentTransaction({ transactionId: parsed?.transaction_id, smsLogId, clientId: order.client_id, source: 'ETECSA', orderId: order.id })
+  if (!claimed) return null
   const { data: updated, error } = await supabase.from('etecsa_orders')
     .update({
       status: 'PAYMENT_RECEIVED_WAITING_DETAILS',
