@@ -1,0 +1,54 @@
+name: SynthesisOne external uptime monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: synthesisone-uptime-monitor
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      SO_HEALTH_BASE_URL: ${{ vars.SYNTHESISONE_HEALTH_BASE_URL || 'https://parser-bot-9y8n.onrender.com' }}
+    steps:
+      - name: Check liveness and database readiness
+        id: health
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${SO_HEALTH_BASE_URL%/}"
+          echo "Comprobando endpoints públicos de salud de SynthesisOne."
+          curl --fail --silent --show-error --location --retry 2 --retry-all-errors --connect-timeout 10 --max-time 35 \
+            --output /tmp/synthesisone-healthz.json "$base/healthz"
+          node -e "const fs=require('fs'); const x=JSON.parse(fs.readFileSync('/tmp/synthesisone-healthz.json','utf8')); if(x.ok!==true || x.status!=='UP') process.exit(1)"
+          curl --fail --silent --show-error --location --retry 2 --retry-all-errors --connect-timeout 10 --max-time 35 \
+            --output /tmp/synthesisone-readyz.json "$base/readyz"
+          node -e "const fs=require('fs'); const x=JSON.parse(fs.readFileSync('/tmp/synthesisone-readyz.json','utf8')); if(x.ok!==true || x.status!=='READY' || x.database!=='UP') process.exit(1)"
+          echo "SynthesisOne está vivo y la base de datos responde."
+      - name: Alert administrators by Telegram if the check fails
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.SYNTHESISONE_MONITOR_TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.SYNTHESISONE_MONITOR_TELEGRAM_CHAT_ID }}
+          HEALTH_URL: ${{ vars.SYNTHESISONE_HEALTH_BASE_URL || 'https://parser-bot-9y8n.onrender.com' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
+            echo "No se configuraron los secretos de Telegram; GitHub Actions marcará esta comprobación como fallida y enviará sus notificaciones habituales si están activadas."
+            exit 0
+          fi
+          message="🚨 SynthesisOne: falló la comprobación externa de salud ($HEALTH_URL). Revisa Render, Supabase y el registro de GitHub Actions: $RUN_URL"
+          curl --fail --silent --show-error --max-time 15 -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${message}" >/dev/null

@@ -1,1 +1,46 @@
-.github
+name: Backend tests and syntax
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Check JavaScript syntax
+        run: |
+          set -euo pipefail
+          find src test -type f -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: Check embedded admin panel JavaScript
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+          const source = fs.readFileSync('src/routes/panel.js', 'utf8')
+          const start = source.indexOf('const PANEL_HTML = `')
+          if (start < 0) throw new Error('PANEL_HTML not found')
+          const bodyStart = start + 'const PANEL_HTML = `'.length
+          const bodyEnd = source.lastIndexOf('`\n\nmodule.exports')
+          if (bodyEnd <= bodyStart) throw new Error('PANEL_HTML boundary not found')
+          const html = source.slice(bodyStart, bodyEnd)
+          const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+          if (!scripts.length) throw new Error('admin panel script not found')
+          const js = scripts[scripts.length - 1][1].replaceAll('\\`', '`').replaceAll('\\${', '${')
+          fs.writeFileSync('/tmp/panel-inline.js', js)
+          NODE
+          node --check /tmp/panel-inline.js
+      - name: Run tests
+        run: npm test
