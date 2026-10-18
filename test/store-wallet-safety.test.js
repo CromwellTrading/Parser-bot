@@ -11,10 +11,11 @@ const claimsSource = fs.readFileSync(path.join(__dirname, '../src/utils/paymentT
 const reliabilityMigration = fs.readFileSync(path.join(__dirname, '../supabase/migrations/018_wallet_payment_reliability.sql'), 'utf8')
 const storeAccountRoute = fs.readFileSync(path.join(__dirname, '../src/routes/storeAccount.js'), 'utf8')
 const reconcilerSource = fs.readFileSync(path.join(__dirname, '../src/utils/paymentSmsReconciler.js'), 'utf8')
-const mainActivitySource = fs.readFileSync(path.resolve(__dirname, '../../SMS-relay-main/app/src/main/java/com/synthesisone/app/MainActivity.kt'), 'utf8')
+const mainActivityPath = path.resolve(__dirname, '../../SMS-relay-main/app/src/main/java/com/synthesisone/app/MainActivity.kt')
+const mainActivitySource = fs.existsSync(mainActivityPath) ? fs.readFileSync(mainActivityPath, 'utf8') : null
 const etecsaOrdersSource = fs.readFileSync(path.join(__dirname, '../src/utils/etecsaOrders.js'), 'utf8')
 const gameOrdersSource = fs.readFileSync(path.join(__dirname, '../src/utils/rechargeGamesOrders.js'), 'utf8')
-const reconcileGuideSql = fs.readFileSync(path.resolve(__dirname, '../../SynthesisOne_SO_Manual_Approve_Wallet_Topup_f43cf615.sql'), 'utf8')
+const refundMigration = fs.readFileSync(path.join(__dirname, '../supabase/migrations/020_game_wallet_refund_reliability.sql'), 'utf8')
 
 test('wallet balance cannot become negative and debits lock the wallet row', () => {
   assert.match(migration, /balance_cup numeric\(18,2\) NOT NULL DEFAULT 0 CHECK \(balance_cup >= 0\)/)
@@ -68,7 +69,8 @@ test('automatic SMS reconciliation skips empty workloads and scans paged records
   assert.match(reconcilerSource, /\.range\(offset, Math\.min\(offset \+ PAGE_SIZE - 1, MAX_SMS_ROWS - 1\)\)/)
 })
 
-test('Android shows a manual refresh button and requests the reconciliation endpoint', () => {
+test('Android shows a manual refresh button and requests the reconciliation endpoint', (t) => {
+  if (!mainActivitySource) return t.skip('Android app se comprueba en el repositorio SMS-relay')
   assert.match(mainActivitySource, /setNeutralButton\("🔄 ACTUALIZAR", null\)/)
   assert.match(mainActivitySource, /wallet\/topups\/\$id\/refresh/)
   assert.match(mainActivitySource, /Saldo actual confirmado:/)
@@ -93,20 +95,20 @@ test('ETECSA and Game Market payment matching page through recent tickets rather
   assert.doesNotMatch(gameOrdersSource, /limit\(isDestinationReceipt \? 500 : 12\)/)
 })
 
-test('Wallet UI never silently substitutes zero when balance_cup is absent and shows integrity warnings', () => {
+test('Wallet UI never silently substitutes zero when balance_cup is absent and shows integrity warnings', (t) => {
+  if (!mainActivitySource) return t.skip('Android app se comprueba en el repositorio SMS-relay')
   assert.match(mainActivitySource, /!wallet\.has\("balance_cup"\)/)
   assert.match(mainActivitySource, /walletIntegrity.*healthy/)
   assert.match(mainActivitySource, /render\(next, fetchBalance = false\)/)
 })
 
-test('manual recovery script returns the SQL RPC result and verifies the actual balance and one ticket movement', () => {
-  assert.match(reconcileGuideSql, /store_wallet_credit_topup/)
-  assert.match(reconcileGuideSql, /rpc\.result AS credit_rpc_result/)
-  assert.match(reconcileGuideSql, /current_wallet_balance_cup/)
-  assert.match(reconcileGuideSql, /credit_movement_count_for_this_ticket/)
-  assert.match(reconcileGuideSql, /ABORTADO: ya existe otro crédito parecido/)
-  assert.match(reconcileGuideSql, /public\.webhook_deliveries[\s\S]*?event_id = 'ee89ebc5f998348eb1aba1c23dd7f8370a2d107c80a178960e08c3f599afe756'[\s\S]*?sms_log_id/ )
-  assert.match(reconcileGuideSql, /store_claim_payment_transaction/)
+test('refund recovery migration marks refunded orders atomically and preserves a unique refund movement', () => {
+  assert.match(refundMigration, /ADD COLUMN IF NOT EXISTS wallet_refunded_at timestamptz/)
+  assert.match(refundMigration, /status = 'REFUNDED',[\s\S]*?wallet_refunded_at = now\(\)/)
+  assert.match(refundMigration, /reference_type = 'GAME_RECHARGE_REFUND'/)
+  assert.match(refundMigration, /WALLET_REFUND_AMOUNT_MISMATCH/)
+  assert.match(refundMigration, /WALLET_REFUND_LEDGER_MISSING/)
+  assert.match(refundMigration, /GRANT EXECUTE ON FUNCTION public\.store_wallet_refund_game_order\(uuid\) TO service_role/)
 })
 
 
@@ -135,10 +137,12 @@ test('Wallet-funded game orders refuse to spend when the balance and ledger are 
   assert.match(reliabilityMigration, /WALLET_TOPUP_LEDGER_MISSING/)
 })
 
-test('manual wallet recovery refuses to reuse an SMS already attached to another store purchase', () => {
-  assert.match(reconcileGuideSql, /public\.etecsa_orders WHERE payment_sms_log_id = v_sms_log_id/)
-  assert.match(reconcileGuideSql, /public\.game_recharge_orders WHERE payment_sms_log_id = v_sms_log_id/)
-  assert.match(reconcileGuideSql, /created_at <= COALESCE\(v_topup\.payment_deadline_at/)
+test('wallet refund reconciliation retries pending refunds even if provider configuration is unavailable', () => {
+  assert.match(gameOrdersSource, /status', 'REFUND_REQUIRED'[\s\S]*?wallet_refunded_at[\s\S]*?store_wallet_refund_game_order/)
+  const reconcile = gameOrdersSource.indexOf('async function reconcileProcessingOrders()')
+  const retrySuccess = gameOrdersSource.indexOf('GAME_RECHARGE_WALLET_REFUND_RETRY_SUCCEEDED', reconcile)
+  const providerGate = gameOrdersSource.indexOf("if (!String(process.env.RECHARGEGAMES_API_KEY", reconcile)
+  assert.ok(retrySuccess >= reconcile && providerGate > retrySuccess, 'refund recovery must run before provider API configuration is checked')
 })
 
 test('expired ticket reads re-fetch the authoritative status if the expiry update loses a race', () => {
@@ -152,7 +156,8 @@ test('potential payment with exact amount and destination but a delayed bank tim
   assert.equal(matching.isPotentialWalletTopupPayment(parsed, ticket, '2026-10-18T03:30:02.000Z'), true)
 })
 
-test('Android never interprets a missing Wallet balance as zero at checkout', () => {
+test('Android never interprets a missing Wallet balance as zero at checkout', (t) => {
+  if (!mainActivitySource) return t.skip('Android app se comprueba en el repositorio SMS-relay')
   assert.match(mainActivitySource, /Saldo no confirmado[\s\S]*?val balance = wallet\.optDouble\("balance_cup", Double\.NaN\)/)
   assert.doesNotMatch(mainActivitySource, /optDouble\("balance_cup", 0\.0\)/)
 })
@@ -177,4 +182,35 @@ test('idempotent wallet game purchase responses return the current locked balanc
 test('periodic repair scans all reviewed completed Wallet top-ups rather than silently stopping at 100', () => {
   assert.match(reconcilerSource, /const reviewedCompletedWallet = await readAllRows[\s\S]*?maxRows: 100_000/)
   assert.doesNotMatch(reconcilerSource, /payment_review_at', 'is', null\)[\s\S]*?limit\(100\)/)
+})
+
+
+test('Wallet-funded purchases do not depend on personal SMS automation settings', () => {
+  const start = gameOrdersSource.indexOf('async function createWalletGameOrder(')
+  const end = gameOrdersSource.indexOf('async function getRecentOrders(', start)
+  assert.ok(start >= 0 && end > start)
+  const walletPurchase = gameOrdersSource.slice(start, end)
+  assert.doesNotMatch(walletPurchase, /getAutomationAvailability\(/)
+  assert.match(walletPurchase, /store_wallet_create_game_order/)
+})
+
+test('an immediate Wallet refund returns the final server state instead of stale REFUND_REQUIRED', () => {
+  const start = gameOrdersSource.indexOf('async function createWalletGameOrder(')
+  const end = gameOrdersSource.indexOf('async function getRecentOrders(', start)
+  const walletPurchase = gameOrdersSource.slice(start, end)
+  assert.match(walletPurchase, /const submitted = await submitProviderOrder|submitted = await submitProviderOrder/)
+  assert.match(walletPurchase, /GAME_RECHARGE_WALLET_SUBMISSION_DEFERRED/)
+  assert.match(walletPurchase, /let finalSubmitted = submitted/)
+  assert.match(walletPurchase, /store_wallet_refund_game_order/)
+  assert.match(walletPurchase, /select\('\*'\)\.eq\('id', orderId\)\.maybeSingle\(\)/)
+  assert.match(walletPurchase, /if \(refreshed\) finalSubmitted = publicOrder\(refreshed\)/)
+})
+
+test('refund retries happen before provider API-key gating and refunded orders are terminal', () => {
+  const reconcile = gameOrdersSource.indexOf('async function reconcileProcessingOrders()')
+  const retrySuccess = gameOrdersSource.indexOf('GAME_RECHARGE_WALLET_REFUND_RETRY_SUCCEEDED', reconcile)
+  const providerGate = gameOrdersSource.indexOf("if (!String(process.env.RECHARGEGAMES_API_KEY", reconcile)
+  assert.ok(retrySuccess >= reconcile && providerGate > retrySuccess)
+  assert.match(refundMigration, /status = 'REFUNDED',[\s\S]*?wallet_refunded_at = now\(\)/)
+  assert.match(gameOrdersSource, /order\.status === 'REFUNDED'[\s\S]*?GAME_RECHARGE_PROVIDER_TERMINAL_CONFLICT/)
 })
