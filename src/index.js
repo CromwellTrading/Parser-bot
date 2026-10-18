@@ -40,6 +40,8 @@ const { startRechargeGamesOrderWorker } = require('./utils/rechargeGamesOrders')
 const { startWebhookWorker } = require('./utils/webhookDelivery')
 const { startLicenseExpiryWorker } = require('./utils/licenseExpiry')
 const { startPaymentSmsReconciler } = require('./utils/paymentSmsReconciler')
+const { startHealthMonitor } = require('./utils/healthMonitor')
+const supabase = require('./supabase')
 
 app.use('/api/store-session', storeSessionRoutes)
 app.use('/api/store/account', storeAccountRoutes)
@@ -61,6 +63,19 @@ startEtecsaOrderWorker()
 startRechargeGamesCatalogWorker()
 startRechargeGamesOrderWorker()
 startPaymentSmsReconciler()
+startHealthMonitor()
+
+// Liveness is deliberately dependency-free; readiness tests the database without exposing internals.
+app.get('/healthz', (_req, res) => res.json({ ok: true, status: 'UP', uptime_seconds: Math.floor(process.uptime()), checked_at: new Date().toISOString() }))
+app.get('/readyz', async (_req, res) => {
+  try {
+    const { error } = await supabase.from('clients').select('id').limit(1)
+    if (error) throw error
+    return res.json({ ok: true, status: 'READY', database: 'UP', checked_at: new Date().toISOString() })
+  } catch (_) {
+    return res.status(503).json({ ok: false, status: 'NOT_READY', database: 'DOWN', checked_at: new Date().toISOString() })
+  }
+})
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'SynthesisOne Backend' })
