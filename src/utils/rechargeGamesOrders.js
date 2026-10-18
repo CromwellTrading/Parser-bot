@@ -10,6 +10,8 @@ const { normalizePayerPhone, isConfiguredPaymentReceiver, evaluateEtecsaPayment 
 const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
 const { getPlatformStoreId } = require('./rechargeGamesCatalog')
 const { verifyWebhookSignature } = require('./rechargeGamesWebhookSecurity')
+const { findMatchingTopups } = require('./storeWallet')
+const { claimPaymentTransaction } = require('./paymentTransactionClaims')
 
 const PAYMENT_WINDOW_MS = 30 * 60 * 1000
 const BLOCKING_STATUSES = ['WAITING_PAYMENT']
@@ -52,7 +54,8 @@ function publicOrder(order) {
     updated_at: order.updated_at,
     provider_status: order.provider_status || null,
     delivery_note: order.provider_delivery_note || null,
-    failure_reason: order.failure_reason || order.provider_failure_reason || null,
+    failure_reason: order.status === 'REFUND_REQUIRED' ? 'La entrega falló. Tu caso requiere resolución; no vuelvas a pagar.' : order.status === 'FULFILLMENT_REVIEW' ? 'El pedido necesita revisión. No vuelvas a pagar.' : order.failure_reason || null,
+    payment_source: order.payment_source || 'TRANSFERMOVIL',
     requirements: {
       delivery: order.provider_delivery,
       player_id: order.provider_delivery === 'player_id',
@@ -109,6 +112,17 @@ async function assertNoOtherWaitingCheckout(clientId) {
       throw Object.assign(errorWithStatus('Ya tienes una operación pendiente de pago. Complétala o cancélala antes de iniciar otra.', 409, 'CHECKOUT_ACTIVE'), {
         order: { id: etecsa.id, ticket: `ET-${String(etecsa.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`, status: etecsa.status },
       })
+    }
+  }
+  const { data: topups, error: topupError } = await supabase.from('store_wallet_topups').select('id,status,payment_deadline_at')
+    .eq('client_id', clientId).eq('status', 'WAITING_PAYMENT').order('created_at', { ascending: false }).limit(1)
+  if (topupError) throw topupError
+  const topup = topups?.[0]
+  if (topup) {
+    if (Date.now() > Date.parse(topup.payment_deadline_at || '')) {
+      await supabase.from('store_wallet_topups').update({ status: 'EXPIRED', updated_at: nowIso() }).eq('id', topup.id).eq('status', 'WAITING_PAYMENT')
+    } else {
+      throw Object.assign(errorWithStatus('Ya tienes una recarga de Wallet pendiente. Complétala antes de iniciar otra compra.', 409, 'CHECKOUT_ACTIVE'), { order: { id: topup.id, status: topup.status } })
     }
   }
 }
@@ -215,6 +229,71 @@ async function createPaymentOrder(client, body) {
   return publicData
 }
 
+async function createWalletGameOrder(client, body) {
+  if (!String(process.env.RECHARGEGAMES_API_KEY || '').trim()) {
+    throw errorWithStatus('Las compras con Wallet están temporalmente no disponibles. Inténtalo más tarde.', 503, 'PROVIDER_NOT_CONFIGURED')
+  }
+  const offerId = cleanText(body?.offer_id, 100)
+  const basis = String(body?.price_basis || 'CUP').trim().toUpperCase()
+  if (!offerId || basis !== 'CUP') throw errorWithStatus('Selecciona un paquete y un precio CUP válidos.', 400, 'INVALID_OFFER_SELECTION')
+  const idempotencyKey = cleanText(body?.idempotency_key, 128)
+  if (!/^[A-Za-z0-9_.:-]{8,128}$/.test(idempotencyKey)) throw errorWithStatus('No se pudo verificar el intento de compra. Vuelve a intentarlo.', 400, 'INVALID_IDEMPOTENCY_KEY')
+  await assertNoOtherWaitingCheckout(client.id)
+  const offer = await getProviderOffer(offerId)
+  const playerId = cleanText(body?.player_id, 200) || null
+  const serverId = cleanText(body?.server_id, 200) || null
+  if (offer.provider_delivery === 'player_id' && !playerId) throw errorWithStatus('Introduce el ID del jugador antes de comprar.', 400, 'PLAYER_ID_REQUIRED')
+  if (offer.provider_delivery === 'player_id' && /mobile[-_ ]?legends/i.test(String(offer.provider_game_slug || '')) && !serverId) {
+    throw errorWithStatus('Introduce también el ID del servidor antes de comprar.', 400, 'SERVER_ID_REQUIRED')
+  }
+  const amount = Number(offer.price_cup)
+  if (!Number.isSafeInteger(amount) || amount <= 0) throw errorWithStatus('El precio de este paquete no está disponible.', 409, 'INVALID_LOCAL_PRICE')
+  const providerMeta = offer.package_data?.rechargegames || {}
+  const providerCost = Number(providerMeta.provider_price_usdt ?? offer.base_cost_usd)
+  if (!Number.isFinite(providerCost) || providerCost <= 0) throw errorWithStatus('El precio del paquete se está actualizando. Inténtalo más tarde.', 409, 'PROVIDER_PRICE_UNAVAILABLE')
+
+  const id = crypto.randomUUID()
+  const createdAt = new Date()
+  const orderPayload = {
+    id, offer_id: offer.id, game_name: cleanText(offer.game_name, 100), offer_title: cleanText(offer.title, 120),
+    provider_product_key: offer.provider_product_key,
+    provider_product_name: cleanText(providerMeta.product_name || offer.title, 120),
+    provider_game_slug: cleanText(offer.provider_game_slug, 160) || cleanText(providerMeta.game_slug, 160),
+    provider_region_slug: offer.provider_region_slug || providerMeta.region_slug || null,
+    provider_region_name: offer.provider_region_name || providerMeta.region_name || null,
+    provider_delivery: offer.provider_delivery || providerMeta.delivery,
+    provider_kind: providerMeta.provider_kind || 'topup', provider_cost_usdt: providerCost,
+    price_basis: 'CUP', payment_amount: amount, payer_phone: null,
+    player_id: playerId, server_id: serverId, buyer_ref: `SO-${id}`,
+  }
+  const { data: rpcData, error: rpcError } = await supabase.rpc('store_wallet_create_game_order', {
+    p_client_id: client.id, p_amount: amount, p_order: orderPayload, p_idempotency_key: idempotencyKey,
+  })
+  if (rpcError) {
+    if (String(rpcError.message || '').includes('INSUFFICIENT_WALLET_BALANCE')) {
+      throw errorWithStatus('No tienes saldo suficiente en Wallet. Añade fondos o elige otro paquete.', 409, 'INSUFFICIENT_WALLET_BALANCE')
+    }
+    if (String(rpcError.message || '').includes('IDEMPOTENCY_KEY_REUSED')) throw errorWithStatus('Este intento ya se utilizó. Inicia una nueva compra.', 409, 'IDEMPOTENCY_KEY_REUSED')
+    if (rpcError.code === '23505') throw errorWithStatus('Esta compra ya se está procesando. Revisa tu historial.', 409, 'ORDER_ALREADY_EXISTS')
+    throw rpcError
+  }
+  const rawOrder = rpcData?.order || rpcData
+  const orderId = rawOrder?.id || id
+  const createdOrder = rpcData?.order ? publicOrder(rpcData.order) : null
+  console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_DEBITED', order_id: orderId, client_id: client.id, amount_cup: amount, balance_cup: Number(rpcData?.balance_cup || 0) }))
+  // If the same idempotency key is replayed, return the existing order. The recovery
+  // worker resolves a stale SUBMITTING_TO_PROVIDER state by buyer_ref, avoiding a
+  // second concurrent provider submission while never leaving a crashed order behind.
+  if (rpcData?.already_processed) return createdOrder || publicOrder(rawOrder)
+  const submitted = await submitProviderOrder(orderId, { playerId, serverId })
+  if (submitted.status === 'REFUND_REQUIRED') {
+    const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: orderId })
+    if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: orderId, code: refundError.code || 'REFUND_FAILED' }))
+    else console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUNDED', order_id: orderId, amount_cup: amount }))
+  }
+  return submitted
+}
+
 async function getRecentOrders(clientId) {
   const { data, error } = await supabase.from('game_recharge_orders').select('*')
     .eq('client_id', clientId).order('created_at', { ascending: false }).limit(30)
@@ -280,6 +359,10 @@ async function persistProviderResult(order, providerOrder, raw = null) {
     notifyAdmins(`✅ Recarga de juego entregada · ${makeTicket(order.id)}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}${patch.provider_delivery_note ? `\nEntrega: ${patch.provider_delivery_note}` : ''}`).catch(() => {})
   } else if (status === 'REFUND_REQUIRED') {
     console.error('[RechargeGames] La entrega falló después del pago local:', JSON.stringify({ order_id: order.id, provider_order_id: patch.provider_order_id, provider_status: providerStatus }))
+    if (data.payment_source === 'WALLET') {
+      const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: data.id })
+      if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: data.id, code: refundError.code || 'REFUND_FAILED' }))
+    }
     notifyAdmins(`⚠️ Recarga de juego necesita resolución · ${makeTicket(order.id)}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nEstado del proveedor: ${providerStatus}\nMotivo: ${patch.failure_reason || 'No disponible'}\nEl pago local ya fue recibido; revisar manualmente.`).catch(() => {})
   }
   return publicOrder(data)
@@ -298,6 +381,10 @@ async function markProviderFailure(order, error) {
     updated_at: nowIso(),
   }).eq('id', order.id).select('*').single()
   if (updateError) throw updateError
+  if (status === 'REFUND_REQUIRED' && data.payment_source === 'WALLET') {
+    const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: data.id })
+    if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: data.id, code: refundError.code || 'REFUND_FAILED' }))
+  }
   notifyAdmins(`⚠️ Falló el envío de recarga de juego · ${makeTicket(order.id)}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nCódigo proveedor: ${error?.code || 'error'}${error?.status ? ` (HTTP ${error.status})` : ''}\nRequiere revisión manual; el pago local ya fue recibido.`).catch(() => {})
   console.error('[RechargeGames] Error al solicitar una recarga:', JSON.stringify({ order_id: order.id, code: error?.code || null, status: error?.status || null, local_status: status }))
   return publicOrder(data)
@@ -409,6 +496,12 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   const { order: selected, evaluation } = matchedCandidates[0]
 
   if (isDestinationReceipt) {
+    const walletMatches = await findMatchingTopups({ client, parsed, receivedAt })
+    if (walletMatches.length) {
+      console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', wallet_ticket_count: walletMatches.length }))
+      return null
+    }
+
     const { data: etecsaCandidates, error: etecsaError } = await supabase.from('etecsa_orders').select('*')
       .in('status', ['WAITING_PAYMENT', 'EXPIRED']).order('created_at', { ascending: false }).limit(500)
     if (etecsaError) throw etecsaError
@@ -422,13 +515,20 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   }
 
   if (parsed?.transaction_id) {
-    const [dupeGame, dupeEtecsa] = await Promise.all([
+    const [dupeGame, dupeEtecsa, dupeWallet] = await Promise.all([
       supabase.from('game_recharge_orders').select('id').eq('payment_transaction_id', String(parsed.transaction_id)).maybeSingle(),
       supabase.from('etecsa_orders').select('id').eq('payment_transaction_id', String(parsed.transaction_id)).maybeSingle(),
+      supabase.from('store_wallet_topups').select('id').eq('payment_transaction_id', String(parsed.transaction_id)).maybeSingle(),
     ])
     if (dupeGame.error) throw dupeGame.error
     if (dupeEtecsa.error) throw dupeEtecsa.error
-    if (dupeGame.data || dupeEtecsa.data) return null
+    if (dupeWallet.error) throw dupeWallet.error
+    if (dupeGame.data || dupeEtecsa.data || dupeWallet.data) return null
+  }
+
+  if (parsed?.transaction_id) {
+    const claimed = await claimPaymentTransaction({ transactionId: parsed.transaction_id, clientId: selected.client_id, source: 'GAMEMARKET', orderId: selected.id })
+    if (!claimed) return null
   }
 
   const requiresServer = /mobile[-_ ]?legends/i.test(String(selected.provider_game_slug || ''))
@@ -618,6 +718,7 @@ module.exports = {
   cancelPaymentOrder,
   submitRecipientDetails,
   processIncomingTransfer,
+  createWalletGameOrder,
   verifyWebhookSignature,
   handleProviderWebhook,
   getPlatformStoreId,

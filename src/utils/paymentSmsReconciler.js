@@ -4,6 +4,7 @@ const supabase = require('../supabase')
 const { parseSms } = require('./parser')
 const { processIncomingTransfer: processEtecsaTransfer } = require('./etecsaOrders')
 const { processIncomingTransfer: processGameTransfer } = require('./rechargeGamesOrders')
+const { processIncomingTransfer: processWalletTransfer } = require('./storeWallet')
 
 let started = false
 let running = false
@@ -24,6 +25,18 @@ async function reconcileRecentPaymentSms() {
       .limit(300)
     if (error) throw error
 
+    // Reconciliation needs the receiver phone as well as client_id so destination-side
+    // RECIBIDO receipts can be matched after a restart, even if the ticket belongs to
+    // a different client/device session.
+    const clientIds = [...new Set((rows || []).map(row => row.client_id).filter(Boolean))]
+    const clientsById = new Map()
+    if (clientIds.length) {
+      const { data: clients, error: clientsError } = await supabase.from('clients')
+        .select('id,phone_number').in('id', clientIds)
+      if (clientsError) throw clientsError
+      for (const client of clients || []) clientsById.set(String(client.id), client)
+    }
+
     // Oldest first so a ticket's receipt is reconciled consistently if a device sent
     // several matching notifications. Matching remains idempotent on transaction ID.
     for (const row of (rows || []).slice().reverse()) {
@@ -34,7 +47,7 @@ async function reconcileRecentPaymentSms() {
           !['TARJETA_TARJETA', 'MONEDERO_TARJETA'].includes(String(parsed?.type || '').toUpperCase()) ||
           !Number.isFinite(Number(parsed?.amount))) continue
       scanned += 1
-      const client = { id: row.client_id }
+      const client = clientsById.get(String(row.client_id)) || { id: row.client_id }
       let etecsa = null
       let game = null
       try {
@@ -47,7 +60,13 @@ async function reconcileRecentPaymentSms() {
       } catch (error) {
         console.error('[PaymentReconciler] Game match failed:', error?.code || error?.message || 'unknown')
       }
-      if (etecsa || game) matched += 1
+      let wallet = null
+      try {
+        wallet = await processWalletTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
+      } catch (error) {
+        console.error('[PaymentReconciler] Wallet match failed:', error?.code || error?.message || 'unknown')
+      }
+      if (etecsa || game || wallet) matched += 1
     }
     if (matched) {
       console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'PAYMENT_SMS_RECONCILIATION_COMPLETED', scanned, matched, lookback_hours: LOOKBACK_HOURS }))

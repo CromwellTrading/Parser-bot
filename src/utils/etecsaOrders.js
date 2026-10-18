@@ -8,6 +8,8 @@ const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
 const { getCatalogResponse } = require('./etecsaCatalog')
 const { normalizePayerPhone, isConfiguredPaymentReceiver, evaluateEtecsaPayment } = require('./etecsaPaymentMatching')
+const { findMatchingTopups } = require('./storeWallet')
+const { claimPaymentTransaction } = require('./paymentTransactionClaims')
 
 const SOKY_API_BASE = 'https://api.sokyrecargas.com/api/v1'
 const PAYMENT_WINDOW_MS = 30 * 60 * 1000
@@ -169,6 +171,20 @@ async function createPaymentOrder(client, body) {
     }
   }
 
+  const { data: activeTopups, error: activeTopupError } = await supabase.from('store_wallet_topups')
+    .select('id,status,payment_deadline_at').eq('client_id', client.id).eq('status', 'WAITING_PAYMENT')
+    .order('created_at', { ascending: false }).limit(1)
+  if (activeTopupError) throw activeTopupError
+  const activeTopup = activeTopups?.[0]
+  if (activeTopup) {
+    if (Date.now() > Date.parse(activeTopup.payment_deadline_at || '')) {
+      await supabase.from('store_wallet_topups').update({ status: 'EXPIRED', updated_at: nowIso() }).eq('id', activeTopup.id).eq('status', 'WAITING_PAYMENT')
+    } else {
+      const conflict = new Error('Ya tienes una recarga de Wallet pendiente. Complétala antes de iniciar otra compra.')
+      conflict.code = 'ETECSA_ORDER_ACTIVE'; conflict.status = 409; conflict.order = { id: activeTopup.id, status: activeTopup.status }; throw conflict
+    }
+  }
+
   const offerId = normalizeText(body?.offer_id, 100)
   const priceId = normalizeText(body?.price_id, 100)
   const basis = String(body?.price_basis || '').trim().toUpperCase()
@@ -298,6 +314,15 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   }
   const { order, evaluation } = matchedCandidates[0]
 
+  // The same Transfermóvil receipt cannot pay an ETECSA ticket and a Wallet top-up.
+  if (isDestinationReceipt) {
+    const walletMatches = await findMatchingTopups({ client, parsed, receivedAt })
+    if (walletMatches.length) {
+      console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'ETECSA', wallet_ticket_count: walletMatches.length }))
+      return null
+    }
+  }
+
   // A single bank transfer must never pay both an ETECSA ticket and a game order.
   // If this same received receipt matches both product types, leave both pending
   // and raise a diagnostic instead of choosing whichever route runs first.
@@ -315,13 +340,19 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   }
 
   if (parsed?.transaction_id) {
-    const [duplicate, duplicateGame] = await Promise.all([
+    const [duplicate, duplicateGame, duplicateWallet] = await Promise.all([
       supabase.from('etecsa_orders').select('id').eq('payment_transaction_id', String(parsed.transaction_id)).maybeSingle(),
       supabase.from('game_recharge_orders').select('id').eq('payment_transaction_id', String(parsed.transaction_id)).maybeSingle(),
+      supabase.from('store_wallet_topups').select('id').eq('payment_transaction_id', String(parsed.transaction_id)).maybeSingle(),
     ])
     if (duplicate.error) throw duplicate.error
     if (duplicateGame.error) throw duplicateGame.error
-    if (duplicate.data || duplicateGame.data) return null
+    if (duplicateWallet.error) throw duplicateWallet.error
+    if (duplicate.data || duplicateGame.data || duplicateWallet.data) return null
+  }
+  if (parsed?.transaction_id) {
+    const claimed = await claimPaymentTransaction({ transactionId: parsed.transaction_id, clientId: order.client_id, source: 'ETECSA', orderId: order.id })
+    if (!claimed) return null
   }
   const { data: updated, error } = await supabase.from('etecsa_orders')
     .update({
