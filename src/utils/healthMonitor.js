@@ -99,6 +99,22 @@ async function runHealthCheck() {
       count: overdueCount,
     })
 
+    const walletRefundsPending = await monitoredCount('game_recharge_orders', q => q.eq('payment_source', 'WALLET').eq('status', 'REFUND_REQUIRED').is('wallet_refunded_at', null))
+    await checkCondition({
+      fingerprint: 'wallet:refunds-pending', component: 'wallet', severity: 'CRITICAL',
+      title: 'Hay devoluciones de Wallet pendientes',
+      message: 'Una compra fallida ya descontó saldo y todavía no tiene una devolución confirmada en el libro de movimientos. El sistema reintenta automáticamente; comprueba el ticket y no pidas al cliente que pague otra vez.',
+      count: walletRefundsPending,
+    })
+
+    const transferRefundsPending = await monitoredCount('game_recharge_orders', q => q.eq('payment_source', 'TRANSFERMOVIL').eq('status', 'REFUND_REQUIRED'))
+    await checkCondition({
+      fingerprint: 'orders:transfer-refunds-pending', component: 'game-market', severity: 'ERROR',
+      title: 'Hay pedidos pagados por Transfermóvil que requieren resolución',
+      message: 'El proveedor marcó una entrega fallida de un pedido pagado por transferencia. Esto no se puede devolver automáticamente a Wallet: revisa la operación y contacta al cliente para resolver el pago.',
+      count: transferRefundsPending,
+    })
+
     const staleCutoff = new Date(Date.now() - 20 * 60 * 1000).toISOString()
     const [etecsaStuck, gameStuck] = await Promise.all([
       monitoredCount('etecsa_orders', q => q.in('status', ['PROCESSING', 'SUBMITTING_TO_SOKY', 'SUBMITTING_TO_PROVIDER']).lt('updated_at', staleCutoff)),
@@ -110,8 +126,8 @@ async function runHealthCheck() {
     const webhookFailures = await monitoredCount('webhook_event_logs', q => q.in('status', ['FAILED', 'EXCEPTION', 'BLOCKED']).gte('created_at', new Date(Date.now() - 30 * 60 * 1000).toISOString()))
     await checkCondition({ fingerprint: 'webhooks:recent-failures', component: 'webhooks', severity: 'WARN', title: 'Fallos recientes de entrega de webhooks', message: 'Hay entregas personales que fallaron; no deben bloquear ni alterar acreditaciones de la tienda oficial.', count: webhookFailures })
 
-    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'OPS_HEALTH_CHECK_COMPLETED', duration_ms: Date.now() - began, wallet_review: reviewCount, overdue_wallet: overdueCount, etecsa_stuck: etecsaStuck, game_stuck: gameStuck, webhook_failures: webhookFailures }))
-    return { ok: true, wallet_review: reviewCount, overdue_wallet: overdueCount, etecsa_stuck: etecsaStuck, game_stuck: gameStuck, webhook_failures: webhookFailures }
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'OPS_HEALTH_CHECK_COMPLETED', duration_ms: Date.now() - began, wallet_review: reviewCount, overdue_wallet: overdueCount, wallet_refunds_pending: walletRefundsPending, transfer_refunds_pending: transferRefundsPending, etecsa_stuck: etecsaStuck, game_stuck: gameStuck, webhook_failures: webhookFailures }))
+    return { ok: true, wallet_review: reviewCount, overdue_wallet: overdueCount, wallet_refunds_pending: walletRefundsPending, transfer_refunds_pending: transferRefundsPending, etecsa_stuck: etecsaStuck, game_stuck: gameStuck, webhook_failures: webhookFailures }
   } catch (error) {
     console.error(JSON.stringify({ ts: new Date().toISOString(), event: 'OPS_HEALTH_CHECK_ERROR', code: error?.code || null, message: String(error?.message || 'unknown').slice(0, 200) }))
     return { ok: false, error: error?.code || 'health_check_error' }

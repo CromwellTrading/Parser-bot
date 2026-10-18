@@ -19,8 +19,8 @@ async function getOpsSummary() {
   const out = {
     ok: true, checked_at: checkedAt, service: { status: 'UP', uptime_seconds: Math.floor(process.uptime()) },
     database: { status: 'UNKNOWN' }, incidents: { open: 0, critical: 0 },
-    wallet: { payment_review: 0, overdue_waiting: 0 },
-    orders: { etecsa_stuck: 0, game_stuck: 0 },
+    wallet: { payment_review: 0, overdue_waiting: 0, refunds_pending: 0 },
+    orders: { etecsa_stuck: 0, game_stuck: 0, transfer_refunds_pending: 0 },
     webhook_failures: 0, warnings: [], migrations_required: false,
   }
 
@@ -43,6 +43,8 @@ async function getOpsSummary() {
     ['incidents_critical', () => countRows('service_incidents', q => q.in('status', ['OPEN', 'ACKNOWLEDGED']).in('severity', ['CRITICAL', 'ERROR']))],
     ['wallet_review', () => countRows('store_wallet_topups', q => q.not('payment_review_at', 'is', null))],
     ['wallet_overdue', () => countRows('store_wallet_topups', q => q.eq('status', 'WAITING_PAYMENT').lt('payment_deadline_at', cutoffOverdue))],
+    ['wallet_refunds_pending', () => countRows('game_recharge_orders', q => q.eq('payment_source', 'WALLET').eq('status', 'REFUND_REQUIRED').is('wallet_refunded_at', null))],
+    ['transfer_refunds_pending', () => countRows('game_recharge_orders', q => q.eq('payment_source', 'TRANSFERMOVIL').eq('status', 'REFUND_REQUIRED'))],
     ['etecsa_stuck', () => countRows('etecsa_orders', q => q.in('status', ['PROCESSING', 'SUBMITTING_TO_SOKY', 'SUBMITTING_TO_PROVIDER']).lt('updated_at', cutoffStale))],
     ['game_stuck', () => countRows('game_recharge_orders', q => q.in('status', ['PROCESSING', 'SUBMITTING_TO_PROVIDER', 'SUBMITTING_TO_SOKY']).lt('updated_at', cutoffStale))],
     ['webhook_failures', () => countRows('webhook_event_logs', q => q.in('status', ['FAILED', 'EXCEPTION', 'BLOCKED']).gte('created_at', new Date(Date.now() - 30 * 60 * 1000).toISOString()))],
@@ -53,7 +55,7 @@ async function getOpsSummary() {
   for (const [key, value, error] of values) {
     if (error) {
       out.ok = false
-      if (/service_incidents|payment_review_at/.test(String(error.message || ''))) out.migrations_required = true
+      if (/service_incidents|payment_review_at|wallet_refunded_at/.test(String(error.message || ''))) out.migrations_required = true
       out.warnings.push(`${key}: ${errorText(error)}`)
       continue
     }
@@ -61,6 +63,8 @@ async function getOpsSummary() {
     else if (key === 'incidents_critical') out.incidents.critical = value
     else if (key === 'wallet_review') out.wallet.payment_review = value
     else if (key === 'wallet_overdue') out.wallet.overdue_waiting = value
+    else if (key === 'wallet_refunds_pending') out.wallet.refunds_pending = value
+    else if (key === 'transfer_refunds_pending') out.orders.transfer_refunds_pending = value
     else if (key === 'etecsa_stuck') out.orders.etecsa_stuck = value
     else if (key === 'game_stuck') out.orders.game_stuck = value
     else if (key === 'webhook_failures') out.webhook_failures = value

@@ -508,6 +508,7 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
 function shortFailure(status, reason, paymentReviewRequired = false) {
   if (paymentReviewRequired) return 'Detectamos un posible pago y lo estamos verificando. No vuelvas a pagar.'
   if (status === 'COMPLETED') return 'Entregado correctamente.'
+  if (status === 'REFUNDED') return 'La recarga falló; el importe se devolvió a Wallet.'
   if (status === 'PROCESSING' || status === 'SUBMITTING_TO_PROVIDER') return 'Pago confirmado; pedido en proceso.'
   if (status === 'WAITING_PAYMENT') return 'Esperando el pago.'
   if (status === 'EXPIRED') return 'El plazo de pago terminó.'
@@ -540,7 +541,7 @@ async function getStoreStatusSnapshot(clientId) {
   })
   const [etecsaRows, gameRows, topupRows] = await Promise.all([
     queryRows('etecsa_orders', 'id,offer_name,price_label,payment_amount,status,created_at,updated_at,paid_at,completed_at,failure_reason', q => q.in('status', ['WAITING_PAYMENT', 'PAYMENT_RECEIVED_WAITING_DETAILS', 'PROCESSING', 'SUBMITTING_TO_SOKY', 'SUBMITTING_TO_PROVIDER', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED'])),
-    queryRows('game_recharge_orders', 'id,game_name,offer_title,payment_amount,status,created_at,updated_at,paid_at,completed_at,failure_reason,payment_source', q => q.in('status', ['WAITING_PAYMENT', 'PAYMENT_RECEIVED_WAITING_DETAILS', 'PROCESSING', 'SUBMITTING_TO_PROVIDER', 'SUBMITTING_TO_SOKY', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED'])),
+    queryRows('game_recharge_orders', 'id,game_name,offer_title,payment_amount,status,created_at,updated_at,paid_at,completed_at,failure_reason,payment_source,wallet_refunded_at', q => q.in('status', ['WAITING_PAYMENT', 'PAYMENT_RECEIVED_WAITING_DETAILS', 'PROCESSING', 'SUBMITTING_TO_PROVIDER', 'SUBMITTING_TO_SOKY', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED', 'REFUNDED'])),
     queryRows('store_wallet_topups', 'id,amount_cup,status,created_at,updated_at,paid_at,payment_deadline_at,payment_review_at,payment_review_reason', q => q.or('status.eq.WAITING_PAYMENT,payment_review_at.not.is.null'), { includeAll: true }),
   ])
   const etecsa = { data: etecsaRows }
@@ -557,9 +558,9 @@ async function getStoreStatusSnapshot(clientId) {
   for (const row of games.data || []) entries.push({
     id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
     source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}`,
-    amount_cup: Number(row.payment_amount), currency: 'CUP', status: row.status,
-    message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at,
-    paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL',
+    amount_cup: Number(row.payment_amount), currency: 'CUP', status: row.wallet_refunded_at ? 'REFUNDED' : row.status,
+    message: shortFailure(row.wallet_refunded_at ? 'REFUNDED' : row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at,
+    paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL', wallet_refunded_at: row.wallet_refunded_at || null,
   })
   for (const row of topups.data || []) entries.push({
     id: row.id, ticket_id: row.id, receipt_code: `SO-WL-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
@@ -575,14 +576,17 @@ async function getStoreStatusSnapshot(clientId) {
 async function getStoreHistory(clientId) {
   const [etecsa, games, topups, ledger] = await Promise.all([
     supabase.from('etecsa_orders').select('id,offer_name,price_label,payment_amount,price_basis,status,created_at,updated_at,paid_at,completed_at,failure_reason').eq('client_id', clientId).order('created_at', { ascending: false }).limit(50),
-    supabase.from('game_recharge_orders').select('id,game_name,offer_title,payment_amount,price_basis,status,payment_source,created_at,updated_at,paid_at,completed_at,failure_reason').eq('client_id', clientId).order('created_at', { ascending: false }).limit(50),
+    supabase.from('game_recharge_orders').select('id,game_name,offer_title,payment_amount,price_basis,status,payment_source,created_at,updated_at,paid_at,completed_at,failure_reason,wallet_refunded_at').eq('client_id', clientId).order('created_at', { ascending: false }).limit(50),
     supabase.from('store_wallet_topups').select('id,amount_cup,status,created_at,updated_at,paid_at,payment_deadline_at,payment_review_at,payment_review_reason').eq('client_id', clientId).order('created_at', { ascending: false }).limit(30),
     supabase.from('store_wallet_transactions').select('id,kind,amount_cup,reference_type,reference_id,description,created_at').eq('client_id', clientId).order('created_at', { ascending: false }).limit(100),
   ])
   for (const r of [etecsa, games, topups, ledger]) if (r.error) throw r.error
   const entries = []
   for (const row of etecsa.data || []) entries.push({ id: row.id, ticket_id: row.id, receipt_code: `SO-ET-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, source: 'ETECSA', title: `${row.offer_name}${row.price_label ? ` · ${row.price_label}` : ''}`, amount_cup: Number(row.payment_amount), currency: row.price_basis === 'SALDO' ? 'SALDO' : 'CUP', status: row.status, message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at })
-  for (const row of games.data || []) entries.push({ id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}`, amount_cup: Number(row.payment_amount), currency: row.price_basis === 'SALDO' ? 'SALDO' : 'CUP', status: row.status, message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL' })
+  for (const row of games.data || []) {
+    const effectiveStatus = row.wallet_refunded_at ? 'REFUNDED' : row.status
+    entries.push({ id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}`, amount_cup: Number(row.payment_amount), currency: row.price_basis === 'SALDO' ? 'SALDO' : 'CUP', status: effectiveStatus, message: shortFailure(effectiveStatus, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL', wallet_refunded_at: row.wallet_refunded_at || null })
+  }
   // Paid top-ups are represented by their CREDIT ledger movement to avoid double-counting.
   for (const row of topups.data || []) {
     if (row.status === 'COMPLETED') continue

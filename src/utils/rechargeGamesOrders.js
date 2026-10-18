@@ -38,7 +38,7 @@ function publicOrder(order) {
   const result = {
     id: order.id,
     ticket: makeTicket(order.id),
-    status: order.status,
+    status: order.wallet_refunded_at ? 'REFUNDED' : order.status,
     game_name: order.game_name,
     offer_title: order.offer_title,
     provider_game_slug: order.provider_game_slug,
@@ -56,7 +56,7 @@ function publicOrder(order) {
     updated_at: order.updated_at,
     provider_status: order.provider_status || null,
     delivery_note: order.provider_delivery_note || null,
-    failure_reason: order.status === 'REFUND_REQUIRED' ? 'La entrega falló. Tu caso requiere resolución; no vuelvas a pagar.' : order.status === 'FULFILLMENT_REVIEW' ? 'El pedido necesita revisión. No vuelvas a pagar.' : order.failure_reason || null,
+    failure_reason: order.wallet_refunded_at ? 'La entrega falló y el importe ya fue devuelto a tu Wallet.' : order.status === 'REFUND_REQUIRED' ? 'La entrega falló. Tu caso requiere resolución; no vuelvas a pagar.' : order.status === 'FULFILLMENT_REVIEW' ? 'El pedido necesita revisión. No vuelvas a pagar.' : order.failure_reason || null,
     payment_source: order.payment_source || 'TRANSFERMOVIL',
     requirements: {
       delivery: order.provider_delivery,
@@ -287,13 +287,41 @@ async function createWalletGameOrder(client, body) {
   // worker resolves a stale SUBMITTING_TO_PROVIDER state by buyer_ref, avoiding a
   // second concurrent provider submission while never leaving a crashed order behind.
   if (rpcData?.already_processed) return createdOrder || publicOrder(rawOrder)
-  const submitted = await submitProviderOrder(orderId, { playerId, serverId })
+
+  // A new Wallet debit must immediately start provider submission. The SQL RPC has
+  // atomically reserved the balance and created a SUBMITTING_TO_PROVIDER order; if
+  // this call has a transient database error, keep the persisted order visible and
+  // let the reconciliation worker safely retry with the same buyer_ref.
+  let submitted
+  try {
+    submitted = await submitProviderOrder(orderId, { playerId, serverId })
+  } catch (submitError) {
+    console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_SUBMISSION_DEFERRED', order_id: orderId, code: submitError?.code || 'submission_error' }))
+    notifyAdmins(`⚠️ Compra con Wallet pendiente de envío · ${makeTicket(orderId)}\nEl saldo quedó reservado y el pedido se recuperará automáticamente. No solicites otro pago al cliente.`).catch(() => {})
+    const { data: refreshed, error: refreshError } = await supabase.from('game_recharge_orders')
+      .select('*').eq('id', orderId).maybeSingle()
+    if (refreshError) throw refreshError
+    if (!refreshed) throw submitError
+    submitted = publicOrder(refreshed)
+  }
+
+  let finalSubmitted = submitted
   if (submitted.status === 'REFUND_REQUIRED') {
     const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: orderId })
-    if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: orderId, code: refundError.code || 'REFUND_FAILED' }))
-    else console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUNDED', order_id: orderId, amount_cup: amount }))
+    if (refundError) {
+      console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: orderId, code: refundError.code || 'REFUND_FAILED' }))
+      notifyAdmins(`🚨 Devolución pendiente · ${makeTicket(orderId)}\nNo se pudo devolver automáticamente el saldo de Wallet. El sistema reintentará la operación; revisa la incidencia y no pidas otro pago al cliente.`).catch(() => {})
+    } else {
+      console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUNDED', order_id: orderId, amount_cup: amount }))
+    }
+    // Return the authoritative persisted state, not the pre-refund response. The
+    // RPC may have completed the refund even if this request began with REFUND_REQUIRED.
+    const { data: refreshed, error: refreshError } = await supabase.from('game_recharge_orders')
+      .select('*').eq('id', orderId).maybeSingle()
+    if (refreshError) throw refreshError
+    if (refreshed) finalSubmitted = publicOrder(refreshed)
   }
-  return submitted
+  return finalSubmitted
 }
 
 async function getRecentOrders(clientId) {
@@ -354,8 +382,20 @@ async function persistProviderResult(order, providerOrder, raw = null) {
     updated_at: nowIso(),
     completed_at: providerStatus === 'delivered' ? nowIso() : null,
   }
-  const { data, error } = await supabase.from('game_recharge_orders').update(patch).eq('id', order.id).select('*').single()
+  // A terminal provider webhook may race the HTTP response. Only update an order that
+  // is still in a provider-submission/reconciliation state; never overwrite a refund or
+  // a terminal state with a stale REST response.
+  const { data, error } = await supabase.from('game_recharge_orders').update(patch)
+    .eq('id', order.id).in('status', ['SUBMITTING_TO_PROVIDER', 'PROCESSING', 'FULFILLMENT_REVIEW'])
+    .select('*').maybeSingle()
   if (error) throw error
+  if (!data) {
+    const { data: latest, error: latestError } = await supabase.from('game_recharge_orders').select('*').eq('id', order.id).maybeSingle()
+    if (latestError) throw latestError
+    return publicOrder(latest || order)
+  }
+
+  let finalOrder = data
   if (status === 'COMPLETED') {
     console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_DELIVERED', order_id: order.id, provider_order_id: patch.provider_order_id }))
     notifyAdmins(`✅ Recarga de juego entregada · ${makeTicket(order.id)}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}${patch.provider_delivery_note ? `\nEntrega: ${patch.provider_delivery_note}` : ''}`).catch(() => {})
@@ -363,11 +403,17 @@ async function persistProviderResult(order, providerOrder, raw = null) {
     console.error('[RechargeGames] La entrega falló después del pago local:', JSON.stringify({ order_id: order.id, provider_order_id: patch.provider_order_id, provider_status: providerStatus }))
     if (data.payment_source === 'WALLET') {
       const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: data.id })
-      if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: data.id, code: refundError.code || 'REFUND_FAILED' }))
+      if (refundError) {
+        console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: data.id, code: refundError.code || 'REFUND_FAILED' }))
+      } else {
+        const { data: refreshed, error: readError } = await supabase.from('game_recharge_orders').select('*').eq('id', data.id).maybeSingle()
+        if (readError) throw readError
+        finalOrder = refreshed || data
+      }
     }
-    notifyAdmins(`⚠️ Recarga de juego necesita resolución · ${makeTicket(order.id)}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nEstado del proveedor: ${providerStatus}\nMotivo: ${patch.failure_reason || 'No disponible'}\nEl pago local ya fue recibido; revisar manualmente.`).catch(() => {})
+    notifyAdmins(`⚠️ Recarga de juego necesita resolución · ${makeTicket(order.id)}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nEstado del proveedor: ${providerStatus}\nMotivo: ${patch.failure_reason || 'No disponible'}\nEl pedido ya fue pagado; comprueba el estado de la devolución antes de pedir cualquier otro pago.`).catch(() => {})
   }
-  return publicOrder(data)
+  return publicOrder(finalOrder)
 }
 
 async function markProviderFailure(order, error) {
@@ -375,21 +421,37 @@ async function markProviderFailure(order, error) {
     && ['out_of_stock', 'unknown_product', 'insufficient_balance', 'invalid_request'].includes(String(error?.code || ''))
   const status = noOrderCreated ? 'REFUND_REQUIRED' : 'FULFILLMENT_REVIEW'
   const safeMessage = providerFailureReason(error)
+  // Do not let a late network exception overwrite a provider webhook or another worker's
+  // terminal result. The periodic worker will retry refund/reconciliation if necessary.
   const { data, error: updateError } = await supabase.from('game_recharge_orders').update({
     status,
     provider_status: 'error',
     provider_failure_reason: cleanText(`${error?.code || 'provider_error'}${error?.status ? ` HTTP ${error.status}` : ''}`, 300),
     failure_reason: safeMessage,
     updated_at: nowIso(),
-  }).eq('id', order.id).select('*').single()
+  }).eq('id', order.id).in('status', ['SUBMITTING_TO_PROVIDER', 'PROCESSING', 'FULFILLMENT_REVIEW'])
+    .select('*').maybeSingle()
   if (updateError) throw updateError
+  if (!data) {
+    const { data: latest, error: latestError } = await supabase.from('game_recharge_orders').select('*').eq('id', order.id).maybeSingle()
+    if (latestError) throw latestError
+    return publicOrder(latest || order)
+  }
+
+  let finalOrder = data
   if (status === 'REFUND_REQUIRED' && data.payment_source === 'WALLET') {
     const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: data.id })
-    if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: data.id, code: refundError.code || 'REFUND_FAILED' }))
+    if (refundError) {
+      console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: data.id, code: refundError.code || 'REFUND_FAILED' }))
+    } else {
+      const { data: refreshed, error: readError } = await supabase.from('game_recharge_orders').select('*').eq('id', data.id).maybeSingle()
+      if (readError) throw readError
+      finalOrder = refreshed || data
+    }
   }
-  notifyAdmins(`⚠️ Falló el envío de recarga de juego · ${makeTicket(order.id)}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nCódigo proveedor: ${error?.code || 'error'}${error?.status ? ` (HTTP ${error.status})` : ''}\nRequiere revisión manual; el pago local ya fue recibido.`).catch(() => {})
-  console.error('[RechargeGames] Error al solicitar una recarga:', JSON.stringify({ order_id: order.id, code: error?.code || null, status: error?.status || null, local_status: status }))
-  return publicOrder(data)
+  notifyAdmins(`⚠️ Falló el envío de recarga de juego · ${makeTicket(order.id)}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nCódigo proveedor: ${error?.code || 'error'}${error?.status ? ` (HTTP ${error.status})` : ''}\nEstado actual: ${finalOrder.status}. Comprueba la entrega o devolución antes de pedir otro pago.`).catch(() => {})
+  console.error('[RechargeGames] Error al solicitar una recarga:', JSON.stringify({ order_id: order.id, code: error?.code || null, status: error?.status || null, local_status: finalOrder.status }))
+  return publicOrder(finalOrder)
 }
 
 async function submitProviderOrder(orderId, { playerId = null, serverId = null } = {}) {
@@ -603,10 +665,17 @@ async function handleProviderWebhook(event, webhookId) {
     console.warn('[RechargeGames] Webhook válido sin pedido local relacionado:', JSON.stringify({ webhook_id: cleanWebhookId, event_type: eventType, has_order_id: Boolean(providerId), has_buyer_ref: Boolean(buyerRef) }))
     return { ok: true, unmatched: true }
   }
-  if (['COMPLETED', 'REFUND_REQUIRED'].includes(order.status) && order.webhook_event_id) {
-    const { error: duplicateInsertError } = await supabase.from('rechargegames_webhook_events').insert({ event_id: cleanWebhookId, event_type: eventType })
-    if (duplicateInsertError && duplicateInsertError.code !== '23505') throw duplicateInsertError
-    return { ok: true, duplicate: true }
+  if (order.status === 'REFUNDED' || order.status === 'COMPLETED' || order.webhook_event_id) {
+    const { error: finalEventError } = await supabase.from('rechargegames_webhook_events').insert({ event_id: cleanWebhookId, event_type: eventType })
+    if (finalEventError && finalEventError.code !== '23505') throw finalEventError
+    const conflictsWithFinal = (order.status === 'REFUNDED' && eventType === 'order.delivered') ||
+      (order.status === 'COMPLETED' && eventType === 'order.failed')
+    if (conflictsWithFinal) {
+      console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_PROVIDER_TERMINAL_CONFLICT', order_id: order.id, local_status: order.status, provider_event: eventType, webhook_id: cleanWebhookId }))
+      notifyAdmins(`🚨 Conflicto de estado del proveedor · ${makeTicket(order.id)}\nEstado local: ${order.status}; nuevo evento: ${eventType}. No se modificó el estado ni el saldo automáticamente. Revisa la operación.`).catch(() => {})
+      return { ok: true, conflict: true, status: order.status }
+    }
+    return { ok: true, duplicate: true, status: order.status }
   }
   const status = eventType === 'order.delivered' ? 'COMPLETED' : 'REFUND_REQUIRED'
   const deliveryNote = cleanText(data?.delivery_note, 1000) || null
@@ -624,13 +693,17 @@ async function handleProviderWebhook(event, webhookId) {
     updated_at: nowIso(),
   }
   const { data: updatedOrder, error: updateError } = await supabase.from('game_recharge_orders')
-    .update(patch).eq('id', order.id).is('webhook_event_id', null).select('id').maybeSingle()
+    .update(patch).eq('id', order.id).is('webhook_event_id', null)
+    .in('status', ['SUBMITTING_TO_PROVIDER', 'PROCESSING', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED'])
+    .select('id,client_id,payment_source,payment_amount,status').maybeSingle()
   if (updateError) throw updateError
   if (!updatedOrder) {
     // A different, concurrent provider event already finalized this order.
     const { error: duplicateInsertError } = await supabase.from('rechargegames_webhook_events').insert({ event_id: cleanWebhookId, event_type: eventType })
     if (duplicateInsertError && duplicateInsertError.code !== '23505') throw duplicateInsertError
-    return { ok: true, duplicate: true }
+    const { data: latest, error: latestError } = await supabase.from('game_recharge_orders').select('status').eq('id', order.id).maybeSingle()
+    if (latestError) throw latestError
+    return { ok: true, duplicate: true, status: latest?.status || order.status }
   }
   // Record the idempotency key only after the order update succeeds. A failed DB update
   // returns 5xx and lets the provider retry rather than being acknowledged as a duplicate.
@@ -641,9 +714,15 @@ async function handleProviderWebhook(event, webhookId) {
     notifyAdmins(`✅ Recarga de juego completada · ${makeTicket(order.id)}\n${order.game_name} · ${order.offer_title}${deliveryNote ? `\nEntrega: ${deliveryNote}` : ''}`).catch(() => {})
   } else {
     console.warn('[RechargeGames] El proveedor marcó el pedido como fallido tras recibir el pago local:', JSON.stringify({ order_id: order.id, provider_order_id: patch.provider_order_id }))
-    notifyAdmins(`⚠️ Recarga de juego fallida · ${makeTicket(order.id)}\n${order.game_name} · ${order.offer_title}\nPago recibido; revisar solución o devolución.`).catch(() => {})
+    if (updatedOrder.payment_source === 'WALLET') {
+      const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: order.id })
+      if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_WEBHOOK_REFUND_FAILED', order_id: order.id, code: refundError.code || 'REFUND_FAILED' }))
+    }
+    notifyAdmins(`⚠️ Recarga de juego fallida · ${makeTicket(order.id)}\n${order.game_name} · ${order.offer_title}\nPago recibido; comprueba la devolución o resolución antes de solicitar otro pago.`).catch(() => {})
   }
-  return { ok: true, order_id: order.id, status }
+  const { data: finalOrder, error: finalReadError } = await supabase.from('game_recharge_orders').select('*').eq('id', order.id).maybeSingle()
+  if (finalReadError) throw finalReadError
+  return { ok: true, order_id: order.id, status: finalOrder?.status || status }
 }
 
 async function findProviderOrderByBuyerRef(buyerRef) {
@@ -655,9 +734,45 @@ async function findProviderOrderByBuyerRef(buyerRef) {
 }
 
 async function reconcileProcessingOrders() {
-  if (reconciliationInFlight || !String(process.env.RECHARGEGAMES_API_KEY || '').trim()) return
+  if (reconciliationInFlight) return
   reconciliationInFlight = true
   try {
+    // Recover Wallet refunds independently of API-key/provider availability. A failed
+    // first refund attempt must not leave the client debited indefinitely.
+    try {
+      const { data: refunds, error: refundQueryError } = await supabase.from('game_recharge_orders')
+        .select('id,client_id,payment_amount,updated_at').eq('payment_source', 'WALLET')
+        .eq('status', 'REFUND_REQUIRED').is('wallet_refunded_at', null)
+        .order('updated_at', { ascending: true }).limit(100)
+      if (refundQueryError) throw refundQueryError
+      for (const order of refunds || []) {
+        try {
+          const { data: refundResult, error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: order.id })
+          if (refundError) {
+            console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_RETRY_FAILED', order_id: order.id, code: refundError.code || 'REFUND_FAILED' }))
+            // Advance the retry cursor even when the RPC itself fails. Otherwise the
+            // oldest 100 rows would be selected forever and later refunds would starve.
+            const { error: rotateError } = await supabase.from('game_recharge_orders')
+              .update({ updated_at: nowIso() }).eq('id', order.id).eq('status', 'REFUND_REQUIRED')
+              .eq('payment_source', 'WALLET').is('wallet_refunded_at', null)
+            if (rotateError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_RETRY_ROTATE_FAILED', order_id: order.id, code: rotateError.code || 'ROTATE_FAILED' }))
+          } else if (!refundResult?.already_refunded) {
+            console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_RETRY_SUCCEEDED', order_id: order.id, amount_cup: Number(order.payment_amount) }))
+            notifyAdmins(`✅ Devolución recuperada · ${makeTicket(order.id)}\nSe devolvieron ${order.payment_amount} CUP a la Wallet después de reintentar una operación pendiente.`).catch(() => {})
+          }
+        } catch (refundError) {
+          console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_RETRY_EXCEPTION', order_id: order.id, code: refundError?.code || 'REFUND_FAILED' }))
+          // Same anti-starvation behavior for thrown client/network exceptions.
+          await supabase.from('game_recharge_orders').update({ updated_at: nowIso() })
+            .eq('id', order.id).eq('status', 'REFUND_REQUIRED').eq('payment_source', 'WALLET')
+            .is('wallet_refunded_at', null)
+        }
+      }
+    } catch (refundQueryError) {
+      console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_SCAN_FAILED', code: refundQueryError?.code || 'REFUND_SCAN_FAILED' }))
+    }
+
+    if (!String(process.env.RECHARGEGAMES_API_KEY || '').trim()) return
     const staleBefore = new Date(Date.now() - 45_000).toISOString()
     const stateSets = await Promise.all([
       supabase.from('game_recharge_orders').select('*').eq('status', 'PROCESSING')
