@@ -518,6 +518,60 @@ function shortFailure(status, reason, paymentReviewRequired = false) {
   return 'Pedido pendiente de actualización.'
 }
 
+async function getStoreStatusSnapshot(clientId) {
+  // The status feed is deliberately separate from purchase history. Query all active
+  // tickets (paged) plus every recently changed ticket so an old, still-pending payment
+  // cannot vanish just because the customer placed many newer orders. Never return a
+  // silently truncated list: readAllRows throws when its safety cap is exceeded.
+  // Wallet top-ups are read across the full account history so a phone that was offline
+  // for longer still learns that its balance was credited.
+  const recentCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
+  const queryRows = (table, columns, activeFilter, { includeAll = false } = {}) => Promise.all([
+    readAllRows(() => {
+      const base = supabase.from(table).select(columns).eq('client_id', clientId)
+      return (includeAll ? base : activeFilter(base)).order('updated_at', { ascending: false })
+    }, { pageSize: 500, maxRows: 10000 }),
+    includeAll ? Promise.resolve([]) : readAllRows(() => supabase.from(table).select(columns).eq('client_id', clientId)
+      .gte('updated_at', recentCutoff).order('updated_at', { ascending: false }), { pageSize: 500, maxRows: 10000 }),
+  ]).then(([active, recent]) => {
+    const byId = new Map()
+    for (const row of [...active, ...recent]) byId.set(row.id, row)
+    return [...byId.values()]
+  })
+  const [etecsaRows, gameRows, topupRows] = await Promise.all([
+    queryRows('etecsa_orders', 'id,offer_name,price_label,payment_amount,status,created_at,updated_at,paid_at,completed_at,failure_reason', q => q.in('status', ['WAITING_PAYMENT', 'PAYMENT_RECEIVED_WAITING_DETAILS', 'PROCESSING', 'SUBMITTING_TO_SOKY', 'SUBMITTING_TO_PROVIDER', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED'])),
+    queryRows('game_recharge_orders', 'id,game_name,offer_title,payment_amount,status,created_at,updated_at,paid_at,completed_at,failure_reason,payment_source', q => q.in('status', ['WAITING_PAYMENT', 'PAYMENT_RECEIVED_WAITING_DETAILS', 'PROCESSING', 'SUBMITTING_TO_PROVIDER', 'SUBMITTING_TO_SOKY', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED'])),
+    queryRows('store_wallet_topups', 'id,amount_cup,status,created_at,updated_at,paid_at,payment_deadline_at,payment_review_at,payment_review_reason', q => q.or('status.eq.WAITING_PAYMENT,payment_review_at.not.is.null'), { includeAll: true }),
+  ])
+  const etecsa = { data: etecsaRows }
+  const games = { data: gameRows }
+  const topups = { data: topupRows }
+  const entries = []
+  for (const row of etecsa.data || []) entries.push({
+    id: row.id, ticket_id: row.id, receipt_code: `SO-ET-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
+    source: 'ETECSA', title: `${row.offer_name}${row.price_label ? ` · ${row.price_label}` : ''}`,
+    amount_cup: Number(row.payment_amount), currency: 'CUP', status: row.status,
+    message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at,
+    paid_at: row.paid_at, completed_at: row.completed_at,
+  })
+  for (const row of games.data || []) entries.push({
+    id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
+    source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}`,
+    amount_cup: Number(row.payment_amount), currency: 'CUP', status: row.status,
+    message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at,
+    paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL',
+  })
+  for (const row of topups.data || []) entries.push({
+    id: row.id, ticket_id: row.id, receipt_code: `SO-WL-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
+    source: 'WALLET', title: 'Añadir fondos a Wallet', amount_cup: Number(row.amount_cup), currency: 'CUP',
+    status: row.status, message: shortFailure(row.status, null, Boolean(row.payment_review_at)),
+    payment_review_required: Boolean(row.payment_review_at), created_at: row.created_at, updated_at: row.updated_at,
+    paid_at: row.paid_at, payment_deadline_at: row.payment_deadline_at,
+  })
+  entries.sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || ''))
+  return entries
+}
+
 async function getStoreHistory(clientId) {
   const [etecsa, games, topups, ledger] = await Promise.all([
     supabase.from('etecsa_orders').select('id,offer_name,price_label,payment_amount,price_basis,status,created_at,updated_at,paid_at,completed_at,failure_reason').eq('client_id', clientId).order('created_at', { ascending: false }).limit(50),
@@ -527,17 +581,17 @@ async function getStoreHistory(clientId) {
   ])
   for (const r of [etecsa, games, topups, ledger]) if (r.error) throw r.error
   const entries = []
-  for (const row of etecsa.data || []) entries.push({ id: row.id, source: 'ETECSA', title: `${row.offer_name}${row.price_label ? ` · ${row.price_label}` : ''}`, amount_cup: Number(row.payment_amount), currency: row.price_basis === 'SALDO' ? 'SALDO' : 'CUP', status: row.status, message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at })
-  for (const row of games.data || []) entries.push({ id: row.id, source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}`, amount_cup: Number(row.payment_amount), currency: row.price_basis === 'SALDO' ? 'SALDO' : 'CUP', status: row.status, message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL' })
+  for (const row of etecsa.data || []) entries.push({ id: row.id, ticket_id: row.id, receipt_code: `SO-ET-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, source: 'ETECSA', title: `${row.offer_name}${row.price_label ? ` · ${row.price_label}` : ''}`, amount_cup: Number(row.payment_amount), currency: row.price_basis === 'SALDO' ? 'SALDO' : 'CUP', status: row.status, message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at })
+  for (const row of games.data || []) entries.push({ id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}`, amount_cup: Number(row.payment_amount), currency: row.price_basis === 'SALDO' ? 'SALDO' : 'CUP', status: row.status, message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL' })
   // Paid top-ups are represented by their CREDIT ledger movement to avoid double-counting.
   for (const row of topups.data || []) {
     if (row.status === 'COMPLETED') continue
-    entries.push({ id: row.id, source: 'WALLET', title: 'Añadir fondos a Wallet', amount_cup: Number(row.amount_cup), currency: 'CUP', status: row.status, message: shortFailure(row.status, null, Boolean(row.payment_review_at)), payment_review_required: Boolean(row.payment_review_at), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, payment_deadline_at: row.payment_deadline_at })
+    entries.push({ id: row.id, ticket_id: row.id, receipt_code: `SO-WL-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, source: 'WALLET', title: 'Añadir fondos a Wallet', amount_cup: Number(row.amount_cup), currency: 'CUP', status: row.status, message: shortFailure(row.status, null, Boolean(row.payment_review_at)), payment_review_required: Boolean(row.payment_review_at), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, payment_deadline_at: row.payment_deadline_at })
   }
   for (const row of ledger.data || []) {
     // Wallet-funded Game Market purchases are already present in the order history.
     if (row.kind === 'SPEND' && row.reference_type === 'GAME_RECHARGE') continue
-    entries.push({ id: row.id, source: 'WALLET_MOVEMENT', title: row.description || (row.kind === 'CREDIT' ? 'Fondos añadidos' : row.kind === 'REFUND' ? 'Devolución a Wallet' : 'Movimiento de Wallet'), amount_cup: Number(row.amount_cup), currency: 'CUP', status: row.kind, message: row.kind === 'SPEND' ? 'Compra descontada del saldo.' : row.kind === 'REFUND' ? 'Importe devuelto al saldo.' : 'Saldo añadido a Wallet.', created_at: row.created_at, updated_at: row.created_at })
+    entries.push({ id: row.id, ticket_id: row.reference_type === 'WALLET_TOPUP' ? row.reference_id : row.id, receipt_code: row.reference_type === 'WALLET_TOPUP' && row.reference_id ? `SO-WL-${String(row.reference_id).replace(/-/g, '').slice(0, 10).toUpperCase()}` : `SO-MV-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, reference_type: row.reference_type, reference_id: row.reference_id, source: 'WALLET_MOVEMENT', title: row.description || (row.kind === 'CREDIT' ? 'Fondos añadidos' : row.kind === 'REFUND' ? 'Devolución a Wallet' : 'Movimiento de Wallet'), amount_cup: Number(row.amount_cup), currency: 'CUP', status: row.kind, message: row.kind === 'SPEND' ? 'Compra descontada del saldo.' : row.kind === 'REFUND' ? 'Importe devuelto al saldo.' : 'Saldo añadido a Wallet.', created_at: row.created_at, updated_at: row.created_at })
   }
   entries.sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || ''))
   return entries.slice(0, 120)
@@ -545,5 +599,5 @@ async function getStoreHistory(clientId) {
 
 module.exports = {
   getWalletSummary, createTopup, getTopup, refreshTopupStatus, findMatchingTopups,
-  processIncomingTransfer, getStoreHistory, publicTopup, markPotentialTopupsForReview,
+  processIncomingTransfer, getStoreHistory, getStoreStatusSnapshot, publicTopup, markPotentialTopupsForReview,
 }
