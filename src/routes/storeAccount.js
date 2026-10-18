@@ -4,7 +4,7 @@ const express = require('express')
 const supabase = require('../supabase')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { canUseOfficialStore } = require('../utils/storeSessionAccess')
-const { getWalletSummary, createTopup, getTopup, getStoreHistory } = require('../utils/storeWallet')
+const { getWalletSummary, createTopup, getTopup, refreshTopupStatus, getStoreHistory } = require('../utils/storeWallet')
 const { createWalletGameOrder } = require('../utils/rechargeGamesOrders')
 
 const router = express.Router()
@@ -62,6 +62,16 @@ router.get('/wallet/topups/:id', async (req, res) => {
     if (!topup) return res.status(404).json({ ok: false, error: 'No se encontró la recarga de Wallet.' })
     return res.json({ ok: true, topup })
   } catch (error) { return respondError(res, error, 'No se pudo consultar la recarga de Wallet.') }
+})
+
+// Explicit customer action: retry reconciliation from already-stored, signed SMS and
+// return both the authoritative ticket status and the current wallet balance.
+router.post('/wallet/topups/:id/refresh', async (req, res) => {
+  try {
+    const result = await refreshTopupStatus(req.storeClient.id, req.params.id)
+    if (!result) return res.status(404).json({ ok: false, error: 'No se encontró la recarga de Wallet.' })
+    return res.json({ ok: true, topup: result.topup, wallet: result.wallet, refreshed: result.refreshed, scanned_sms: result.scanned_sms })
+  } catch (error) { return respondError(res, error, 'No se pudo actualizar el estado de la recarga. El saldo no se cobrará dos veces; inténtalo de nuevo.') }
 })
 
 router.post('/wallet/game-orders', async (req, res) => {
