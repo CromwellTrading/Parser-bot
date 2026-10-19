@@ -33,6 +33,13 @@ test('normalizes topup products and preserves exact provider product_key', () =>
   assert.equal(result.products[1].out_of_stock, true)
 })
 
+test('skips catalog product keys over the provider OpenAPI 300-character limit without truncating', () => {
+  const longName = 'x'.repeat(290)
+  const result = normalizeCatalog({ categories: [{ slug: 'free-fire', name: 'Free Fire', kind: 'topup', groups: [{ slug: 'brazil', products: [{ name: longName, price: 1, delivery: 'player_id', product_key: `topup/free-fire/brazil/${longName}` }] }] }] })
+  assert.equal(result.products.length, 0)
+  assert.equal(result.stats.skipped_invalid_key_length, 1)
+})
+
 test('normalizes giftcard catalog rows and removes duplicate product keys', () => {
   const result = normalizeCatalog({ categories: [
     { slug: 'steam', name: 'Steam', kind: 'giftcard', groups: [

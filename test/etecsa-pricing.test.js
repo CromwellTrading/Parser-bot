@@ -4,6 +4,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const {
   normalizeRate,
+  normalizePriceBasis,
   calculateRetailPrice,
   calculateOfferPrices,
   isPricingConfigured,
@@ -136,4 +137,11 @@ test('client-facing catalog text never exposes non-CUP currencies or foreign cur
   assert.equal(sanitizeCustomerText('Cubacel 500 CUP · coste 4.20 USD'), 'Cubacel 500 CUP · coste')
   assert.equal(sanitizeCustomerText('Oferta USDT 9.20 EUR'), 'Oferta')
   assert.equal(sanitizeCustomerText('Recarga $4.20'), 'Recarga')
+})
+
+
+test('only CUP can become an automated transfer-ticket amount; Saldo Móvil remains catalogue-only', () => {
+  assert.equal(normalizePriceBasis('cup'), 'CUP')
+  assert.equal(normalizePriceBasis(' saldo '), null)
+  assert.equal(normalizePriceBasis('USDT'), null)
 })

@@ -1,11 +1,32 @@
 'use strict'
+
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { roundToStep, computePrices } = require('../src/utils/gamePricing')
-const normal = { usd_to_cup: 1050, usd_to_saldo: 380, profit_margin_pct: 10, cup_rounding_step: 5, saldo_rounding_step: 1, rounding_mode: 'ceil' }
-const reseller = { usd_to_cup: 1050, usd_to_saldo: 380, profit_margin_pct: 5, cup_rounding_step: 5, saldo_rounding_step: 1, rounding_mode: 'ceil' }
-test('computes normal prices using the normal rule', () => { assert.deepEqual(computePrices(0.70, normal), { price_cup: 810, price_saldo: 293 }) })
-test('computes reseller prices independently', () => { assert.deepEqual(computePrices(0.70, reseller), { price_cup: 775, price_saldo: 280 }) })
-test('supports ceil, nearest and floor per currency step', () => { assert.equal(roundToStep(101, 10, 'ceil'), 110); assert.equal(roundToStep(101, 10, 'nearest'), 100); assert.equal(roundToStep(109, 10, 'floor'), 100) })
-test('protects against floating point rounding noise', () => { assert.equal(roundToStep(110.00000000000001, 10, 'ceil'), 110) })
-test('rejects invalid cost, rates and rounding', () => { assert.throws(() => computePrices(-1, normal)); assert.throws(() => computePrices(1, { ...normal, usd_to_cup: 0 })); assert.throws(() => roundToStep(1, 0, 'ceil')) })
+const { normalizeMarketPricing, computePrices, calculateOfferPrices } = require('../src/utils/gamePricing')
+
+const liveSettings = {
+  usd_to_cup: 1050,
+  usd_to_saldo: 380,
+  profit_margin_pct: 10,
+  cup_rounding_step: 5,
+  saldo_rounding_step: 1,
+  rounding_mode: 'ceil',
+}
+
+test('Game Market pricing exports exactly the functions the real catalog worker imports', () => {
+  assert.equal(typeof normalizeMarketPricing, 'function')
+  assert.equal(typeof calculateOfferPrices, 'function')
+  assert.deepEqual(calculateOfferPrices(1, liveSettings), { price_cup: 1155, price_saldo: 418 })
+  assert.deepEqual(computePrices(0.5, liveSettings), { price_cup: 580, price_saldo: 209 })
+})
+
+test('Game Market refuses missing rates instead of silently inventing a price', () => {
+  assert.throws(() => normalizeMarketPricing(undefined), { code: 'PRICING_NOT_CONFIGURED' })
+  assert.throws(() => normalizeMarketPricing({ usd_to_cup: 1050 }), { code: 'PRICING_NOT_CONFIGURED' })
+})
+
+test('Game Market validates rounding/margin and accepts settings persisted by the admin panel', () => {
+  assert.deepEqual(normalizeMarketPricing(liveSettings), liveSettings)
+  assert.throws(() => normalizeMarketPricing({ ...liveSettings, profit_margin_pct: -1 }), { code: 'PRICING_NOT_CONFIGURED' })
+  assert.throws(() => normalizeMarketPricing({ ...liveSettings, usd_to_saldo: 0 }), { code: 'PRICING_NOT_CONFIGURED' })
+})
