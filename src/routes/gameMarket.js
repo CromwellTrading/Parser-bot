@@ -66,10 +66,15 @@ function requiredAdmin(req, res, next) {
   return next()
 }
 function sendError(res, error, context) {
-  if (error?.status) return res.status(error.status).json({ error: error.message })
+  if (error?.status) {
+    console.warn(`[Game Market] ${context}: HTTP ${error.status} - ${error.message}`)
+    return res.status(error.status).json({ error: error.message })
+  }
   if (error?.code === '23505') return res.status(409).json({ error: 'El nombre de usuario o identificador ya existe' })
-  console.error(context, error)
-  return res.status(500).json({ error: 'Error interno del servidor' })
+  console.error(`[Game Market] ${context}:`, {
+    code: error?.code, message: error?.message, details: error?.details, hint: error?.hint
+  })
+  return res.status(500).json({ error: 'Error interno del servidor. El evento quedó registrado en los logs del backend.' })
 }
 
 function decodeImage(body, prefix = 'image') {
@@ -153,11 +158,12 @@ async function catalogPayload(tier, admin = false) {
     let resellerCup = o.price_reseller_cup == null ? null : Number(o.price_reseller_cup)
     let resellerSaldo = o.price_reseller_saldo == null ? null : Number(o.price_reseller_saldo)
     if (o.auto_pricing && o.base_cost_usd !== null && o.base_cost_usd !== undefined) {
+      // Auto-priced offers are derived from the active per-tier settings at read time.
+      // Never keep a stale previously calculated value after an admin changes a rate.
       const np = computePrices(Number(o.base_cost_usd), normalRule)
       const rp = computePrices(Number(o.base_cost_usd), resellerRule)
       normalCup = np.price_cup; normalSaldo = np.price_saldo
-      if (resellerCup === null) resellerCup = rp.price_cup
-      if (resellerSaldo === null) resellerSaldo = rp.price_saldo
+      resellerCup = rp.price_cup; resellerSaldo = rp.price_saldo
     }
     const out = {
       id: o.id, game_id: o.game_id, title: o.title, description: o.description || '', category: o.category || 'Paquete',
@@ -291,20 +297,21 @@ router.put('/admin/pricing', requiredClient, requiredAdmin, async (req, res) => 
       rounding_mode: ['ceil', 'nearest', 'floor'].includes(b.rounding_mode) ? b.rounding_mode : 'ceil',
     }
     if (!Number.isInteger(pricing.cup_rounding_step) || !Number.isInteger(pricing.saldo_rounding_step)) throw fail(400, 'Los pasos de redondeo deben ser enteros')
-    const { error } = await supabase.from('synthesisone_settings').upsert({ key: `game_market_pricing:${tier}`, value: pricing, updated_at: new Date().toISOString() }, { onConflict: 'key' })
-    if (error) throw error
-    const storeId = await platformStoreId()
-    const { data: offers, error: offerError } = await supabase.from('game_market_offers').select('id, base_cost_usd, auto_pricing').eq('store_id', storeId).eq('auto_pricing', true)
-    if (offerError) throw offerError
-    const tierKey = tier === 'reseller' ? 'reseller' : 'normal'
-    for (const o of offers || []) {
-      if (o.base_cost_usd == null) continue
-      const p = computePrices(Number(o.base_cost_usd), pricing)
-      const patch = tierKey === 'reseller' ? { price_reseller_cup: p.price_cup, price_reseller_saldo: p.price_saldo } : { price_cup: p.price_cup, price_saldo: p.price_saldo }
-      const { error: updateError } = await supabase.from('game_market_offers').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', o.id)
-      if (updateError) throw updateError
+
+    // Persist the source-of-truth settings first. Auto-priced offers are calculated
+    // dynamically by catalogPayload() from these settings; a separate bulk UPDATE is
+    // redundant and could make a successful save appear to fail if one offer update fails.
+    const { error } = await supabase.from('synthesisone_settings').upsert({
+      key: `game_market_pricing:${tier}`, value: pricing, updated_at: new Date().toISOString()
+    }, { onConflict: 'key' })
+    if (error) {
+      console.error(`[Game Market] No se pudo guardar pricing tier=${tier}:`, {
+        code: error.code, message: error.message, details: error.details, hint: error.hint
+      })
+      throw error
     }
-    return res.json({ ok: true, tier, pricing })
+    console.info(`[Game Market] Reglas de precios guardadas: tier=${tier}`)
+    return res.json({ ok: true, tier, pricing, recalculation: 'dynamic_on_catalog_read' })
   } catch (e) { return sendError(res, e, 'PUT admin pricing') }
 })
 router.post('/admin/images', requiredClient, requiredAdmin, async (req, res) => {
