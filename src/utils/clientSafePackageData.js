@@ -11,6 +11,7 @@ function clientSafePackageData(packageData) {
       automatic: true,
       delivery: ['player_id', 'code'].includes(String(provider.delivery || '')) ? provider.delivery : null,
       delivery_label: String(provider.delivery_label || '').slice(0, 80),
+      game_slug: String(provider.game_slug || provider.source_game_slug || '').trim().slice(0, 160) || null,
       region_name: String(provider.region_name || '').slice(0, 100) || null,
       region_slug: String(provider.region_slug || '').slice(0, 100) || null,
       provider_kind: ['topup', 'giftcard'].includes(String(provider.provider_kind || '')) ? String(provider.provider_kind) : null,
