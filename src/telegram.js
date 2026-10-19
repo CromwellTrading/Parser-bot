@@ -6,7 +6,7 @@ const supabase = require("./supabase");
 const pendingCreates = new Map(); 
 
 // IDs de administradores permitidos
-const ADMINS = String(process.env.ADMIN_TELEGRAM_IDS || "5387882635,5376388604").split(",").map(v => Number(v.trim())).filter(Number.isFinite);
+const ADMINS = String(process.env.ADMIN_TELEGRAM_IDS || "").split(",").map(v => Number(v.trim())).filter(v => Number.isSafeInteger(v) && v > 0);
 
 // Verificar token
 if (!process.env.TELEGRAM_BOT_TOKEN) {
@@ -17,6 +17,7 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
 // Inicializar bot con polling
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 console.log("✅ Bot de Telegram iniciado");
+if (!ADMINS.length) console.error("⚠️ ADMIN_TELEGRAM_IDS no está configurado; comandos y alertas de administrador no podrán autorizar usuarios.");
 console.log("ℹ️ Activación automática gestionada por /api/onboarding");
 
 // ====================
