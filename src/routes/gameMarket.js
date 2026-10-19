@@ -3,7 +3,7 @@
 const express = require('express')
 const crypto = require('crypto')
 const supabase = require('../supabase')
-const { clientSafePackageData } = require('../utils/clientSafePackageData')
+const { isConnectedRechargeGamesOffer, isLegacyEtecsaGame, packageDataForCatalog } = require('../utils/gameMarketCatalogSafety')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { bot, ADMINS } = require('../telegram')
 const { roundToStep, computePrices, normalizeMarketPricing } = require('../utils/gamePricing')
@@ -130,17 +130,20 @@ async function catalogPayload(tier, admin = false) {
     .select('id, slug, name, description, category, thumbnail_path, badge, is_active, sort_order')
     .eq('store_id', storeId).order('sort_order').order('name')
   if (gameError) throw gameError
-  const gameRows = admin ? (games || []) : (games || []).filter(g => g.is_active)
+  // Keep all real games visible, but do not duplicate the live Soky/ETECSA catalog with a legacy empty Game Market placeholder.
+  const gameRows = admin ? (games || []) : (games || []).filter(g => g.is_active && !isLegacyEtecsaGame(g))
   const normalRule = await pricingFor('normal')
   const resellerRule = await pricingFor('reseller')
   const ids = gameRows.map(g => g.id)
   let offers = []
   if (ids.length) {
     const { data, error } = await supabase.from('game_market_offers')
-      .select('id, game_id, title, description, category, package_data, price_cup, price_saldo, price_reseller_cup, price_reseller_saldo, base_cost_usd, auto_pricing, available, published, sort_order')
+      .select('id, game_id, title, description, category, package_data, provider, provider_product_key, provider_game_slug, provider_region_slug, provider_region_name, provider_delivery, provider_out_of_stock, price_cup, price_saldo, price_reseller_cup, price_reseller_saldo, base_cost_usd, auto_pricing, available, published, sort_order')
       .eq('store_id', storeId).in('game_id', ids).order('sort_order').order('title')
     if (error) throw error
-    offers = (data || []).filter(o => admin || o.published)
+    // Public catalog only exposes offers that the backend can actually order from a provider.
+    // Legacy/manual rows remain accessible to admins for cleanup, but never appear purchasable to clients.
+    offers = (data || []).filter(o => admin || (o.published && isConnectedRechargeGamesOffer(o)))
   }
   const mappedOffers = offers.map(o => {
     let normalCup = Number(o.price_cup || 0)
@@ -157,7 +160,8 @@ async function catalogPayload(tier, admin = false) {
     }
     const out = {
       id: o.id, game_id: o.game_id, title: o.title, description: o.description || '', category: o.category || 'Paquete',
-      package_data: admin ? (o.package_data || {}) : clientSafePackageData(o.package_data),
+      package_data: packageDataForCatalog(o, { admin }),
+      provider_connected: isConnectedRechargeGamesOffer(o),
       price_cup: tier === 'reseller' ? (resellerCup === null ? normalCup : resellerCup) : normalCup,
       price_saldo: tier === 'reseller' ? (resellerSaldo === null ? normalSaldo : resellerSaldo) : normalSaldo,
       available: !!o.available, published: !!o.published, sort_order: o.sort_order || 0,
