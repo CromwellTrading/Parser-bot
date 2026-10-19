@@ -1,59 +1,27 @@
 'use strict'
 
-const DEFAULT_MARKET_PRICING = Object.freeze({
-  usd_to_cup: 1050,
-  usd_to_saldo: 380,
-  profit_margin_pct: 0,
-  cup_rounding_step: 5,
-  saldo_rounding_step: 1,
-  rounding_mode: 'ceil',
-})
-
-function positiveNumber(value, fallback) {
-  const n = Number(value)
-  return Number.isFinite(n) && n > 0 ? n : fallback
+function roundToStep(value, step, mode = 'ceil') {
+  const v = Number(value)
+  const s = Number(step)
+  if (!Number.isFinite(v) || v < 0) throw new TypeError('value debe ser un número finito mayor o igual a cero')
+  if (!Number.isFinite(s) || s <= 0) throw new TypeError('step debe ser mayor que cero')
+  const units = v / s
+  const rounded = mode === 'floor' ? Math.floor(units + 1e-10) : mode === 'nearest' ? Math.round(units) : mode === 'ceil' ? Math.ceil(units - 1e-10) : NaN
+  if (!Number.isFinite(rounded)) throw new TypeError('rounding mode no válido')
+  return Math.max(0, rounded * s)
 }
 
-function normalizeMarketPricing(input = {}) {
-  const mode = String(input.rounding_mode || DEFAULT_MARKET_PRICING.rounding_mode).toLowerCase()
-  const margin = Number(input.profit_margin_pct ?? DEFAULT_MARKET_PRICING.profit_margin_pct)
+function computePrices(costUsd, rule) {
+  const cost = Number(costUsd)
+  if (!Number.isFinite(cost) || cost < 0) throw new TypeError('base_cost_usd debe ser mayor o igual a cero')
+  if (!rule || !Number.isFinite(Number(rule.usd_to_cup)) || Number(rule.usd_to_cup) <= 0 || !Number.isFinite(Number(rule.usd_to_saldo)) || Number(rule.usd_to_saldo) <= 0) throw new TypeError('tasas de conversión no válidas')
+  const marginPct = Number(rule.profit_margin_pct ?? 0)
+  if (!Number.isFinite(marginPct) || marginPct < 0 || marginPct > 10000) throw new TypeError('margen no válido')
+  const margin = 1 + marginPct / 100
   return {
-    usd_to_cup: positiveNumber(input.usd_to_cup, DEFAULT_MARKET_PRICING.usd_to_cup),
-    usd_to_saldo: positiveNumber(input.usd_to_saldo, DEFAULT_MARKET_PRICING.usd_to_saldo),
-    profit_margin_pct: Number.isFinite(margin) && margin >= 0 && margin <= 10000 ? margin : DEFAULT_MARKET_PRICING.profit_margin_pct,
-    cup_rounding_step: positiveNumber(input.cup_rounding_step, DEFAULT_MARKET_PRICING.cup_rounding_step),
-    saldo_rounding_step: positiveNumber(input.saldo_rounding_step, DEFAULT_MARKET_PRICING.saldo_rounding_step),
-    rounding_mode: ['ceil', 'nearest', 'floor'].includes(mode) ? mode : DEFAULT_MARKET_PRICING.rounding_mode,
+    price_cup: roundToStep(cost * Number(rule.usd_to_cup) * margin, Number(rule.cup_rounding_step ?? 5), rule.rounding_mode || 'ceil'),
+    price_saldo: roundToStep(cost * Number(rule.usd_to_saldo) * margin, Number(rule.saldo_rounding_step ?? 1), rule.rounding_mode || 'ceil'),
   }
 }
 
-function roundToStep(value, step, mode) {
-  const safeStep = positiveNumber(step, 1)
-  const units = value / safeStep
-  let roundedUnits
-  // Avoid floating-point noise (e.g. 1.1 * 100 producing 110.00000000000001).
-  if (mode === 'floor') roundedUnits = Math.floor(units + 1e-10)
-  else if (mode === 'nearest') roundedUnits = Math.round(units)
-  else roundedUnits = Math.ceil(units - 1e-10)
-  return Math.max(0, roundedUnits * safeStep)
-}
-
-function calculateOfferPrices(baseCostUsd, pricingInput = {}) {
-  const cost = Number(baseCostUsd)
-  if (!Number.isFinite(cost) || cost < 0) throw new TypeError('base_cost_usd debe ser un número mayor o igual a cero')
-  const pricing = normalizeMarketPricing(pricingInput)
-  const multiplier = 1 + pricing.profit_margin_pct / 100
-  const cupRaw = cost * pricing.usd_to_cup * multiplier
-  const saldoRaw = cost * pricing.usd_to_saldo * multiplier
-  return {
-    price_cup: roundToStep(cupRaw, pricing.cup_rounding_step, pricing.rounding_mode),
-    price_saldo: roundToStep(saldoRaw, pricing.saldo_rounding_step, pricing.rounding_mode),
-  }
-}
-
-module.exports = {
-  DEFAULT_MARKET_PRICING,
-  normalizeMarketPricing,
-  calculateOfferPrices,
-  roundToStep,
-}
+module.exports = { roundToStep, computePrices }
