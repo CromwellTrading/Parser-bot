@@ -7,6 +7,7 @@ const { isConnectedRechargeGamesOffer, isLegacyEtecsaGame, packageDataForCatalog
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { bot, ADMINS } = require('../telegram')
 const { roundToStep, computePrices, normalizeMarketPricing } = require('../utils/gamePricing')
+const { readAllRows } = require('../utils/supabasePagination')
 
 const router = express.Router()
 const AVATAR_BUCKET = 'so-profile-avatars'
@@ -126,10 +127,13 @@ async function resellerActive(clientId) {
 }
 async function catalogPayload(tier, admin = false) {
   const storeId = await platformStoreId()
-  const { data: games, error: gameError } = await supabase.from('game_market_games')
+  // Read every row in deterministic pages. PostgREST commonly caps a single
+  // response at 1,000 rows; a one-shot query silently hid later games/offers,
+  // including RechargeGames regions (the UI calls these server/region options).
+  const games = await readAllRows(() => supabase.from('game_market_games')
     .select('id, slug, name, description, category, thumbnail_path, badge, is_active, sort_order')
-    .eq('store_id', storeId).order('sort_order').order('name')
-  if (gameError) throw gameError
+    .eq('store_id', storeId).order('sort_order').order('name').order('id'),
+  { pageSize: 500, maxRows: 10_000 })
   // Keep all real games visible, but do not duplicate the live Soky/ETECSA catalog with a legacy empty Game Market placeholder.
   const gameRows = admin ? (games || []) : (games || []).filter(g => g.is_active && !isLegacyEtecsaGame(g))
   const normalRule = await pricingFor('normal')
@@ -137,13 +141,13 @@ async function catalogPayload(tier, admin = false) {
   const ids = gameRows.map(g => g.id)
   let offers = []
   if (ids.length) {
-    const { data, error } = await supabase.from('game_market_offers')
+    const data = await readAllRows(() => supabase.from('game_market_offers')
       .select('id, game_id, title, description, category, package_data, provider, provider_product_key, provider_game_slug, provider_region_slug, provider_region_name, provider_delivery, provider_out_of_stock, price_cup, price_saldo, price_reseller_cup, price_reseller_saldo, base_cost_usd, auto_pricing, available, published, sort_order')
-      .eq('store_id', storeId).in('game_id', ids).order('sort_order').order('title')
-    if (error) throw error
+      .eq('store_id', storeId).in('game_id', ids).order('sort_order').order('title').order('id'),
+    { pageSize: 500, maxRows: 100_000 })
     // Public catalog only exposes offers that the backend can actually order from a provider.
     // Legacy/manual rows remain accessible to admins for cleanup, but never appear purchasable to clients.
-    offers = (data || []).filter(o => admin || (o.published && isConnectedRechargeGamesOffer(o)))
+    offers = data.filter(o => admin || (o.published && isConnectedRechargeGamesOffer(o)))
   }
   const mappedOffers = offers.map(o => {
     let normalCup = Number(o.price_cup || 0)
