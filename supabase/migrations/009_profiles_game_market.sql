@@ -123,17 +123,7 @@ INSERT INTO public.game_market_stores (name, slug, is_platform_store, is_active)
 VALUES ('SynthesisOne', 'synthesisone', true, true)
 ON CONFLICT (slug) DO NOTHING;
 
-INSERT INTO public.game_market_games (store_id, slug, name, description, category, badge, sort_order)
-SELECT store_row.id, seed.slug, seed.name, seed.description, seed.category, seed.badge, seed.sort_order
-FROM public.game_market_stores AS store_row
-CROSS JOIN (VALUES
-  ('free-fire', 'Free Fire', 'Recargas y paquetes para Free Fire.', 'Battle Royale', 'POPULAR', 10),
-  ('mobile-legends', 'Mobile Legends', 'Diamantes y paquetes para Mobile Legends.', 'MOBA', 'MOBA', 20),
-  ('honor-of-kings', 'Honor of Kings', 'Tokens y paquetes para Honor of Kings.', 'MOBA', 'MOBA', 30),
-  ('genshin-impact', 'Genshin Impact', 'Cristales génesis y paquetes para Genshin Impact.', 'RPG', 'RPG', 40)
-) AS seed(slug, name, description, category, badge, sort_order)
-WHERE store_row.slug = 'synthesisone'
-ON CONFLICT (store_id, slug) DO NOTHING;
+-- The live RechargeGames catalog worker creates game rows from provider data; no placeholder games are seeded.
 
 -- Tables are accessed through the Node.js backend using SUPABASE_SERVICE_KEY.
 -- Restrictive policies below explicitly prevent direct anon/authenticated table access.

@@ -158,20 +158,8 @@ END $$;
 CREATE INDEX IF NOT EXISTS game_market_offers_game_listing_idx
   ON public.game_market_offers (store_id, game_id, published, available, sort_order);
 
--- Seed only the four games requested. Conflicts preserve existing metadata and user-created offers.
-INSERT INTO public.game_market_games (store_id, slug, name, description, category, badge, sort_order)
-SELECT s.id, v.slug, v.name, v.description, v.category, v.badge, v.sort_order
-FROM public.game_market_stores s
-CROSS JOIN (VALUES
-  ('free-fire','Free Fire','Recargas y paquetes para Free Fire.','Battle Royale','POPULAR',10),
-  ('mobile-legends','Mobile Legends','Diamantes y paquetes para Mobile Legends.','MOBA','MOBA',20),
-  ('honor-of-kings','Honor of Kings','Tokens y paquetes para Honor of Kings.','MOBA','MOBA',30),
-  ('genshin-impact','Genshin Impact','Cristales génesis y paquetes para Genshin Impact.','RPG','RPG',40)
-) AS v(slug,name,description,category,badge,sort_order)
-WHERE s.slug='synthesisone'
-ON CONFLICT DO NOTHING;
+-- The live RechargeGames catalog worker owns game rows; do not seed placeholder tiles.
 
--- Normal and reseller rates are independent. Sale orders/providers are intentionally not created in this phase.
 INSERT INTO public.synthesisone_settings (key, value, updated_at)
 VALUES
  ('game_market_pricing:normal', '{"usd_to_cup":1050,"usd_to_saldo":380,"profit_margin_pct":0,"cup_rounding_step":5,"saldo_rounding_step":1,"rounding_mode":"ceil"}'::jsonb, now()),

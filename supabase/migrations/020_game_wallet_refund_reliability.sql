@@ -2,6 +2,37 @@
 -- Apply after migrations 017, 018 and 019 in the same Supabase project as the Render backend.
 BEGIN;
 
+-- Defensive bootstrap for deployments that accidentally ran this repair before 019.
+-- Migration 019 remains required for the incident RPCs/announcement routes, but this
+-- table definition prevents the historic "service_incidents does not exist" failure.
+CREATE TABLE IF NOT EXISTS public.service_incidents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  fingerprint text NOT NULL UNIQUE,
+  component text NOT NULL,
+  severity text NOT NULL DEFAULT 'WARN' CHECK (severity IN ('INFO','WARN','ERROR','CRITICAL')),
+  status text NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','ACKNOWLEDGED','RESOLVED')),
+  title text NOT NULL,
+  message text NOT NULL,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  occurrence_count integer NOT NULL DEFAULT 1 CHECK (occurrence_count >= 1),
+  first_seen_at timestamptz NOT NULL DEFAULT now(),
+  last_seen_at timestamptz NOT NULL DEFAULT now(),
+  acknowledged_at timestamptz,
+  acknowledged_by text,
+  resolved_at timestamptz,
+  resolved_by text,
+  resolution_note text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS service_incidents_status_last_seen_idx ON public.service_incidents (status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS service_incidents_component_status_idx ON public.service_incidents (component, status, last_seen_at DESC);
+ALTER TABLE public.service_incidents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.service_incidents FORCE ROW LEVEL SECURITY;
+REVOKE ALL PRIVILEGES ON TABLE public.service_incidents FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON TABLE public.service_incidents FROM anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.service_incidents TO service_role;
+
 ALTER TABLE public.game_recharge_orders
   ADD COLUMN IF NOT EXISTS wallet_refunded_at timestamptz;
 
