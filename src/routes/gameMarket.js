@@ -3,9 +3,10 @@
 const express = require('express')
 const crypto = require('crypto')
 const supabase = require('../supabase')
+const { clientSafePackageData } = require('../utils/clientSafePackageData')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { bot, ADMINS } = require('../telegram')
-const { roundToStep, computePrices } = require('../utils/gamePricing')
+const { roundToStep, computePrices, normalizeMarketPricing } = require('../utils/gamePricing')
 
 const router = express.Router()
 const AVATAR_BUCKET = 'so-profile-avatars'
@@ -107,21 +108,10 @@ function publicGameUrl(path) {
 
 async function pricingFor(tier) {
   const key = tier === 'reseller' ? 'game_market_pricing:reseller' : 'game_market_pricing:normal'
-  const fallback = tier === 'reseller'
-    ? { usd_to_cup: 1050, usd_to_saldo: 380, profit_margin_pct: 0, cup_rounding_step: 5, saldo_rounding_step: 1, rounding_mode: 'ceil' }
-    : { usd_to_cup: 1050, usd_to_saldo: 380, profit_margin_pct: 0, cup_rounding_step: 5, saldo_rounding_step: 1, rounding_mode: 'ceil' }
   const { data, error } = await supabase.from('synthesisone_settings').select('value').eq('key', key).maybeSingle()
   if (error) throw error
-  const raw = data?.value || fallback
-  const mode = ['ceil', 'nearest', 'floor'].includes(raw.rounding_mode) ? raw.rounding_mode : 'ceil'
-  return {
-    usd_to_cup: number(raw.usd_to_cup, 'usd_to_cup', { min: 0.000001 }),
-    usd_to_saldo: number(raw.usd_to_saldo, 'usd_to_saldo', { min: 0.000001 }),
-    profit_margin_pct: number(raw.profit_margin_pct ?? 0, 'profit_margin_pct', { min: 0, max: 10000 }),
-    cup_rounding_step: number(raw.cup_rounding_step ?? 5, 'cup_rounding_step', { min: 1, max: 1e6 }),
-    saldo_rounding_step: number(raw.saldo_rounding_step ?? 1, 'saldo_rounding_step', { min: 1, max: 1e6 }),
-    rounding_mode: mode,
-  }
+  // Prices must come from the database, never a silent, hard-coded exchange-rate fallback.
+  return normalizeMarketPricing(data?.value)
 }
 async function platformStoreId() {
   const { data, error } = await supabase.from('game_market_stores').select('id').eq('slug', 'synthesisone').maybeSingle()
@@ -150,7 +140,7 @@ async function catalogPayload(tier, admin = false) {
       .select('id, game_id, title, description, category, package_data, price_cup, price_saldo, price_reseller_cup, price_reseller_saldo, base_cost_usd, auto_pricing, available, published, sort_order')
       .eq('store_id', storeId).in('game_id', ids).order('sort_order').order('title')
     if (error) throw error
-    offers = (data || []).filter(o => admin || (o.published && o.available))
+    offers = (data || []).filter(o => admin || o.published)
   }
   const mappedOffers = offers.map(o => {
     let normalCup = Number(o.price_cup || 0)
@@ -167,7 +157,7 @@ async function catalogPayload(tier, admin = false) {
     }
     const out = {
       id: o.id, game_id: o.game_id, title: o.title, description: o.description || '', category: o.category || 'Paquete',
-      package_data: o.package_data || {},
+      package_data: admin ? (o.package_data || {}) : clientSafePackageData(o.package_data),
       price_cup: tier === 'reseller' ? (resellerCup === null ? normalCup : resellerCup) : normalCup,
       price_saldo: tier === 'reseller' ? (resellerSaldo === null ? normalSaldo : resellerSaldo) : normalSaldo,
       available: !!o.available, published: !!o.published, sort_order: o.sort_order || 0,
@@ -418,7 +408,7 @@ router.delete('/admin/offers/:id', requiredClient, requiredAdmin, async (req, re
 router.get('/reseller/status', requiredClient, async (req, res) => {
   try {
     const id = String(req.client.id)
-    const { data: application, error } = await supabase.from('reseller_applications').select('id, status, review_note, submitted_at, reviewed_at, deposit_confirmed, monthly_sales_count, updated_at').eq('client_id', id).order('submitted_at', { ascending: false }).limit(1).maybeSingle()
+    const { data: application, error } = await supabase.from('reseller_applications').select('id, status, review_note, submitted_at, reviewed_at, deposit_confirmed, deposit_payment_status, deposit_detected_at, deposit_topup_id, monthly_sales_count, updated_at').eq('client_id', id).order('submitted_at', { ascending: false }).limit(1).maybeSingle()
     if (error) throw error
     let { data: profile, error: pError } = await supabase.from('reseller_profiles').select('status, activated_at, deposit_confirmed, monthly_sales_count, last_sales_period').eq('client_id', id).maybeSingle()
     if (pError) throw pError
@@ -491,7 +481,7 @@ router.get('/admin/reseller/pending-count', requiredClient, requiredAdmin, async
 router.get('/admin/reseller/applications', requiredClient, requiredAdmin, async (req, res) => {
   try {
     const status = cleanText(req.query.status, 40)
-    let q = supabase.from('reseller_applications').select('id, client_id, client_name, client_phone, card_numbers, phone_numbers, id_front_path, id_back_path, selfie_path, status, review_note, accepted_terms, submitted_at, reviewed_at, deposit_confirmed, monthly_sales_count, monthly_sales_target, deposit_min_cup').order('submitted_at', { ascending: false }).limit(100)
+    let q = supabase.from('reseller_applications').select('id, client_id, client_name, client_phone, card_numbers, phone_numbers, id_front_path, id_back_path, selfie_path, status, review_note, accepted_terms, submitted_at, reviewed_at, deposit_confirmed, deposit_payment_status, deposit_detected_at, deposit_transaction_id, deposit_topup_id, monthly_sales_count, monthly_sales_target, deposit_min_cup').order('submitted_at', { ascending: false }).limit(100)
     if (status && RESELLER_STATUSES.has(status)) q = q.eq('status', status)
     const { data, error } = await q
     if (error) throw error
@@ -530,15 +520,32 @@ router.post('/admin/reseller/applications/:id/review', requiredClient, requiredA
 router.post('/admin/reseller/applications/:id/activate', requiredClient, requiredAdmin, async (req, res) => {
   try {
     if (req.body?.deposit_confirmed !== true) throw fail(400, 'Debes confirmar manualmente que el depósito de 50.000 CUP está verificado')
-    const { data: app, error: getError } = await supabase.from('reseller_applications').select('id, client_id, status').eq('id', req.params.id).maybeSingle()
+    const { data: app, error: getError } = await supabase.from('reseller_applications')
+      .select('id, client_id, status, deposit_payment_status, deposit_topup_id, deposit_detected_at')
+      .eq('id', req.params.id).maybeSingle()
     if (getError) throw getError; if (!app) throw fail(404, 'Solicitud no encontrada')
     if (app.status !== 'approved_awaiting_deposit') throw fail(409, 'Primero debe aprobarse el KYC')
+    if (app.deposit_payment_status !== 'PAYMENT_DETECTED_PENDING_ADMIN') {
+      throw fail(409, 'Todavía no hay un depósito Wallet elegible detectado. No se puede activar reseller sin esa revisión previa.')
+    }
     const now = new Date().toISOString()
-    const { error: appError } = await supabase.from('reseller_applications').update({ status: 'active', deposit_confirmed: true, activated_at: now, updated_at: now }).eq('id', app.id)
+    const reviewPatch = {
+      status: 'active', deposit_confirmed: true, deposit_payment_status: 'APPROVED',
+      deposit_reviewed_by: String(req.client.id), deposit_reviewed_at: now,
+      activated_at: now, updated_at: now,
+    }
+    const { data: reviewedApplication, error: appError } = await supabase.from('reseller_applications').update(reviewPatch)
+      .eq('id', app.id).eq('status', 'approved_awaiting_deposit')
+      .eq('deposit_payment_status', 'PAYMENT_DETECTED_PENDING_ADMIN')
+      .select('id').maybeSingle()
     if (appError) throw appError
-    const { error: profileError } = await supabase.from('reseller_profiles').upsert({ client_id: app.client_id, status: 'active', deposit_confirmed: true, activated_at: now, monthly_sales_count: 0, updated_at: now }, { onConflict: 'client_id' })
+    if (!reviewedApplication) throw fail(409, 'La solicitud cambió mientras se revisaba. Actualiza la pantalla y vuelve a comprobar el depósito.')
+    const { error: profileError } = await supabase.from('reseller_profiles').upsert({
+      client_id: app.client_id, ...reviewPatch, monthly_sales_count: 0,
+      deposit_topup_id: app.deposit_topup_id, deposit_detected_at: app.deposit_detected_at,
+    }, { onConflict: 'client_id' })
     if (profileError) throw profileError
-    return res.json({ ok: true, status: 'active', message: 'SO Reseller activado. Los precios especiales estarán disponibles al actualizar el catálogo.' })
+    return res.json({ ok: true, status: 'active', message: 'Depósito revisado manualmente y SO Reseller activado. Los precios especiales estarán disponibles al actualizar el catálogo.' })
   } catch (e) { return sendError(res, e, 'POST reseller activation') }
 })
 

@@ -10,6 +10,7 @@ const {
   cancelPaymentOrder, submitRecipientDetails, handleProviderWebhook,
 } = require('../utils/rechargeGamesOrders')
 const { verifyWebhookSignature } = require('../utils/rechargeGamesWebhookSecurity')
+const { checkPlayerRegion } = require('../utils/rechargeGamesRegionCheck')
 
 const router = express.Router()
 
@@ -77,6 +78,25 @@ function requireAdmin(req, res, next) {
 
 router.use(requireClient)
 
+// RechargeGames explicitly documents this verifier as keyless. Keep it on the
+// backend so the APK never calls provider endpoints directly and can be rate-limited.
+router.post('/region-check', async (req, res) => {
+  try {
+    const result = await checkPlayerRegion({
+      game: req.body?.game,
+      uid: req.body?.uid,
+      region: req.body?.region || '',
+      clientId: req.client.id,
+    })
+    return res.json({ ok: true, ...result })
+  } catch (error) {
+    if (error?.retryAfter) res.setHeader('Retry-After', String(error.retryAfter))
+    if (error?.status) return res.status(error.status).json({ ok: false, code: error.code || 'REGION_CHECK_ERROR', error: error.message, ...(error.retryAfter ? { retry_after: error.retryAfter } : {}) })
+    console.error('[RechargeGames] Error en verificador regional:', error?.code || error?.message || 'unknown')
+    return res.status(502).json({ ok: false, code: 'REGION_CHECK_PROVIDER_ERROR', error: 'No se pudo verificar la región del jugador.' })
+  }
+})
+
 router.get('/checkout/config', async (req, res) => {
   try { return res.json({ ok: true, ...(await getCheckoutConfig()) }) }
   catch (error) { return errorResponse(res, error, 'No se pudo comprobar el método de pago.') }
@@ -117,6 +137,23 @@ router.post('/admin/check-connection', requireAdmin, async (req, res) => {
   } catch (error) {
     if (error?.code === 'api_key_not_configured') return res.status(503).json({ ok: false, connected: false, code: error.code, error: 'Configura la clave API en Render.' })
     return res.status(error?.status || 502).json({ ok: false, connected: false, code: error?.code || 'provider_error', error: 'No se pudo autenticar con el proveedor. Comprueba la clave de API y los permisos de revendedor.' })
+  }
+})
+
+router.get('/admin/provider-balance', requireAdmin, async (req, res) => {
+  try {
+    const response = await require('../utils/rechargeGamesApi').rechargeGamesRequest('/v1/balance')
+    const rawBalance = response.data?.balance_usdt
+    const numericBalance = Number(rawBalance)
+    if (rawBalance === undefined || rawBalance === null || !Number.isFinite(numericBalance) || numericBalance < 0) {
+      return res.status(502).json({ ok: false, code: 'INVALID_PROVIDER_BALANCE_RESPONSE', error: 'RechargeGames devolvió un saldo con formato inesperado.' })
+    }
+    // Keep the provider's ledger private; this panel endpoint returns only the
+    // reseller balance required to diagnose insufficient_balance failures.
+    return res.json({ ok: true, balance_usdt: String(rawBalance), balance_micro: Number.isSafeInteger(Number(response.data?.balance_micro)) ? Number(response.data.balance_micro) : null })
+  } catch (error) {
+    if (error?.code === 'api_key_not_configured') return res.status(503).json({ ok: false, code: error.code, error: 'Configura la clave API de RechargeGames en Render.' })
+    return res.status(error?.status || 502).json({ ok: false, code: error?.code || 'PROVIDER_BALANCE_UNAVAILABLE', error: 'No se pudo consultar el saldo prepago de RechargeGames.' })
   }
 })
 
