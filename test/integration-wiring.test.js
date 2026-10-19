@@ -22,6 +22,15 @@ test('Game Market catalog worker uses persisted rate config and does not fall ba
   for (const symbol of ['normalizeMarketPricing', 'calculateOfferPrices']) assert.match(pricing, new RegExp(`function ${symbol}\\(`))
 })
 
+
+test('Game Market API paginates games and offers so regions/server markets are not silently truncated at 1,000 rows', () => {
+  const route = read('src/routes/gameMarket.js')
+  assert.match(route, /require\(['"]\.\.\/utils\/supabasePagination['"]\)/)
+  assert.match(route, /const games = await readAllRows\([\s\S]*?maxRows: 10_000/)
+  assert.match(route, /const data = await readAllRows\([\s\S]*?maxRows: 100_000/)
+  assert.match(route, /\.order\('title'\)\.order\('id'\)/)
+})
+
 test('Telegram administrator allowlist has no baked-in IDs', () => {
   const telegram = read('src/telegram.js')
   assert.match(telegram, /process\.env\.ADMIN_TELEGRAM_IDS\s*\|\|\s*""/)
