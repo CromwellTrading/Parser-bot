@@ -4,779 +4,553 @@ const express = require('express')
 const crypto = require('crypto')
 const supabase = require('../supabase')
 const { requireNonRevokedToken } = require('../utils/tokenState')
-const { canAccessGameMarket } = require('../utils/storeSessionAccess')
-const { DEFAULT_MARKET_PRICING, normalizeMarketPricing, calculateOfferPrices } = require('../utils/gamePricing')
-const { clientSafePackageData } = require('../utils/clientSafePackageData')
-const { readAllRows } = require('../utils/supabasePagination')
+const { bot, ADMINS } = require('../telegram')
+const { roundToStep, computePrices } = require('../utils/gamePricing')
 
 const router = express.Router()
 const AVATAR_BUCKET = 'so-profile-avatars'
-const GAME_IMAGE_BUCKET = 'so-game-thumbnails'
-const MAX_IMAGE_BYTES = 2 * 1024 * 1024
-const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
-const ALLOWED_THEMES = new Set(['violet', 'light', 'red', 'green', 'cyan'])
+const GAME_BUCKET = 'so-game-thumbnails'
+const KYC_BUCKET = 'so-reseller-kyc'
+const MAX_IMAGE_BYTES = 1_500_000
+const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
+const THEMES = new Set(['violet', 'light', 'red', 'green', 'cyan'])
+const RESELLER_STATUSES = new Set(['pending_review', 'changes_requested', 'approved_awaiting_deposit', 'active', 'rejected', 'suspended', 'expired'])
 
-function extractToken(req) {
-  const header = String(req.headers.authorization || '')
-  if (header.toLowerCase().startsWith('bearer ')) return header.slice(7).trim() || null
+function tokenFrom(req) {
+  const auth = String(req.headers.authorization || '')
+  if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim() || null
   return req.body?.token || req.query?.token || req.headers['x-client-token'] || null
 }
-
-function isExpired(expiresAt) {
-  if (!expiresAt) return false
-  const expires = new Date(expiresAt)
-  return !Number.isNaN(expires.getTime()) && expires < new Date()
+function fail(status, message) { const e = new Error(message); e.status = status; return e }
+function cleanText(value, max = 500) {
+  if (value === null || value === undefined) return null
+  const s = String(value).trim()
+  return s ? s.slice(0, max) : null
 }
+function bool(value, fallback = false) { return typeof value === 'boolean' ? value : (value === 'true' || value === 1 || value === '1' ? true : value === 'false' || value === 0 || value === '0' ? false : fallback) }
+function number(value, field, { min = 0, max = 1e9, optional = false } = {}) {
+  if ((value === '' || value === null || value === undefined) && optional) return null
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < min || n > max) throw fail(400, `${field} fuera de rango`)
+  return n
+}
+function slugify(v) { return String(v || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) }
+function isExpired(v) { if (!v) return false; const d = new Date(v); return !Number.isNaN(d.getTime()) && d < new Date() }
 
-async function requireClient(req, res, next) {
+async function optionalClient(token, req = null) {
+  if (!token) return null
+  await requireNonRevokedToken(token)
+  const { data, error } = await supabase.from('clients')
+    .select('id, name, token, active, token_used, device_id, expires_at, role, wallet, phone_number')
+    .eq('token', token).maybeSingle()
+  if (error) throw error
+  if (!data) throw fail(401, 'Token inválido')
+  if (data.active === false || isExpired(data.expires_at)) throw fail(403, 'Licencia inactiva o expirada')
+  // Keep Game Market and KYC bound to the same device that existing license verification authorized.
+  // This endpoint must not create a way to reuse a copied token on another phone.
+  const boundDevice = String(data.device_id || '').trim()
+  const requestedDevice = String(req?.headers?.['x-device-id'] || req?.body?.device_id || '').trim()
+  if (boundDevice && requestedDevice !== boundDevice) throw fail(403, 'Dispositivo no autorizado para esta licencia')
+  return data
+}
+async function requiredClient(req, res, next) {
   try {
-    const token = extractToken(req)
-    if (!token) return res.status(401).json({ error: 'Token de licencia requerido' })
-    await requireNonRevokedToken(token)
-    const { data: client, error } = await supabase
-      .from('clients')
-      .select('id, name, token, active, token_used, device_id, expires_at, role, store_only')
-      .eq('token', token)
-      .maybeSingle()
-    if (error) throw error
-    if (!client) return res.status(401).json({ error: 'Token inválido' })
-    // Device binding applies to free store sessions too. A leaked store token
-    // must not be reusable from a different installation.
-    const boundDevice = String(client.device_id || '').trim()
-    const requestedDevice = String(req.headers['x-device-id'] || '').trim()
-    if (boundDevice && (!requestedDevice || requestedDevice !== boundDevice)) {
-      return res.status(403).json({ error: 'Dispositivo no autorizado para esta licencia' })
-    }
-    if (!canAccessGameMarket(client, req.method, req.path)) {
-      return res.status(403).json({ code: 'LICENSE_REQUIRED', error: 'Esta función requiere una licencia activa. Las compras de la tienda oficial siguen siendo gratuitas.' })
-    }
-    req.client = client
+    const token = tokenFrom(req)
+    if (!token) return res.status(401).json({ error: 'Se requiere una sesión válida para esta operación' })
+    req.client = await optionalClient(token, req)
     return next()
-  } catch (error) {
-    if (error.code === 'TOKEN_REVOKED') return res.status(403).json({ error: 'Token revocado' })
-    console.error('Error validando cliente para Game Market:', error)
-    return res.status(500).json({ error: 'No se pudo validar la sesión' })
-  }
+  } catch (e) { return sendError(res, e, 'No se pudo validar el cliente') }
 }
-
-function requireAdmin(req, res, next) {
-  if (String(req.client?.role || '').toLowerCase() !== 'admin') {
-    return res.status(403).json({ error: 'Esta operación requiere rol de administrador' })
-  }
+function requiredAdmin(req, res, next) {
+  if (String(req.client?.role || '').toLowerCase() !== 'admin') return res.status(403).json({ error: 'Solo un administrador puede realizar esta operación' })
   return next()
 }
-
-function cleanText(value, max = 500) {
-  if (value === undefined || value === null) return null
-  const cleaned = String(value).trim()
-  if (!cleaned) return null
-  return cleaned.slice(0, max)
-}
-
-function slugify(value) {
-  return String(value || '')
-    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80)
-}
-
-function parseBoolean(value, fallback) {
-  if (typeof value === 'boolean') return value
-  if (value === 'true' || value === '1' || value === 1) return true
-  if (value === 'false' || value === '0' || value === 0) return false
-  return fallback
-}
-
-function parseNonNegativeNumber(value, field, { optional = false } = {}) {
-  if ((value === undefined || value === null || value === '') && optional) return null
-  const number = Number(value)
-  if (!Number.isFinite(number) || number < 0 || number > 1_000_000_000) {
-    const error = new Error(`${field} debe ser un número válido mayor o igual a cero`)
-    error.status = 400
-    throw error
-  }
-  return number
-}
-
-function parseWholeSalePrice(value, field) {
-  const number = parseNonNegativeNumber(value, field)
-  if (!Number.isInteger(number)) {
-    const error = new Error(`${field} debe ser un importe entero`)
-    error.status = 400
-    throw error
-  }
-  return number
-}
-
-async function getPricingSettings() {
-  const { data, error } = await supabase.from('synthesisone_settings')
-    .select('value').eq('key', 'game_market_pricing:synthesisone').maybeSingle()
-  if (error) throw error
-  return normalizeMarketPricing(data?.value || DEFAULT_MARKET_PRICING)
-}
-
-async function getPlatformStoreId() {
-  const { data, error } = await supabase.from('game_market_stores')
-    .select('id').eq('is_platform_store', true).maybeSingle()
-  if (error) throw error
-  if (!data?.id) throw new Error('No existe la tienda oficial; ejecuta la migración 009_profiles_game_market.sql')
-  return data.id
-}
-
-function storagePublicUrl(bucket, path) {
-  if (!path) return null
-  const { data } = supabase.storage.from(bucket).getPublicUrl(path)
-  return data?.publicUrl || null
-}
-
-async function avatarUrl(path) {
-  if (!path) return null
-  const { data, error } = await supabase.storage.from(AVATAR_BUCKET).createSignedUrl(path, 60 * 60)
-  if (error) {
-    console.error('No se pudo firmar la URL de avatar:', error.message)
-    return null
-  }
-  return data?.signedUrl || null
-}
-
-async function getOrCreateProfile(client) {
-  const { data, error } = await supabase.from('synthesisone_profiles')
-    .select('*').eq('client_id', String(client.id)).maybeSingle()
-  if (error) throw error
-  if (data) return data
-  const { data: created, error: insertError } = await supabase.from('synthesisone_profiles')
-    .insert({ client_id: client.id, display_name: cleanText(client.name, 80) })
-    .select('*').single()
-  if (insertError) throw insertError
-  return created
-}
-
-async function serializeProfile(profile) {
-  return {
-    client_id: String(profile.client_id),
-    display_name: profile.display_name || '',
-    username: profile.username ? `@${profile.username}` : '',
-    avatar_url: await avatarUrl(profile.avatar_path),
-    theme: profile.theme || 'violet',
-    province: profile.province || '',
-    municipality: profile.municipality || '',
-    age: profile.age ?? null,
-    display_name_public: !!profile.display_name_public,
-    avatar_public: !!profile.avatar_public,
-    age_public: !!profile.age_public,
-    location_public: !!profile.location_public,
-    local_data_imported: !!profile.local_data_imported,
-    profile_complete: Boolean(
-      String(profile.display_name || '').trim() &&
-      /^[a-z0-9_]{3,20}$/.test(String(profile.username || '')) &&
-      String(profile.province || '').trim() &&
-      String(profile.municipality || '').trim() &&
-      profile.avatar_path
-    ),
-    updated_at: profile.updated_at,
-  }
-}
-
-function decodeImage(body = {}) {
-  const type = String(body.content_type || body.contentType || 'image/jpeg').toLowerCase().split(';')[0].trim()
-  if (!ALLOWED_IMAGE_TYPES.has(type)) {
-    const error = new Error('Formato no permitido. Usa JPG, PNG o WebP.')
-    error.status = 400
-    throw error
-  }
-  let encoded = String(body.image_base64 || body.imageBase64 || '').trim()
-  encoded = encoded.replace(/^data:image\/(?:jpeg|png|webp);base64,/i, '')
-  if (!encoded || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
-    const error = new Error('La imagen codificada no es válida')
-    error.status = 400
-    throw error
-  }
-  const bytes = Buffer.from(encoded, 'base64')
-  if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) {
-    const error = new Error('La imagen no puede superar 2 MB')
-    error.status = 413
-    throw error
-  }
-  // Check the actual format as well as the client-supplied MIME type.
-  const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
-  const isPng = bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
-  const isWebp = bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP'
-  if (!((type === 'image/jpeg' && isJpeg) || (type === 'image/png' && isPng) || (type === 'image/webp' && isWebp))) {
-    const error = new Error('El contenido de la imagen no coincide con su formato')
-    error.status = 400
-    throw error
-  }
-  return { bytes, type }
-}
-
-async function uploadImage(bucket, path, image) {
-  try {
-    const { error } = await supabase.storage.from(bucket).upload(path, image.bytes, {
-      contentType: image.type,
-      cacheControl: '3600',
-      upsert: false,
-    })
-    if (error) throw error
-    return path
-  } catch (storageError) {
-    const detail = String(storageError?.message || storageError || 'Error desconocido')
-    const lower = detail.toLowerCase()
-    const bucketMissing = /bucket.{0,30}(not found|does not exist|missing)|no such bucket|bucket not found/.test(lower)
-      || (Number(storageError?.statusCode || storageError?.status) === 404 && lower.includes('bucket'))
-    // Keep provider/configuration details in private server logs only; never return
-    // bucket names, storage errors or infrastructure details to the Android client.
-    console.error('[Game Market] Falló la carga de una imagen. Verifica la configuración del almacenamiento y la clave de servicio.', {
-      bucket,
-      statusCode: storageError?.statusCode || storageError?.status || null,
-      errorCode: storageError?.error || storageError?.code || null,
-      bucketMissing,
-      message: detail,
-    })
-    const safeError = new Error('No se pudo guardar la imagen en este momento. Inténtalo de nuevo más tarde.')
-    safeError.status = 503
-    safeError.code = bucketMissing ? 'IMAGE_BUCKET_NOT_CONFIGURED' : 'IMAGE_STORAGE_UNAVAILABLE'
-    throw safeError
-  }
-}
-
-async function loadCatalog({ admin = false, storeId = null } = {}) {
-  const games = await readAllRows(() => {
-    let query = supabase.from('game_market_games')
-      .select('id, slug, name, description, category, thumbnail_path, thumbnail_url, badge, is_active, sort_order, created_at, updated_at')
-      .order('sort_order', { ascending: true }).order('name', { ascending: true })
-    if (storeId) query = query.eq('store_id', storeId)
-    if (!admin) query = query.eq('is_active', true)
-    return query
-  }, { pageSize: 500, maxRows: 20000 })
-  if (!games.length) return { games: [] }
-
-  const ids = games.map(game => game.id)
-  const offers = await readAllRows(() => {
-    let query = supabase.from('game_market_offers')
-      .select('id, game_id, title, description, category, package_data, price_cup, price_saldo, base_cost_usd, auto_pricing, available, published, sort_order, provider, created_at, updated_at')
-      .in('game_id', ids).order('sort_order', { ascending: true }).order('title', { ascending: true })
-    if (storeId) query = query.eq('store_id', storeId)
-    if (!admin) query = query.eq('published', true)
-    return query
-  }, { pageSize: 500, maxRows: 100000 })
-
-  const offersByGame = new Map()
-  for (const offer of offers || []) {
-    // Provider-marked out-of-stock packages remain visible with a disabled purchase
-    // action; manual offers that an admin marked unavailable remain hidden from buyers.
-    if (!admin && !offer.available && offer.provider !== 'rechargegames') continue
-    const bucket = offersByGame.get(offer.game_id) || []
-    const safeOffer = {
-      id: offer.id,
-      game_id: offer.game_id,
-      title: offer.title,
-      description: offer.description || '',
-      category: offer.category || 'Paquete',
-      package_data: admin ? (offer.package_data || {}) : clientSafePackageData(offer.package_data || {}),
-      price_cup: Number(offer.price_cup || 0),
-      price_saldo: Number(offer.price_saldo || 0),
-      available: !!offer.available,
-      published: !!offer.published,
-      sort_order: offer.sort_order || 0,
-    }
-    if (admin) {
-      safeOffer.base_cost_usd = offer.base_cost_usd === null ? null : Number(offer.base_cost_usd)
-      safeOffer.auto_pricing = !!offer.auto_pricing
-    }
-    bucket.push(safeOffer)
-    offersByGame.set(offer.game_id, bucket)
-  }
-
-  return {
-    games: games.map(game => ({
-      id: game.id,
-      slug: game.slug,
-      name: game.name,
-      description: game.description || '',
-      category: game.category || 'Juegos',
-      thumbnail_path: game.thumbnail_path || null,
-      // Manually uploaded artwork wins; automatically discovered URLs are the fallback.
-      thumbnail_url: (game.thumbnail_path ? storagePublicUrl(GAME_IMAGE_BUCKET, game.thumbnail_path) : null) || game.thumbnail_url || null,
-      badge: game.badge || '',
-      is_active: !!game.is_active,
-      sort_order: game.sort_order || 0,
-      offers: offersByGame.get(game.id) || [],
-    })),
-  }
-}
-
-function handleError(res, error, context) {
+function sendError(res, error, context) {
   if (error?.status) return res.status(error.status).json({ error: error.message })
-  if (error?.code === '23505') return res.status(409).json({ error: 'Ese username o identificador ya está en uso' })
+  if (error?.code === '23505') return res.status(409).json({ error: 'El nombre de usuario o identificador ya existe' })
   console.error(context, error)
   return res.status(500).json({ error: 'Error interno del servidor' })
 }
 
-router.get('/public-profile/:username', async (req, res) => {
-  try {
-    const username = String(req.params.username || '').trim().replace(/^@/, '').toLowerCase()
-    if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ error: 'Username no válido' })
-    const { data: profile, error } = await supabase.from('synthesisone_profiles')
-      .select('username, display_name, display_name_public, avatar_path, avatar_public, province, municipality, location_public, age, age_public')
-      .eq('username', username).maybeSingle()
+function decodeImage(body, prefix = 'image') {
+  const type = String(body?.[`${prefix}_content_type`] || body?.content_type || 'image/jpeg').toLowerCase().split(';')[0].trim()
+  if (!IMAGE_TYPES.has(type)) throw fail(400, 'Formato de imagen no permitido; utiliza JPG, PNG o WebP')
+  let encoded = String(body?.[`${prefix}_base64`] || body?.image_base64 || '').trim().replace(/^data:image\/(?:jpeg|png|webp);base64,/i, '')
+  if (!encoded || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) throw fail(400, 'Imagen codificada no válida')
+  const bytes = Buffer.from(encoded, 'base64')
+  if (!bytes.length || bytes.length > MAX_IMAGE_BYTES) throw fail(413, 'Cada imagen debe pesar como máximo 1,5 MB una vez optimizada')
+  const jpeg = bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255
+  const png = bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))
+  const webp = bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP'
+  if (!((type === 'image/jpeg' && jpeg) || (type === 'image/png' && png) || (type === 'image/webp' && webp))) throw fail(400, 'El contenido no coincide con el formato de imagen declarado')
+  return { bytes, type, extension: type === 'image/png' ? 'png' : type === 'image/webp' ? 'webp' : 'jpg' }
+}
+async function uploadPrivate(bucket, path, image) {
+  const { error } = await supabase.storage.from(bucket).upload(path, image.bytes, { contentType: image.type, cacheControl: '3600', upsert: false })
+  if (error) throw error
+}
+async function signedUrl(bucket, path, seconds = 300) {
+  if (!path) return null
+  const { data, error } = await supabase.storage.from(bucket).createSignedUrl(path, seconds)
+  if (error) { console.error('Error generando URL temporal:', error.message); return null }
+  return data?.signedUrl || null
+}
+function publicGameUrl(path) {
+  if (!path) return null
+  return supabase.storage.from(GAME_BUCKET).getPublicUrl(path).data?.publicUrl || null
+}
+
+async function pricingFor(tier) {
+  const key = tier === 'reseller' ? 'game_market_pricing:reseller' : 'game_market_pricing:normal'
+  const fallback = tier === 'reseller'
+    ? { usd_to_cup: 1050, usd_to_saldo: 380, profit_margin_pct: 0, cup_rounding_step: 5, saldo_rounding_step: 1, rounding_mode: 'ceil' }
+    : { usd_to_cup: 1050, usd_to_saldo: 380, profit_margin_pct: 0, cup_rounding_step: 5, saldo_rounding_step: 1, rounding_mode: 'ceil' }
+  const { data, error } = await supabase.from('synthesisone_settings').select('value').eq('key', key).maybeSingle()
+  if (error) throw error
+  const raw = data?.value || fallback
+  const mode = ['ceil', 'nearest', 'floor'].includes(raw.rounding_mode) ? raw.rounding_mode : 'ceil'
+  return {
+    usd_to_cup: number(raw.usd_to_cup, 'usd_to_cup', { min: 0.000001 }),
+    usd_to_saldo: number(raw.usd_to_saldo, 'usd_to_saldo', { min: 0.000001 }),
+    profit_margin_pct: number(raw.profit_margin_pct ?? 0, 'profit_margin_pct', { min: 0, max: 10000 }),
+    cup_rounding_step: number(raw.cup_rounding_step ?? 5, 'cup_rounding_step', { min: 1, max: 1e6 }),
+    saldo_rounding_step: number(raw.saldo_rounding_step ?? 1, 'saldo_rounding_step', { min: 1, max: 1e6 }),
+    rounding_mode: mode,
+  }
+}
+async function platformStoreId() {
+  const { data, error } = await supabase.from('game_market_stores').select('id').eq('slug', 'synthesisone').maybeSingle()
+  if (error) throw error
+  if (!data) throw fail(503, 'El catálogo no está inicializado; el administrador debe aplicar la migración SQL 009')
+  return data.id
+}
+async function resellerActive(clientId) {
+  const { data, error } = await supabase.from('reseller_profiles').select('status').eq('client_id', String(clientId)).maybeSingle()
+  if (error) throw error
+  return data?.status === 'active'
+}
+async function catalogPayload(tier, admin = false) {
+  const storeId = await platformStoreId()
+  const { data: games, error: gameError } = await supabase.from('game_market_games')
+    .select('id, slug, name, description, category, thumbnail_path, badge, is_active, sort_order')
+    .eq('store_id', storeId).order('sort_order').order('name')
+  if (gameError) throw gameError
+  const gameRows = admin ? (games || []) : (games || []).filter(g => g.is_active)
+  const normalRule = await pricingFor('normal')
+  const resellerRule = await pricingFor('reseller')
+  const ids = gameRows.map(g => g.id)
+  let offers = []
+  if (ids.length) {
+    const { data, error } = await supabase.from('game_market_offers')
+      .select('id, game_id, title, description, category, package_data, price_cup, price_saldo, price_reseller_cup, price_reseller_saldo, base_cost_usd, auto_pricing, available, published, sort_order')
+      .eq('store_id', storeId).in('game_id', ids).order('sort_order').order('title')
     if (error) throw error
-    if (!profile) return res.status(404).json({ error: 'Perfil no encontrado' })
-    return res.json({
-      username: `@${profile.username}`,
-      display_name: profile.display_name_public ? profile.display_name : null,
-      avatar_url: profile.avatar_public ? await avatarUrl(profile.avatar_path) : null,
-      age: profile.age_public ? profile.age : null,
-      province: profile.location_public ? profile.province : null,
-      municipality: profile.location_public ? profile.municipality : null,
-    })
-  } catch (error) {
-    return handleError(res, error, 'Error GET public profile:')
+    offers = (data || []).filter(o => admin || (o.published && o.available))
   }
-})
-
-
-router.use(requireClient)
-
-// Profile records are isolated by the server-authenticated client id.
-router.get('/profile', async (req, res) => {
-  try {
-    const profile = await getOrCreateProfile(req.client)
-    return res.json({ ok: true, profile: await serializeProfile(profile) })
-  } catch (error) {
-    return handleError(res, error, 'Error GET /api/game-market/profile:')
+  const mappedOffers = offers.map(o => {
+    let normalCup = Number(o.price_cup || 0)
+    let normalSaldo = Number(o.price_saldo || 0)
+    let resellerCup = o.price_reseller_cup == null ? null : Number(o.price_reseller_cup)
+    let resellerSaldo = o.price_reseller_saldo == null ? null : Number(o.price_reseller_saldo)
+    if (o.auto_pricing && o.base_cost_usd !== null && o.base_cost_usd !== undefined) {
+      const np = computePrices(Number(o.base_cost_usd), normalRule)
+      const rp = computePrices(Number(o.base_cost_usd), resellerRule)
+      normalCup = np.price_cup; normalSaldo = np.price_saldo
+      if (resellerCup === null) resellerCup = rp.price_cup
+      if (resellerSaldo === null) resellerSaldo = rp.price_saldo
+    }
+    const out = {
+      id: o.id, game_id: o.game_id, title: o.title, description: o.description || '', category: o.category || 'Paquete',
+      package_data: o.package_data || {},
+      price_cup: tier === 'reseller' ? (resellerCup === null ? normalCup : resellerCup) : normalCup,
+      price_saldo: tier === 'reseller' ? (resellerSaldo === null ? normalSaldo : resellerSaldo) : normalSaldo,
+      available: !!o.available, published: !!o.published, sort_order: o.sort_order || 0,
+    }
+    if (admin) {
+      out.base_cost_usd = o.base_cost_usd === null ? null : Number(o.base_cost_usd)
+      out.auto_pricing = !!o.auto_pricing
+      out.price_reseller_cup = resellerCup
+      out.price_reseller_saldo = resellerSaldo
+      out.price_normal_cup = normalCup
+      out.price_normal_saldo = normalSaldo
+    }
+    return out
+  })
+  return {
+    pricing_tier: tier,
+    games: gameRows.map(g => ({
+      id: g.id, slug: g.slug, name: g.name, description: g.description || '', category: g.category || 'Juegos',
+      thumbnail_path: g.thumbnail_path || null, thumbnail_url: publicGameUrl(g.thumbnail_path), badge: g.badge || '',
+      is_active: !!g.is_active, sort_order: g.sort_order || 0,
+      offers: mappedOffers.filter(o => o.game_id === g.id),
+    })),
   }
-})
+}
 
-router.put('/profile', async (req, res) => {
-  try {
-    const body = req.body || {}
-    const patch = { updated_at: new Date().toISOString() }
-    if (Object.prototype.hasOwnProperty.call(body, 'display_name')) {
-      patch.display_name = cleanText(body.display_name, 80)
-    }
-    if (Object.prototype.hasOwnProperty.call(body, 'username')) {
-      const username = String(body.username || '').trim().replace(/^@/, '').toLowerCase()
-      if (username && !/^[a-z0-9_]{3,20}$/.test(username)) {
-        return res.status(400).json({ error: 'El username debe tener 3–20 caracteres: letras, números o guion bajo' })
-      }
-      patch.username = username || null
-    }
-    if (Object.prototype.hasOwnProperty.call(body, 'theme')) {
-      const theme = String(body.theme || 'violet').toLowerCase()
-      if (!ALLOWED_THEMES.has(theme)) return res.status(400).json({ error: 'Tema visual no válido' })
-      patch.theme = theme
-    }
-    if (Object.prototype.hasOwnProperty.call(body, 'province')) patch.province = cleanText(body.province, 80)
-    if (Object.prototype.hasOwnProperty.call(body, 'municipality')) patch.municipality = cleanText(body.municipality, 100)
-    if (Object.prototype.hasOwnProperty.call(body, 'age')) {
-      if (body.age === null || body.age === '') patch.age = null
-      else {
-        const age = Number(body.age)
-        if (!Number.isInteger(age) || age < 1 || age > 120) return res.status(400).json({ error: 'La edad debe estar entre 1 y 120 años, o quedar vacía' })
-        patch.age = age
-      }
-    }
-    for (const field of ['display_name_public', 'avatar_public', 'age_public', 'location_public']) {
-      if (Object.prototype.hasOwnProperty.call(body, field)) {
-        if (typeof body[field] !== 'boolean') return res.status(400).json({ error: `${field} debe ser booleano` })
-        patch[field] = body[field]
-      }
-    }
-    const completeProfileForm = [
-      'display_name', 'username', 'age', 'province', 'municipality',
-      'display_name_public', 'avatar_public', 'age_public', 'location_public',
-    ].every(field => Object.prototype.hasOwnProperty.call(body, field))
-    if (patch.province === null) patch.municipality = null
-    if (patch.municipality && !patch.province) return res.status(400).json({ error: 'La provincia es necesaria para guardar el municipio' })
-
-    const current = await getOrCreateProfile(req.client)
-    if (completeProfileForm) {
-      if (!String(patch.display_name || '').trim()) return res.status(400).json({ error: 'El nombre visible es obligatorio' })
-      if (!String(patch.username || '').trim() || !/^[a-z0-9_]{3,20}$/.test(String(patch.username))) {
-        return res.status(400).json({ error: 'El username es obligatorio y debe tener 3–20 caracteres: letras, números o guion bajo' })
-      }
-      if (!String(patch.province || '').trim() || !String(patch.municipality || '').trim()) {
-        return res.status(400).json({ error: 'Selecciona provincia y municipio para completar el perfil' })
-      }
-      if (!current.avatar_path) return res.status(400).json({ error: 'Selecciona y sube una foto de perfil antes de finalizar' })
-      patch.local_data_imported = true
-    }
-    const { data, error } = await supabase.from('synthesisone_profiles')
-      .update(patch).eq('client_id', String(req.client.id)).select('*').single()
-    if (error) throw error
-    return res.json({ ok: true, profile: await serializeProfile(data || current) })
-  } catch (error) {
-    return handleError(res, error, 'Error PUT /api/game-market/profile:')
-  }
-})
-
-router.post('/profile/import-local', async (req, res) => {
-  try {
-    const body = req.body || {}
-    const current = await getOrCreateProfile(req.client)
-    if (current.local_data_imported) {
-      return res.json({ ok: true, imported: false, profile: await serializeProfile(current) })
-    }
-
-    const patch = { local_data_imported: true, updated_at: new Date().toISOString() }
-    // This is a one-time, conservative migration from SharedPreferences. Keep server
-    // fields that already exist, and never import avatar paths/URLs from the client.
-    const displayName = cleanText(body.display_name, 80)
-    if (displayName) patch.display_name = displayName
-
-    let usernameConflict = false
-    const username = String(body.username || '').trim().replace(/^@/, '').toLowerCase()
-    if (username) {
-      if (!/^[a-z0-9_]{3,20}$/.test(username)) {
-        usernameConflict = true
-      } else if (!current.username) {
-        const { data: duplicate, error: duplicateError } = await supabase.from('synthesisone_profiles')
-          .select('client_id').eq('username', username).neq('client_id', String(req.client.id)).maybeSingle()
-        if (duplicateError) throw duplicateError
-        if (duplicate) usernameConflict = true
-        else patch.username = username
-      }
-    }
-
-    const theme = String(body.theme || '').toLowerCase()
-    if (ALLOWED_THEMES.has(theme)) patch.theme = theme
-    if (!current.province && cleanText(body.province, 80)) patch.province = cleanText(body.province, 80)
-    const province = patch.province ?? current.province
-    if (!current.municipality && province && cleanText(body.municipality, 100)) {
-      patch.municipality = cleanText(body.municipality, 100)
-    }
-    if (current.age === null || current.age === undefined) {
-      if (body.age !== undefined && body.age !== null && body.age !== '') {
-        const age = Number(body.age)
-        if (Number.isInteger(age) && age >= 1 && age <= 120) patch.age = age
-      }
-    }
-    for (const field of ['display_name_public', 'avatar_public', 'age_public', 'location_public']) {
-      if (body[field] === true && current[field] !== true) patch[field] = true
-    }
-
-    let updateResult = await supabase.from('synthesisone_profiles').update(patch)
-      .eq('client_id', String(req.client.id)).select('*').single()
-    if (updateResult.error?.code === '23505' && Object.prototype.hasOwnProperty.call(patch, 'username')) {
-      // If another device claimed the username at the same time, preserve all other
-      // imported fields and mark import complete; the user can choose another username.
-      delete patch.username
-      usernameConflict = true
-      updateResult = await supabase.from('synthesisone_profiles').update(patch)
-        .eq('client_id', String(req.client.id)).select('*').single()
-    }
-    if (updateResult.error) throw updateResult.error
-    return res.json({
-      ok: true,
-      imported: true,
-      username_conflict: usernameConflict,
-      profile: await serializeProfile(updateResult.data),
-    })
-  } catch (error) {
-    return handleError(res, error, 'Error POST /api/game-market/profile/import-local:')
-  }
-})
-
-router.post('/profile/avatar', async (req, res) => {
-  try {
-    const image = decodeImage(req.body || {})
-    const current = await getOrCreateProfile(req.client)
-    const extension = image.type === 'image/png' ? 'png' : (image.type === 'image/webp' ? 'webp' : 'jpg')
-    const path = `${String(req.client.id)}/${crypto.randomUUID()}.${extension}`
-    await uploadImage(AVATAR_BUCKET, path, image)
-    const { data, error } = await supabase.from('synthesisone_profiles')
-      .update({ avatar_path: path, updated_at: new Date().toISOString() })
-      .eq('client_id', String(req.client.id)).select('*').single()
-    if (error) {
-      await supabase.storage.from(AVATAR_BUCKET).remove([path]).catch(() => {})
-      throw error
-    }
-    if (current.avatar_path && current.avatar_path !== path) {
-      const { error: removeError } = await supabase.storage.from(AVATAR_BUCKET).remove([current.avatar_path])
-      if (removeError) console.warn('No se pudo limpiar el avatar anterior:', removeError.message)
-    }
-    return res.json({ ok: true, profile: await serializeProfile(data) })
-  } catch (error) {
-    return handleError(res, error, 'Error POST /api/game-market/profile/avatar:')
-  }
-})
-
-
+// Public catalog only exposes the normal tier. If the token is valid, its active reseller status determines tier.
 router.get('/catalog', async (req, res) => {
   try {
-    const storeId = await getPlatformStoreId()
-    return res.json(await loadCatalog({ admin: false, storeId }))
-  } catch (error) {
-    return handleError(res, error, 'Error GET /api/game-market/catalog:')
-  }
+    const client = await optionalClient(tokenFrom(req), req)
+    const tier = client && await resellerActive(client.id) ? 'reseller' : 'normal'
+    const payload = await catalogPayload(tier, false)
+    return res.json(payload)
+  } catch (e) { return sendError(res, e, 'GET market catalog') }
 })
-
-router.get('/admin/catalog', requireAdmin, async (req, res) => {
+router.get('/profile', requiredClient, async (req, res) => {
   try {
-    const storeId = await getPlatformStoreId()
-    const catalog = await loadCatalog({ admin: true, storeId })
-    catalog.pricing = await getPricingSettings()
-    return res.json(catalog)
-  } catch (error) {
-    return handleError(res, error, 'Error GET /api/game-market/admin/catalog:')
-  }
+    const id = String(req.client.id)
+    const { data, error } = await supabase.from('synthesisone_profiles').select('*').eq('client_id', id).maybeSingle()
+    if (error) throw error
+    const profile = data || { client_id: id, display_name: req.client.name || '', theme: 'violet', age: null, province: null, municipality: null, username: null, avatar_path: null, display_name_public: false, avatar_public: false, age_public: false, location_public: false, local_data_imported: false }
+    return res.json({ ok: true, profile: { ...profile, avatar_url: await signedUrl(AVATAR_BUCKET, profile.avatar_path, 3600), avatar_path: undefined } })
+  } catch (e) { return sendError(res, e, 'GET market profile') }
 })
-
-router.get('/admin/pricing', requireAdmin, async (req, res) => {
+router.put('/profile', requiredClient, async (req, res) => {
   try {
-    return res.json({ pricing: await getPricingSettings() })
-  } catch (error) {
-    return handleError(res, error, 'Error GET market pricing:')
-  }
+    const b = req.body || {}
+    const patch = { client_id: String(req.client.id), updated_at: new Date().toISOString() }
+    if ('display_name' in b) patch.display_name = cleanText(b.display_name, 80)
+    if ('username' in b) {
+      const u = String(b.username || '').trim().replace(/^@/, '').toLowerCase()
+      if (u && !/^[a-z0-9_]{3,20}$/.test(u)) throw fail(400, 'Username: 3–20 caracteres, letras, números o guion bajo')
+      patch.username = u || null
+    }
+    if ('theme' in b) { const t = String(b.theme || 'violet'); if (!THEMES.has(t)) throw fail(400, 'Tema no válido'); patch.theme = t }
+    for (const [field, max] of [['province', 80], ['municipality', 100]]) if (field in b) patch[field] = cleanText(b[field], max)
+    if ('age' in b) { const a = b.age === null || b.age === '' ? null : number(b.age, 'age', { min: 1, max: 120 }); patch.age = a }
+    for (const f of ['display_name_public', 'avatar_public', 'age_public', 'location_public']) if (f in b) { if (typeof b[f] !== 'boolean') throw fail(400, `${f} debe ser booleano`); patch[f] = b[f] }
+    if ('province' in patch && !patch.province) patch.municipality = null
+    const { data, error } = await supabase.from('synthesisone_profiles').upsert(patch, { onConflict: 'client_id' }).select('*').single()
+    if (error) throw error
+    return res.json({ ok: true, profile: data })
+  } catch (e) { return sendError(res, e, 'PUT market profile') }
 })
-
-router.put('/admin/pricing', requireAdmin, async (req, res) => {
+router.post('/profile/import-local', requiredClient, async (req, res) => {
   try {
-    const body = req.body || {}
-    for (const key of ['usd_to_cup', 'usd_to_saldo']) {
-      const value = Number(body[key])
-      if (!Number.isFinite(value) || value <= 0 || value > 1_000_000_000) return res.status(400).json({ error: `${key} debe ser mayor que cero` })
+    const id = String(req.client.id)
+    const { data: current, error: getError } = await supabase.from('synthesisone_profiles').select('*').eq('client_id', id).maybeSingle()
+    if (getError) throw getError
+    if (current?.local_data_imported) return res.json({ ok: true, imported: false, profile: current })
+    const b = req.body || {}
+    const patch = { client_id: id, local_data_imported: true, updated_at: new Date().toISOString() }
+    if (!current?.display_name && cleanText(b.display_name, 80)) patch.display_name = cleanText(b.display_name, 80)
+    if (!current?.username && cleanText(b.username, 24)) {
+      const username = String(b.username).trim().replace(/^@/, '').toLowerCase()
+      if (/^[a-z0-9_]{3,20}$/.test(username)) {
+        const { data: duplicate, error: duplicateError } = await supabase.from('synthesisone_profiles').select('client_id').eq('username', username).neq('client_id', id).maybeSingle()
+        if (duplicateError) throw duplicateError
+        if (!duplicate) patch.username = username
+      }
     }
-    for (const key of ['cup_rounding_step', 'saldo_rounding_step']) {
-      const value = Number(body[key])
-      if (!Number.isInteger(value) || value <= 0 || value > 1_000_000_000) return res.status(400).json({ error: `${key} debe ser un entero mayor que cero` })
+    if (!current?.theme && THEMES.has(String(b.theme))) patch.theme = String(b.theme)
+    if (!current?.province && cleanText(b.province, 80)) patch.province = cleanText(b.province, 80)
+    if (!current?.municipality && cleanText(b.municipality, 100)) patch.municipality = cleanText(b.municipality, 100)
+    if ((current?.age === null || current?.age === undefined) && b.age !== null && b.age !== '' && b.age !== undefined) {
+      const age = Number(b.age); if (Number.isInteger(age) && age >= 1 && age <= 120) patch.age = age
     }
-    const margin = Number(body.profit_margin_pct)
-    if (!Number.isFinite(margin) || margin < 0 || margin > 10000) return res.status(400).json({ error: 'El margen debe estar entre 0 y 10000 %' })
-    if (!['ceil', 'nearest', 'floor'].includes(String(body.rounding_mode))) return res.status(400).json({ error: 'rounding_mode debe ser ceil, nearest o floor' })
-    const pricing = normalizeMarketPricing(body)
-    const { error: saveError } = await supabase.from('synthesisone_settings').upsert({
-      key: 'game_market_pricing:synthesisone', value: pricing, updated_at: new Date().toISOString(),
-    }, { onConflict: 'key' })
-    if (saveError) throw saveError
-
-    // Rate changes apply only to the official store; future independent sellers
-    // must retain their own pricing settings.
-    const platformStoreId = await getPlatformStoreId()
-    const { data: automaticOffers, error: offersError } = await supabase.from('game_market_offers')
-      .select('id, base_cost_usd').eq('auto_pricing', true).eq('store_id', platformStoreId)
-    if (offersError) throw offersError
-    for (const offer of automaticOffers || []) {
-      if (offer.base_cost_usd === null || offer.base_cost_usd === undefined) continue
-      const calculated = calculateOfferPrices(offer.base_cost_usd, pricing)
-      const { error } = await supabase.from('game_market_offers').update({
-        price_cup: calculated.price_cup, price_saldo: calculated.price_saldo,
-        updated_at: new Date().toISOString(),
-      }).eq('id', offer.id)
-      if (error) throw error
+    for (const f of ['display_name_public', 'avatar_public', 'age_public', 'location_public']) {
+      if (!current?.[f] && b[f] === true) patch[f] = true
     }
-    return res.json({ ok: true, pricing })
-  } catch (error) {
-    return handleError(res, error, 'Error PUT market pricing:')
-  }
+    const { data, error } = await supabase.from('synthesisone_profiles').upsert(patch, { onConflict: 'client_id' }).select('*').single()
+    if (error) throw error
+    return res.json({ ok: true, imported: true, profile: data })
+  } catch (e) { return sendError(res, e, 'POST profile import local') }
 })
 
-router.post('/admin/images', requireAdmin, async (req, res) => {
+router.post('/profile/avatar', requiredClient, async (req, res) => {
   try {
     const image = decodeImage(req.body || {})
-    const extension = image.type === 'image/png' ? 'png' : (image.type === 'image/webp' ? 'webp' : 'jpg')
-    const path = `games/${crypto.randomUUID()}.${extension}`
-    await uploadImage(GAME_IMAGE_BUCKET, path, image)
-    // Android's uploader intentionally requires an explicit success flag. Without it,
-    // a valid upload was incorrectly treated as failed and never attached to the game.
-    return res.status(201).json({ ok: true, path, url: storagePublicUrl(GAME_IMAGE_BUCKET, path) })
-  } catch (error) {
-    return handleError(res, error, 'Error uploading Game Market image:')
-  }
+    const id = String(req.client.id)
+    const path = `${id}/${crypto.randomUUID()}.${image.extension}`
+    await uploadPrivate(AVATAR_BUCKET, path, image)
+    const { data: old } = await supabase.from('synthesisone_profiles').select('avatar_path').eq('client_id', id).maybeSingle()
+    const { data, error } = await supabase.from('synthesisone_profiles').upsert({ client_id: id, avatar_path: path, updated_at: new Date().toISOString() }, { onConflict: 'client_id' }).select('*').single()
+    if (error) { await supabase.storage.from(AVATAR_BUCKET).remove([path]); throw error }
+    if (old?.avatar_path) await supabase.storage.from(AVATAR_BUCKET).remove([old.avatar_path])
+    return res.json({ ok: true, profile: { ...data, avatar_url: await signedUrl(AVATAR_BUCKET, path, 3600), avatar_path: undefined } })
+  } catch (e) { return sendError(res, e, 'POST profile avatar') }
 })
 
-// Upload and persist a thumbnail for a specific game in one server-side operation.
-// This is the dedicated admin fallback when automatic artwork cannot be found.
-router.post('/admin/games/:id/thumbnail', requireAdmin, async (req, res) => {
-  let uploadedPath = null
+router.get('/admin/catalog', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    const payload = await catalogPayload('normal', true)
+    payload.pricing = { normal: await pricingFor('normal'), reseller: await pricingFor('reseller') }
+    return res.json(payload)
+  } catch (e) { return sendError(res, e, 'GET admin catalog') }
+})
+router.put('/admin/pricing', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    const tier = req.body?.tier === 'reseller' ? 'reseller' : 'normal'
+    const b = req.body || {}
+    const pricing = {
+      usd_to_cup: number(b.usd_to_cup, 'usd_to_cup', { min: 0.000001 }),
+      usd_to_saldo: number(b.usd_to_saldo, 'usd_to_saldo', { min: 0.000001 }),
+      profit_margin_pct: number(b.profit_margin_pct ?? 0, 'profit_margin_pct', { min: 0, max: 10000 }),
+      cup_rounding_step: number(b.cup_rounding_step ?? 5, 'cup_rounding_step', { min: 1, max: 1e6 }),
+      saldo_rounding_step: number(b.saldo_rounding_step ?? 1, 'saldo_rounding_step', { min: 1, max: 1e6 }),
+      rounding_mode: ['ceil', 'nearest', 'floor'].includes(b.rounding_mode) ? b.rounding_mode : 'ceil',
+    }
+    if (!Number.isInteger(pricing.cup_rounding_step) || !Number.isInteger(pricing.saldo_rounding_step)) throw fail(400, 'Los pasos de redondeo deben ser enteros')
+    const { error } = await supabase.from('synthesisone_settings').upsert({ key: `game_market_pricing:${tier}`, value: pricing, updated_at: new Date().toISOString() }, { onConflict: 'key' })
+    if (error) throw error
+    const storeId = await platformStoreId()
+    const { data: offers, error: offerError } = await supabase.from('game_market_offers').select('id, base_cost_usd, auto_pricing').eq('store_id', storeId).eq('auto_pricing', true)
+    if (offerError) throw offerError
+    const tierKey = tier === 'reseller' ? 'reseller' : 'normal'
+    for (const o of offers || []) {
+      if (o.base_cost_usd == null) continue
+      const p = computePrices(Number(o.base_cost_usd), pricing)
+      const patch = tierKey === 'reseller' ? { price_reseller_cup: p.price_cup, price_reseller_saldo: p.price_saldo } : { price_cup: p.price_cup, price_saldo: p.price_saldo }
+      const { error: updateError } = await supabase.from('game_market_offers').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', o.id)
+      if (updateError) throw updateError
+    }
+    return res.json({ ok: true, tier, pricing })
+  } catch (e) { return sendError(res, e, 'PUT admin pricing') }
+})
+router.post('/admin/images', requiredClient, requiredAdmin, async (req, res) => {
   try {
     const image = decodeImage(req.body || {})
-    const storeId = await getPlatformStoreId()
-    const { data: existing, error: fetchError } = await supabase.from('game_market_games')
-      .select('id, thumbnail_path').eq('id', req.params.id).eq('store_id', storeId).maybeSingle()
-    if (fetchError) throw fetchError
-    if (!existing) return res.status(404).json({ error: 'Juego no encontrado' })
-
-    const extension = image.type === 'image/png' ? 'png' : (image.type === 'image/webp' ? 'webp' : 'jpg')
-    uploadedPath = `games/${crypto.randomUUID()}.${extension}`
-    await uploadImage(GAME_IMAGE_BUCKET, uploadedPath, image)
-    const { data: updated, error: updateError } = await supabase.from('game_market_games')
-      .update({ thumbnail_path: uploadedPath, updated_at: new Date().toISOString() })
-      .eq('id', existing.id).eq('store_id', storeId)
-      .select('id, name, thumbnail_path, thumbnail_url').single()
-    if (updateError) {
-      await supabase.storage.from(GAME_IMAGE_BUCKET).remove([uploadedPath]).catch(() => {})
-      uploadedPath = null
-      throw updateError
-    }
-
-    if (existing.thumbnail_path && existing.thumbnail_path !== uploadedPath) {
-      const { error: removeError } = await supabase.storage.from(GAME_IMAGE_BUCKET).remove([existing.thumbnail_path])
-      if (removeError) console.warn('[Game Market] No se pudo borrar la miniatura sustituida:', removeError.message)
-    }
-    return res.status(201).json({
-      ok: true,
-      path: uploadedPath,
-      url: storagePublicUrl(GAME_IMAGE_BUCKET, uploadedPath),
-      game: updated,
-    })
-  } catch (error) {
-    if (uploadedPath) await supabase.storage.from(GAME_IMAGE_BUCKET).remove([uploadedPath]).catch(() => {})
-    return handleError(res, error, 'Error saving Game Market game thumbnail:')
-  }
+    const path = `games/${crypto.randomUUID()}.${image.extension}`
+    await uploadPrivate(GAME_BUCKET, path, image)
+    return res.status(201).json({ path, url: publicGameUrl(path) })
+  } catch (e) { return sendError(res, e, 'POST admin image') }
 })
-
-router.post('/admin/games', requireAdmin, async (req, res) => {
+router.post('/admin/games', requiredClient, requiredAdmin, async (req, res) => {
   try {
-    const body = req.body || {}
-    const name = cleanText(body.name, 100)
-    if (!name) return res.status(400).json({ error: 'El nombre del juego es obligatorio' })
-    const slug = slugify(body.slug || name)
-    if (!slug) return res.status(400).json({ error: 'No se pudo crear un identificador válido para el juego' })
-    const sortOrder = Number.isInteger(Number(body.sort_order)) ? Number(body.sort_order) : 0
-    const storeId = await getPlatformStoreId()
+    const storeId = await platformStoreId()
+    const name = cleanText(req.body?.name, 100)
+    const slug = slugify(req.body?.slug || name)
+    if (!name || !slug) throw fail(400, 'Nombre requerido')
     const { data, error } = await supabase.from('game_market_games').insert({
-      store_id: storeId, slug, name, description: cleanText(body.description, 2000), category: cleanText(body.category, 80) || 'Juegos',
-      thumbnail_path: cleanText(body.thumbnail_path, 500), badge: cleanText(body.badge, 30),
-      is_active: parseBoolean(body.is_active, true), sort_order: sortOrder,
+      store_id: storeId, slug, name, description: cleanText(req.body.description, 2000), category: cleanText(req.body.category, 80) || 'Juegos',
+      thumbnail_path: cleanText(req.body.thumbnail_path, 500), badge: cleanText(req.body.badge, 30), is_active: bool(req.body.is_active, true), sort_order: Number(req.body.sort_order) || 0,
     }).select('*').single()
     if (error) throw error
     return res.status(201).json({ game: data })
-  } catch (error) {
-    return handleError(res, error, 'Error POST market game:')
-  }
+  } catch (e) { return sendError(res, e, 'POST admin game') }
 })
-
-router.patch('/admin/games/:id', requireAdmin, async (req, res) => {
+router.patch('/admin/games/:id', requiredClient, requiredAdmin, async (req, res) => {
   try {
-    const body = req.body || {}
-    const patch = { updated_at: new Date().toISOString() }
-    if (Object.prototype.hasOwnProperty.call(body, 'name')) {
-      patch.name = cleanText(body.name, 100)
-      if (!patch.name) return res.status(400).json({ error: 'El nombre del juego no puede quedar vacío' })
-    }
-    if (Object.prototype.hasOwnProperty.call(body, 'slug')) patch.slug = slugify(body.slug)
-    if (Object.prototype.hasOwnProperty.call(body, 'description')) patch.description = cleanText(body.description, 2000)
-    if (Object.prototype.hasOwnProperty.call(body, 'category')) patch.category = cleanText(body.category, 80) || 'Juegos'
-    if (Object.prototype.hasOwnProperty.call(body, 'thumbnail_path')) patch.thumbnail_path = cleanText(body.thumbnail_path, 500)
-    if (Object.prototype.hasOwnProperty.call(body, 'badge')) patch.badge = cleanText(body.badge, 30)
-    if (Object.prototype.hasOwnProperty.call(body, 'is_active')) patch.is_active = parseBoolean(body.is_active, true)
-    if (Object.prototype.hasOwnProperty.call(body, 'sort_order')) patch.sort_order = Number(body.sort_order) || 0
-    const storeId = await getPlatformStoreId()
-    const { data, error } = await supabase.from('game_market_games').update(patch)
-      .eq('id', req.params.id).eq('store_id', storeId).select('*').maybeSingle()
-    if (error) throw error
-    if (!data) return res.status(404).json({ error: 'Juego no encontrado' })
+    const storeId = await platformStoreId(); const b = req.body || {}; const p = { updated_at: new Date().toISOString() }
+    if ('name' in b) p.name = cleanText(b.name, 100)
+    if ('slug' in b) p.slug = slugify(b.slug)
+    if ('description' in b) p.description = cleanText(b.description, 2000)
+    if ('category' in b) p.category = cleanText(b.category, 80) || 'Juegos'
+    if ('thumbnail_path' in b) p.thumbnail_path = cleanText(b.thumbnail_path, 500)
+    if ('badge' in b) p.badge = cleanText(b.badge, 30)
+    if ('is_active' in b) p.is_active = bool(b.is_active)
+    if ('sort_order' in b) p.sort_order = Number(b.sort_order) || 0
+    const { data, error } = await supabase.from('game_market_games').update(p).eq('id', req.params.id).eq('store_id', storeId).select('*').maybeSingle()
+    if (error) throw error; if (!data) throw fail(404, 'Juego no encontrado')
     return res.json({ game: data })
-  } catch (error) {
-    return handleError(res, error, 'Error PATCH market game:')
-  }
+  } catch (e) { return sendError(res, e, 'PATCH admin game') }
 })
-
-router.delete('/admin/games/:id', requireAdmin, async (req, res) => {
+router.delete('/admin/games/:id', requiredClient, requiredAdmin, async (req, res) => {
   try {
-    const storeId = await getPlatformStoreId()
-    const { data: game, error: fetchError } = await supabase.from('game_market_games')
-      .select('id, thumbnail_path').eq('id', req.params.id).eq('store_id', storeId).maybeSingle()
-    if (fetchError) throw fetchError
-    if (!game) return res.status(404).json({ error: 'Juego no encontrado' })
+    const storeId = await platformStoreId()
+    const { data: game, error: getError } = await supabase.from('game_market_games').select('id, thumbnail_path').eq('id', req.params.id).eq('store_id', storeId).maybeSingle()
+    if (getError) throw getError; if (!game) throw fail(404, 'Juego no encontrado')
     const { error } = await supabase.from('game_market_games').delete().eq('id', game.id).eq('store_id', storeId)
     if (error) throw error
-    if (game.thumbnail_path) {
-      const { error: storageError } = await supabase.storage.from(GAME_IMAGE_BUCKET).remove([game.thumbnail_path])
-      if (storageError) console.warn('No se pudo limpiar una miniatura eliminada:', storageError.message)
-    }
+    if (game.thumbnail_path) await supabase.storage.from(GAME_BUCKET).remove([game.thumbnail_path])
     return res.json({ ok: true })
-  } catch (error) {
-    return handleError(res, error, 'Error DELETE market game:')
-  }
+  } catch (e) { return sendError(res, e, 'DELETE admin game') }
 })
-
-router.post('/admin/games/:id/offers', requireAdmin, async (req, res) => {
+router.post('/admin/games/:id/offers', requiredClient, requiredAdmin, async (req, res) => {
   try {
-    const body = req.body || {}
-    const title = cleanText(body.title, 120)
-    if (!title) return res.status(400).json({ error: 'El nombre de la oferta es obligatorio' })
-    const storeId = await getPlatformStoreId()
-    const pricing = await getPricingSettings()
-    const autoPricing = parseBoolean(body.auto_pricing, false)
-    const baseCost = parseNonNegativeNumber(body.base_cost_usd, 'base_cost_usd', { optional: true })
-    if (autoPricing && baseCost === null) return res.status(400).json({ error: 'El coste mayorista USD es obligatorio para el cálculo automático' })
-    let priceCup = parseWholeSalePrice(body.price_cup ?? 0, 'price_cup')
-    let priceSaldo = parseWholeSalePrice(body.price_saldo ?? 0, 'price_saldo')
-    if (autoPricing) ({ price_cup: priceCup, price_saldo: priceSaldo } = calculateOfferPrices(baseCost, pricing))
+    const storeId = await platformStoreId(); const b = req.body || {}; const title = cleanText(b.title, 120)
+    if (!title) throw fail(400, 'Nombre de oferta requerido')
+    const cost = number(b.base_cost_usd, 'base_cost_usd', { optional: true })
+    const normalRule = await pricingFor('normal'); const resellerRule = await pricingFor('reseller')
+    const auto = bool(b.auto_pricing)
+    const np = auto && cost != null ? computePrices(cost, normalRule) : { price_cup: number(b.price_cup ?? 0, 'price_cup'), price_saldo: number(b.price_saldo ?? 0, 'price_saldo') }
+    const rp = auto && cost != null ? computePrices(cost, resellerRule) : { price_cup: number(b.price_reseller_cup ?? np.price_cup, 'price_reseller_cup'), price_saldo: number(b.price_reseller_saldo ?? np.price_saldo, 'price_reseller_saldo') }
+    if (auto && cost == null) throw fail(400, 'El coste USD es obligatorio para cálculo automático')
     const { data, error } = await supabase.from('game_market_offers').insert({
-      store_id: storeId, game_id: req.params.id, title,
-      description: cleanText(body.description, 1000), category: cleanText(body.category, 80) || 'Paquete',
-      package_data: body.package_data && typeof body.package_data === 'object' && !Array.isArray(body.package_data) ? body.package_data : {},
-      price_cup: priceCup, price_saldo: priceSaldo, base_cost_usd: baseCost, auto_pricing: autoPricing,
-      available: parseBoolean(body.available, true), published: parseBoolean(body.published, true),
-      sort_order: Number.isInteger(Number(body.sort_order)) ? Number(body.sort_order) : 0,
+      store_id: storeId, game_id: req.params.id, title, description: cleanText(b.description, 1000), category: cleanText(b.category, 80) || 'Paquete',
+      package_data: b.package_data && typeof b.package_data === 'object' && !Array.isArray(b.package_data) ? b.package_data : {},
+      price_cup: np.price_cup, price_saldo: np.price_saldo, price_reseller_cup: rp.price_cup, price_reseller_saldo: rp.price_saldo,
+      base_cost_usd: cost, auto_pricing: auto, available: bool(b.available, true), published: bool(b.published, true), sort_order: Number(b.sort_order) || 0,
     }).select('*').single()
     if (error) throw error
     return res.status(201).json({ offer: data })
-  } catch (error) {
-    return handleError(res, error, 'Error POST market offer:')
-  }
+  } catch (e) { return sendError(res, e, 'POST admin offer') }
 })
-
-router.patch('/admin/offers/:id', requireAdmin, async (req, res) => {
+router.patch('/admin/offers/:id', requiredClient, requiredAdmin, async (req, res) => {
   try {
-    const body = req.body || {}
-    const patch = { updated_at: new Date().toISOString() }
-    for (const [field, max] of Object.entries({ title: 120, description: 1000, category: 80 })) {
-      if (Object.prototype.hasOwnProperty.call(body, field)) {
-        const cleaned = cleanText(body[field], max)
-        if (field === 'title' && !cleaned) return res.status(400).json({ error: 'El nombre de la oferta es obligatorio' })
-        patch[field] = field === 'category' ? (cleaned || 'Paquete') : cleaned
-      }
+    const storeId = await platformStoreId(); const b = req.body || {}; const p = { updated_at: new Date().toISOString() }
+    for (const [f, max] of [['title', 120], ['description', 1000], ['category', 80]]) if (f in b) p[f] = f === 'category' ? (cleanText(b[f], max) || 'Paquete') : cleanText(b[f], max)
+    for (const f of ['available', 'published', 'auto_pricing']) if (f in b) p[f] = bool(b[f])
+    if ('package_data' in b) p.package_data = b.package_data
+    if ('base_cost_usd' in b) p.base_cost_usd = number(b.base_cost_usd, 'base_cost_usd', { optional: true })
+    for (const f of ['price_cup', 'price_saldo', 'price_reseller_cup', 'price_reseller_saldo']) if (f in b) p[f] = number(b[f], f)
+    const { data: existing, error: getError } = await supabase.from('game_market_offers').select('id, base_cost_usd, auto_pricing').eq('id', req.params.id).eq('store_id', storeId).maybeSingle()
+    if (getError) throw getError; if (!existing) throw fail(404, 'Oferta no encontrada')
+    const auto = p.auto_pricing ?? existing.auto_pricing
+    const cost = Object.prototype.hasOwnProperty.call(p, 'base_cost_usd') ? p.base_cost_usd : existing.base_cost_usd
+    if (auto) {
+      if (cost == null) throw fail(400, 'El coste USD es obligatorio para cálculo automático')
+      const normal = computePrices(cost, await pricingFor('normal')); const reseller = computePrices(cost, await pricingFor('reseller'))
+      Object.assign(p, { price_cup: normal.price_cup, price_saldo: normal.price_saldo, price_reseller_cup: reseller.price_cup, price_reseller_saldo: reseller.price_saldo })
     }
-    if (Object.prototype.hasOwnProperty.call(body, 'package_data')) {
-      if (!body.package_data || typeof body.package_data !== 'object' || Array.isArray(body.package_data)) return res.status(400).json({ error: 'package_data debe ser un objeto JSON' })
-      patch.package_data = body.package_data
-    }
-    if (Object.prototype.hasOwnProperty.call(body, 'available')) patch.available = parseBoolean(body.available, true)
-    if (Object.prototype.hasOwnProperty.call(body, 'published')) patch.published = parseBoolean(body.published, true)
-    if (Object.prototype.hasOwnProperty.call(body, 'sort_order')) patch.sort_order = Number(body.sort_order) || 0
-
-    const platformStoreId = await getPlatformStoreId()
-    const { data: existing, error: fetchError } = await supabase.from('game_market_offers')
-      .select('id, store_id, base_cost_usd, auto_pricing, price_cup, price_saldo')
-      .eq('id', req.params.id).eq('store_id', platformStoreId).maybeSingle()
-    if (fetchError) throw fetchError
-    if (!existing) return res.status(404).json({ error: 'Oferta no encontrada' })
-    if (Object.prototype.hasOwnProperty.call(body, 'base_cost_usd')) patch.base_cost_usd = parseNonNegativeNumber(body.base_cost_usd, 'base_cost_usd', { optional: true })
-    if (Object.prototype.hasOwnProperty.call(body, 'auto_pricing')) patch.auto_pricing = parseBoolean(body.auto_pricing, false)
-    const effectiveAuto = patch.auto_pricing ?? existing.auto_pricing
-    const effectiveCost = Object.prototype.hasOwnProperty.call(patch, 'base_cost_usd') ? patch.base_cost_usd : existing.base_cost_usd
-    if (effectiveAuto && effectiveCost === null) return res.status(400).json({ error: 'El coste mayorista USD es obligatorio para el cálculo automático' })
-
-    if (Object.prototype.hasOwnProperty.call(body, 'price_cup')) patch.price_cup = parseWholeSalePrice(body.price_cup, 'price_cup')
-    if (Object.prototype.hasOwnProperty.call(body, 'price_saldo')) patch.price_saldo = parseWholeSalePrice(body.price_saldo, 'price_saldo')
-    if (effectiveAuto && (Object.prototype.hasOwnProperty.call(body, 'base_cost_usd') || Object.prototype.hasOwnProperty.call(body, 'auto_pricing') || Object.prototype.hasOwnProperty.call(body, 'price_cup') || Object.prototype.hasOwnProperty.call(body, 'price_saldo'))) {
-      const calculated = calculateOfferPrices(effectiveCost, await getPricingSettings())
-      patch.price_cup = calculated.price_cup
-      patch.price_saldo = calculated.price_saldo
-    }
-    const { data, error } = await supabase.from('game_market_offers').update(patch)
-      .eq('id', req.params.id).select('*').single()
+    const { data, error } = await supabase.from('game_market_offers').update(p).eq('id', req.params.id).eq('store_id', storeId).select('*').single()
     if (error) throw error
     return res.json({ offer: data })
-  } catch (error) {
-    return handleError(res, error, 'Error PATCH market offer:')
-  }
+  } catch (e) { return sendError(res, e, 'PATCH admin offer') }
+})
+router.delete('/admin/offers/:id', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    const storeId = await platformStoreId()
+    const { data, error } = await supabase.from('game_market_offers').delete().eq('id', req.params.id).eq('store_id', storeId).select('id').maybeSingle()
+    if (error) throw error; if (!data) throw fail(404, 'Oferta no encontrada')
+    return res.json({ ok: true })
+  } catch (e) { return sendError(res, e, 'DELETE admin offer') }
 })
 
-router.delete('/admin/offers/:id', requireAdmin, async (req, res) => {
+// Reseller application: KYC files remain in a private bucket. No wallet debit or purchase is performed here.
+router.get('/reseller/status', requiredClient, async (req, res) => {
   try {
-    const platformStoreId = await getPlatformStoreId()
-    const { data, error } = await supabase.from('game_market_offers').delete()
-      .eq('id', req.params.id).eq('store_id', platformStoreId).select('id').maybeSingle()
+    const id = String(req.client.id)
+    const { data: application, error } = await supabase.from('reseller_applications').select('id, status, review_note, submitted_at, reviewed_at, deposit_confirmed, monthly_sales_count, updated_at').eq('client_id', id).order('submitted_at', { ascending: false }).limit(1).maybeSingle()
     if (error) throw error
-    if (!data) return res.status(404).json({ error: 'Oferta no encontrada en la tienda oficial' })
-    return res.json({ ok: true })
-  } catch (error) {
-    return handleError(res, error, 'Error DELETE market offer:')
+    let { data: profile, error: pError } = await supabase.from('reseller_profiles').select('status, activated_at, deposit_confirmed, monthly_sales_count, last_sales_period').eq('client_id', id).maybeSingle()
+    if (pError) throw pError
+    if (profile?.status === 'active') {
+      const now = new Date()
+      const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString().slice(0, 10)
+      if (!profile.last_sales_period || String(profile.last_sales_period).slice(0, 10) < periodStart) {
+        const { data: reset, error: resetError } = await supabase.from('reseller_profiles').update({ monthly_sales_count: 0, last_sales_period: periodStart, updated_at: now.toISOString() }).eq('client_id', id).select('status, activated_at, deposit_confirmed, monthly_sales_count, last_sales_period').single()
+        if (resetError) throw resetError
+        profile = reset
+        if (application?.status === 'active') {
+          const { error: appResetError } = await supabase.from('reseller_applications').update({ monthly_sales_count: 0, updated_at: now.toISOString() }).eq('id', application.id)
+          if (appResetError) throw appResetError
+          application.monthly_sales_count = 0
+        }
+      }
+    }
+    return res.json({ ok: true, application, reseller: profile || { status: 'not_reseller', deposit_confirmed: false, monthly_sales_count: 0 }, monthly_sales_target: 15, deposit_min_cup: 50000, monthly_sales_tracked_manually: true })
+  } catch (e) { return sendError(res, e, 'GET reseller status') }
+})
+router.post('/reseller/applications', requiredClient, async (req, res) => {
+  const uploaded = []
+  try {
+    const b = req.body || {}
+    if (b.accepted_terms !== true) throw fail(400, 'Debes aceptar las condiciones de SO Reseller antes de enviar la solicitud')
+    const cards = Array.isArray(b.card_numbers) ? b.card_numbers.map(v => String(v).trim()).filter(Boolean).slice(0, 5) : []
+    const phones = Array.isArray(b.phone_numbers) ? b.phone_numbers.map(v => String(v).trim()).filter(Boolean).slice(0, 5) : []
+    if (!cards.length || cards.some(v => !/^[0-9\- ]{8,24}$/.test(v))) throw fail(400, 'Introduce al menos una tarjeta válida')
+    if (!phones.length || phones.some(v => !/^\+?[0-9]{8,15}$/.test(v))) throw fail(400, 'Introduce al menos un teléfono válido')
+    const front = decodeImage(b, 'id_front')
+    const back = decodeImage(b, 'id_back')
+    const selfie = decodeImage(b, 'selfie_with_id')
+    const clientId = String(req.client.id)
+    const { data: previous, error: previousError } = await supabase.from('reseller_applications').select('id, status').eq('client_id', clientId).in('status', ['pending_review', 'approved_awaiting_deposit', 'active']).maybeSingle()
+    if (previousError) throw previousError
+    if (previous) throw fail(409, 'Ya existe una solicitud o condición reseller activa')
+    const { data: activeProfile, error: activeProfileError } = await supabase.from('reseller_profiles').select('status').eq('client_id', clientId).maybeSingle()
+    if (activeProfileError) throw activeProfileError
+    if (activeProfile?.status === 'active' || activeProfile?.status === 'approved_awaiting_deposit') throw fail(409, 'Tu condición SO Reseller ya existe; consulta su estado en Ajustes')
+    const paths = {}
+    for (const [kind, image] of [['id-front', front], ['id-back', back], ['selfie-so-reseller', selfie]]) {
+      const path = `${clientId}/${crypto.randomUUID()}-${kind}.${image.extension}`
+      await uploadPrivate(KYC_BUCKET, path, image); uploaded.push(path); paths[kind] = path
+    }
+    const { data, error } = await supabase.from('reseller_applications').insert({
+      client_id: clientId, client_name: cleanText(req.client.name, 100), client_phone: cleanText(b.contact_phone, 30),
+      card_numbers: cards, phone_numbers: phones, id_front_path: paths['id-front'], id_back_path: paths['id-back'],
+      selfie_path: paths['selfie-so-reseller'], accepted_terms: true, status: 'pending_review',
+      submitted_at: new Date().toISOString(), updated_at: new Date().toISOString(), monthly_sales_target: 15, deposit_min_cup: 50000,
+    }).select('id, status, submitted_at').single()
+    if (error) throw error
+    // Alert administrators without sending any KYC documents or sensitive card data to Telegram.
+    const alert = `🟣 Nueva solicitud SO Reseller\nSolicitante: ${cleanText(req.client.name, 80) || 'Cliente'}\nID interno: ${clientId}\nSolicitud: ${data.id}\nRevisión manual requerida. El plazo informativo es de 24–48 horas.`
+    await Promise.allSettled(ADMINS.map(chatId => bot.sendMessage(chatId, alert)))
+    return res.status(201).json({ ok: true, application: data, message: 'Solicitud enviada. El equipo de SynthesisOne la revisará normalmente en un plazo de 24–48 horas.' })
+  } catch (e) {
+    if (uploaded.length) await supabase.storage.from(KYC_BUCKET).remove(uploaded).catch(() => {})
+    return sendError(res, e, 'POST reseller application')
   }
+})
+router.get('/admin/reseller/pending-count', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    const { count, error } = await supabase.from('reseller_applications')
+      .select('id', { count: 'exact', head: true }).eq('status', 'pending_review')
+    if (error) throw error
+    return res.json({ pending_count: count || 0 })
+  } catch (e) { return sendError(res, e, 'GET admin reseller pending count') }
+})
+
+router.get('/admin/reseller/applications', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    const status = cleanText(req.query.status, 40)
+    let q = supabase.from('reseller_applications').select('id, client_id, client_name, client_phone, card_numbers, phone_numbers, id_front_path, id_back_path, selfie_path, status, review_note, accepted_terms, submitted_at, reviewed_at, deposit_confirmed, monthly_sales_count, monthly_sales_target, deposit_min_cup').order('submitted_at', { ascending: false }).limit(100)
+    if (status && RESELLER_STATUSES.has(status)) q = q.eq('status', status)
+    const { data, error } = await q
+    if (error) throw error
+    const applications = await Promise.all((data || []).map(async a => ({
+      ...a,
+      documents: {
+        id_front_url: await signedUrl(KYC_BUCKET, a.id_front_path),
+        id_back_url: await signedUrl(KYC_BUCKET, a.id_back_path),
+        selfie_url: await signedUrl(KYC_BUCKET, a.selfie_path),
+      },
+      id_front_path: undefined, id_back_path: undefined, selfie_path: undefined,
+    })))
+    return res.json({ applications, pending_count: applications.filter(a => a.status === 'pending_review').length })
+  } catch (e) { return sendError(res, e, 'GET admin reseller applications') }
+})
+router.post('/admin/reseller/applications/:id/review', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    const action = String(req.body?.action || '').toLowerCase()
+    if (!['approve', 'reject', 'request_changes'].includes(action)) throw fail(400, 'Acción de revisión no válida')
+    const note = cleanText(req.body?.note, 1000)
+    if (action !== 'approve' && !note) throw fail(400, 'Añade un motivo o instrucciones para el solicitante')
+    const { data: app, error: getError } = await supabase.from('reseller_applications').select('*').eq('id', req.params.id).maybeSingle()
+    if (getError) throw getError; if (!app) throw fail(404, 'Solicitud no encontrada')
+    if (app.status !== 'pending_review') throw fail(409, 'La solicitud ya fue revisada')
+    const status = action === 'approve' ? 'approved_awaiting_deposit' : action === 'reject' ? 'rejected' : 'changes_requested'
+    const now = new Date().toISOString()
+    const { data, error } = await supabase.from('reseller_applications').update({ status, review_note: note, reviewed_at: now, reviewed_by: String(req.client.id), updated_at: now }).eq('id', app.id).select('id, client_id, status, review_note, reviewed_at').single()
+    if (error) throw error
+    if (action === 'approve') {
+      const { error: profileError } = await supabase.from('reseller_profiles').upsert({ client_id: app.client_id, status: 'approved_awaiting_deposit', deposit_confirmed: false, updated_at: now }, { onConflict: 'client_id' })
+      if (profileError) throw profileError
+    }
+    return res.json({ ok: true, application: data, message: action === 'approve' ? 'KYC aprobado. Falta comprobar el depósito de trabajo de 50.000 CUP.' : action === 'reject' ? 'Solicitud rechazada.' : 'Se ha solicitado una corrección.' })
+  } catch (e) { return sendError(res, e, 'POST reseller review') }
+})
+router.post('/admin/reseller/applications/:id/activate', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    if (req.body?.deposit_confirmed !== true) throw fail(400, 'Debes confirmar manualmente que el depósito de 50.000 CUP está verificado')
+    const { data: app, error: getError } = await supabase.from('reseller_applications').select('id, client_id, status').eq('id', req.params.id).maybeSingle()
+    if (getError) throw getError; if (!app) throw fail(404, 'Solicitud no encontrada')
+    if (app.status !== 'approved_awaiting_deposit') throw fail(409, 'Primero debe aprobarse el KYC')
+    const now = new Date().toISOString()
+    const { error: appError } = await supabase.from('reseller_applications').update({ status: 'active', deposit_confirmed: true, activated_at: now, updated_at: now }).eq('id', app.id)
+    if (appError) throw appError
+    const { error: profileError } = await supabase.from('reseller_profiles').upsert({ client_id: app.client_id, status: 'active', deposit_confirmed: true, activated_at: now, monthly_sales_count: 0, updated_at: now }, { onConflict: 'client_id' })
+    if (profileError) throw profileError
+    return res.json({ ok: true, status: 'active', message: 'SO Reseller activado. Los precios especiales estarán disponibles al actualizar el catálogo.' })
+  } catch (e) { return sendError(res, e, 'POST reseller activation') }
+})
+
+
+router.post('/admin/reseller/applications/:id/sales-count', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    const count = Number(req.body?.monthly_sales_count)
+    const reason = cleanText(req.body?.reason, 500)
+    if (!Number.isInteger(count) || count < 0 || count > 100000) throw fail(400, 'El total mensual debe ser un entero entre 0 y 100000')
+    if (!reason) throw fail(400, 'Escribe el motivo del ajuste manual')
+    const { data, error } = await supabase.rpc('so_set_reseller_monthly_sales', {
+      p_application_id: req.params.id,
+      p_new_count: count,
+      p_reason: reason,
+      p_admin_client_id: String(req.client.id),
+    })
+    if (error) throw error
+    return res.json(data || { ok: true, monthly_sales_count: count, monthly_sales_target: 15, tracked_manually: true })
+  } catch (e) { return sendError(res, e, 'POST reseller monthly sales count') }
 })
 
 module.exports = router
