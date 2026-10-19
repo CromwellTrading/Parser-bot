@@ -51,6 +51,7 @@ function normalizeCatalog(payload) {
     accepted_product_count: 0,
     skipped_missing_name: 0,
     skipped_missing_key: 0,
+    skipped_invalid_key_length: 0,
     skipped_invalid_price: 0,
     skipped_unsupported_delivery: 0,
   }
@@ -93,6 +94,10 @@ function normalizeCatalog(payload) {
         const derivedKey = sourceGameSlug && sourceRegionSlug ? `${kind}/${sourceGameSlug}/${sourceRegionSlug}/${productName}` : ''
         const productKey = providedKey || cleanProductKey(derivedKey, 500)
         if (!productKey) { stats.skipped_missing_key += 1; continue }
+        // OpenAPI specifies product_key maxLength=300. Never truncate it because this
+        // key is the provider's exact priced SKU; truncation could select nothing or a
+        // different product. Skip invalid records and expose the diagnostic counter.
+        if (productKey.length > 300) { stats.skipped_invalid_key_length += 1; continue }
         const rawPrice = product?.price ?? product?.price_usdt ?? product?.priceUsdt
         const price = typeof rawPrice === 'string' ? Number(rawPrice.trim()) : Number(rawPrice)
         if (rawPrice === null || rawPrice === undefined || rawPrice === '' || !Number.isFinite(price) || price < 0) {

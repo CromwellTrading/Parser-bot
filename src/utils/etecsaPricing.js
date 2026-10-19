@@ -22,6 +22,14 @@ function normalizeRate(value) {
   return parsed ? parsed.normalized : null
 }
 
+// Automated purchase tickets are settled through Transfermóvil in CUP.
+// Saldo Móvil prices remain visible in catalogues, but cannot be used as a
+// payment amount until a real, independently verifiable balance-payment rail exists.
+function normalizePriceBasis(value) {
+  const basis = String(value || '').trim().toUpperCase()
+  return basis === 'CUP' ? 'CUP' : null
+}
+
 // Convert a provider cost and one independently managed rate using fixed-point
 // BigInt math, then always round UP to the next multiple of five.
 function calculateRetailPrice(cost, rate) {
@@ -52,6 +60,7 @@ function isPricingConfigured(settings) {
 module.exports = {
   normalizeDecimalInput,
   normalizeRate,
+  normalizePriceBasis,
   calculateRetailPrice,
   calculateOfferPrices,
   isPricingConfigured,

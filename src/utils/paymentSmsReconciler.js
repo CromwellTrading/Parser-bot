@@ -97,25 +97,29 @@ async function reconcileRecentPaymentSms() {
 
     for (const row of rows.slice().reverse()) {
       const parsed = parseSms(row.sender, row.body, row.received_at)
-      if (String(parsed?.network || '').toUpperCase() !== 'PAGOMOVIL' ||
-          String(parsed?.currency || '').toUpperCase() !== 'CUP' ||
-          !['ENVIADO', 'RECIBIDO'].includes(String(parsed?.direction || '').toUpperCase()) ||
-          !['TARJETA_TARJETA', 'MONEDERO_TARJETA'].includes(String(parsed?.type || '').toUpperCase()) ||
-          !Number.isFinite(Number(parsed?.amount))) continue
+      const network = String(parsed?.network || '').toUpperCase()
+      const direction = String(parsed?.direction || '').toUpperCase()
+      const validCupPayment = network === 'PAGOMOVIL' && String(parsed?.currency || '').toUpperCase() === 'CUP' &&
+        ['TARJETA_TARJETA', 'MONEDERO_TARJETA'].includes(String(parsed?.type || '').toUpperCase())
+      const validSaldoPayment = network === 'CUBACEL' && String(parsed?.type || '').toUpperCase() === 'CUBACEL' &&
+        ['ENVIADO', 'RECIBIDO'].includes(direction)
+      if ((!validCupPayment && !validSaldoPayment) || !Number.isFinite(Number(parsed?.amount))) continue
       scanned += 1
       const client = clientsById.get(String(row.client_id)) || { id: row.client_id }
       let etecsa = null
       let game = null
       let wallet = null
-      try {
-        etecsa = await processEtecsaTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
-      } catch (error) {
-        console.error('[PaymentReconciler] ETECSA match failed:', error?.code || error?.message || 'unknown')
-      }
-      try {
-        game = await processGameTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
-      } catch (error) {
-        console.error('[PaymentReconciler] Game match failed:', error?.code || error?.message || 'unknown')
+      if (validCupPayment) {
+        try {
+          etecsa = await processEtecsaTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
+        } catch (error) {
+          console.error('[PaymentReconciler] ETECSA match failed:', error?.code || error?.message || 'unknown')
+        }
+        try {
+          game = await processGameTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
+        } catch (error) {
+          console.error('[PaymentReconciler] Game match failed:', error?.code || error?.message || 'unknown')
+        }
       }
       try {
         wallet = await processWalletTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })

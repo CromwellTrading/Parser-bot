@@ -10,6 +10,7 @@ const { getAutomationAvailability } = require('./systemSettings')
 const { normalizePayerPhone, isConfiguredPaymentReceiver } = require('./etecsaPaymentMatching')
 const { evaluateOfficialStorePayment } = require('./walletPaymentMatching')
 const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
+const { buildRechargeGamesOrderPayload } = require('./rechargeGamesOrderPayload')
 const { getPlatformStoreId } = require('./rechargeGamesCatalog')
 const { verifyWebhookSignature } = require('./rechargeGamesWebhookSecurity')
 const { findMatchingTopups } = require('./storeWallet')
@@ -46,7 +47,7 @@ function publicOrder(order) {
     provider_delivery: order.provider_delivery,
     price_basis: order.price_basis,
     amount: Number(order.payment_amount),
-    currency: 'CUP',
+    currency: String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(order.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP',
     payer_phone: order.payer_phone,
     player_id: order.player_id || null,
     server_id: order.server_id || null,
@@ -169,7 +170,7 @@ async function createPaymentOrder(client, body) {
   const offerId = cleanText(body?.offer_id, 100)
   const basis = String(body?.price_basis || '').trim().toUpperCase()
   const payerPhone = normalizePayerPhone(body?.payer_phone)
-  if (!offerId || !['CUP', 'SALDO'].includes(basis)) throw errorWithStatus('Selecciona un paquete y un precio válidos.', 400, 'INVALID_OFFER_SELECTION')
+  if (!offerId || basis !== 'CUP') throw errorWithStatus('Selecciona un paquete con precio CUP. Saldo Móvil se muestra como referencia, pero no es un importe de transferencia válido.', 400, 'INVALID_OFFER_SELECTION')
   if (!/^5\d{7}$/.test(payerPhone)) throw errorWithStatus('Introduce el móvil cubano desde el que realizarás la transferencia.', 400, 'INVALID_PAYER_PHONE')
 
   const offer = await getProviderOffer(offerId)
@@ -181,7 +182,7 @@ async function createPaymentOrder(client, body) {
   if (offer.provider_delivery === 'player_id' && /mobile[-_ ]?legends/i.test(String(offer.provider_game_slug || '')) && !serverId) {
     throw errorWithStatus('Introduce también el ID del servidor antes de crear el ticket.', 400, 'SERVER_ID_REQUIRED')
   }
-  const amount = basis === 'CUP' ? Number(offer.price_cup) : Number(offer.price_saldo)
+  const amount = Number(offer.price_cup)
   if (!Number.isSafeInteger(amount) || amount <= 0) throw errorWithStatus('El precio seleccionado no es válido. Actualiza el catálogo e inténtalo de nuevo.', 409, 'INVALID_LOCAL_PRICE')
   const providerMeta = offer.package_data?.rechargegames || {}
   const providerCost = Number(providerMeta.provider_price_usdt ?? offer.base_cost_usd)
@@ -237,7 +238,7 @@ async function createWalletGameOrder(client, body) {
   }
   const offerId = cleanText(body?.offer_id, 100)
   const basis = String(body?.price_basis || 'CUP').trim().toUpperCase()
-  if (!offerId || basis !== 'CUP') throw errorWithStatus('Selecciona un paquete y un precio CUP válidos.', 400, 'INVALID_OFFER_SELECTION')
+  if (!offerId || !['CUP', 'SALDO'].includes(basis)) throw errorWithStatus('Selecciona un paquete y una moneda válida para Wallet.', 400, 'INVALID_OFFER_SELECTION')
   const idempotencyKey = cleanText(body?.idempotency_key, 128)
   if (!/^[A-Za-z0-9_.:-]{8,128}$/.test(idempotencyKey)) throw errorWithStatus('No se pudo verificar el intento de compra. Vuelve a intentarlo.', 400, 'INVALID_IDEMPOTENCY_KEY')
   await assertNoOtherWaitingCheckout(client.id)
@@ -248,8 +249,8 @@ async function createWalletGameOrder(client, body) {
   if (offer.provider_delivery === 'player_id' && /mobile[-_ ]?legends/i.test(String(offer.provider_game_slug || '')) && !serverId) {
     throw errorWithStatus('Introduce también el ID del servidor antes de comprar.', 400, 'SERVER_ID_REQUIRED')
   }
-  const amount = Number(offer.price_cup)
-  if (!Number.isSafeInteger(amount) || amount <= 0) throw errorWithStatus('El precio de este paquete no está disponible.', 409, 'INVALID_LOCAL_PRICE')
+  const amount = Number(basis === 'SALDO' ? offer.price_saldo : offer.price_cup)
+  if (!Number.isSafeInteger(amount) || amount <= 0) throw errorWithStatus(`El precio de este paquete en ${basis === 'SALDO' ? 'Saldo Móvil' : 'CUP'} no está disponible.`, 409, 'INVALID_LOCAL_PRICE')
   const providerMeta = offer.package_data?.rechargegames || {}
   const providerCost = Number(providerMeta.provider_price_usdt ?? offer.base_cost_usd)
   if (!Number.isFinite(providerCost) || providerCost <= 0) throw errorWithStatus('El precio del paquete se está actualizando. Inténtalo más tarde.', 409, 'PROVIDER_PRICE_UNAVAILABLE')
@@ -265,15 +266,15 @@ async function createWalletGameOrder(client, body) {
     provider_region_name: offer.provider_region_name || providerMeta.region_name || null,
     provider_delivery: offer.provider_delivery || providerMeta.delivery,
     provider_kind: providerMeta.provider_kind || 'topup', provider_cost_usdt: providerCost,
-    price_basis: 'CUP', payment_amount: amount, payer_phone: null,
+    price_basis: basis, payment_amount: amount, payer_phone: null,
     player_id: playerId, server_id: serverId, buyer_ref: `SO-${id}`,
   }
   const { data: rpcData, error: rpcError } = await supabase.rpc('store_wallet_create_game_order', {
-    p_client_id: client.id, p_amount: amount, p_order: orderPayload, p_idempotency_key: idempotencyKey,
+    p_client_id: client.id, p_amount: amount, p_order: orderPayload, p_idempotency_key: idempotencyKey, p_currency: basis,
   })
   if (rpcError) {
     if (String(rpcError.message || '').includes('INSUFFICIENT_WALLET_BALANCE')) {
-      throw errorWithStatus('No tienes saldo suficiente en Wallet. Añade fondos o elige otro paquete.', 409, 'INSUFFICIENT_WALLET_BALANCE')
+      throw errorWithStatus(`No tienes suficiente saldo ${basis === 'SALDO' ? 'móvil' : 'CUP'} en Wallet. Añade fondos en esa moneda o elige otro paquete.`, 409, 'INSUFFICIENT_WALLET_BALANCE')
     }
     if (String(rpcError.message || '').includes('IDEMPOTENCY_KEY_REUSED')) throw errorWithStatus('Este intento ya se utilizó. Inicia una nueva compra.', 409, 'IDEMPOTENCY_KEY_REUSED')
     if (rpcError.code === '23505') throw errorWithStatus('Esta compra ya se está procesando. Revisa tu historial.', 409, 'ORDER_ALREADY_EXISTS')
@@ -282,7 +283,7 @@ async function createWalletGameOrder(client, body) {
   const rawOrder = rpcData?.order || rpcData
   const orderId = rawOrder?.id || id
   const createdOrder = rpcData?.order ? publicOrder(rpcData.order) : null
-  console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_DEBITED', order_id: orderId, client_id: client.id, amount_cup: amount, balance_cup: Number(rpcData?.balance_cup || 0) }))
+  console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_DEBITED', order_id: orderId, client_id: client.id, currency: basis, amount, balance_cup: Number(rpcData?.balance_cup || 0), balance_saldo: Number(rpcData?.balance_saldo || 0) }))
   // If the same idempotency key is replayed, return the existing order. The recovery
   // worker resolves a stale SUBMITTING_TO_PROVIDER state by buyer_ref, avoiding a
   // second concurrent provider submission while never leaving a crashed order behind.
@@ -312,7 +313,7 @@ async function createWalletGameOrder(client, body) {
       console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: orderId, code: refundError.code || 'REFUND_FAILED' }))
       notifyAdmins(`🚨 Devolución pendiente · ${makeTicket(orderId)}\nNo se pudo devolver automáticamente el saldo de Wallet. El sistema reintentará la operación; revisa la incidencia y no pidas otro pago al cliente.`).catch(() => {})
     } else {
-      console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUNDED', order_id: orderId, amount_cup: amount }))
+      console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUNDED', order_id: orderId, currency: basis, amount }))
     }
     // Return the authoritative persisted state, not the pre-refund response. The
     // RPC may have completed the refund even if this request began with REFUND_REQUIRED.
@@ -484,15 +485,11 @@ async function submitProviderOrder(orderId, { playerId = null, serverId = null }
   if (claimError) throw claimError
   if (!claiming) throw errorWithStatus('La compra ya está siendo procesada.', 409, 'ORDER_ALREADY_PROCESSING')
 
-  const body = {
-    product_key: order.provider_product_key,
-    product: order.provider_product_name || order.offer_title,
-    buyer_ref: order.buyer_ref,
-    quantity: 1,
-    ...(effectivePlayerId ? { player_id: effectivePlayerId } : {}),
-    ...(effectiveServerId ? { server_id: effectiveServerId } : {}),
+  const body = buildRechargeGamesOrderPayload(order, {
+    playerId: effectivePlayerId,
+    serverId: effectiveServerId,
     note: `SynthesisOne ${makeTicket(order.id)}`,
-  }
+  })
   try {
     let result
     try {
@@ -729,7 +726,13 @@ async function findProviderOrderByBuyerRef(buyerRef) {
   if (!buyerRef) return null
   const response = await rechargeGamesRequest('/v1/orders', { query: { buyer_ref: buyerRef, limit: 1 } })
   const data = response.data
-  const rows = Array.isArray(data) ? data : (data?.orders || data?.results || [])
+  // Keep compatibility with both the documented direct list and envelope variants
+  // used by gateways; never assume a wrapped response is empty and resubmit blindly.
+  const rows = Array.isArray(data) ? data
+    : Array.isArray(data?.orders) ? data.orders
+      : Array.isArray(data?.results) ? data.results
+        : Array.isArray(data?.data) ? data.data
+          : Array.isArray(data?.data?.orders) ? data.data.orders : []
   return rows.find(item => item?.buyer_ref === buyerRef) || null
 }
 
@@ -757,7 +760,7 @@ async function reconcileProcessingOrders() {
               .eq('payment_source', 'WALLET').is('wallet_refunded_at', null)
             if (rotateError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_RETRY_ROTATE_FAILED', order_id: order.id, code: rotateError.code || 'ROTATE_FAILED' }))
           } else if (!refundResult?.already_refunded) {
-            console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_RETRY_SUCCEEDED', order_id: order.id, amount_cup: Number(order.payment_amount) }))
+            console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_RETRY_SUCCEEDED', order_id: order.id, currency: String(order.price_basis || 'CUP').toUpperCase(), amount: Number(order.payment_amount) }))
             notifyAdmins(`✅ Devolución recuperada · ${makeTicket(order.id)}\nSe devolvieron ${order.payment_amount} CUP a la Wallet después de reintentar una operación pendiente.`).catch(() => {})
           }
         } catch (refundError) {
