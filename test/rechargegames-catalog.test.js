@@ -4,6 +4,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { normalizeCatalog } = require('../src/utils/rechargeGamesCatalogParser')
 const { clientSafePackageData } = require('../src/utils/clientSafePackageData')
+const { isConnectedRechargeGamesOffer, isLegacyEtecsaGame, packageDataForCatalog } = require('../src/utils/gameMarketCatalogSafety')
 
 const sample = {
   currency: 'USDT',
@@ -70,4 +71,34 @@ test('client catalog keeps the automatic-offer marker but hides wholesale provid
   assert.equal(safe.rechargegames.provider_price_usdt, undefined)
   assert.equal(safe.rechargegames.currency, undefined)
   assert.equal(safe.rechargegames.provider, undefined)
+})
+
+
+test('client-visible Game Market offers must be linked to a valid RechargeGames product key', () => {
+  assert.equal(isConnectedRechargeGamesOffer({ provider: 'rechargegames', provider_product_key: 'topup/free-fire/global/100 Diamonds' }), true)
+  assert.equal(isConnectedRechargeGamesOffer({ provider: null, provider_product_key: 'topup/free-fire/global/100 Diamonds' }), false)
+  assert.equal(isConnectedRechargeGamesOffer({ provider: 'rechargegames', provider_product_key: '' }), false)
+  assert.equal(isConnectedRechargeGamesOffer({ provider: 'rechargegames', provider_product_key: 'x'.repeat(301) }), false)
+})
+
+test('catalog package data restores region and delivery metadata from trusted provider columns without exposing SKU', () => {
+  const row = {
+    provider: 'rechargegames', provider_product_key: 'topup/mobile-legends/europe/86 Diamonds',
+    provider_game_slug: 'mobile-legends', provider_region_slug: 'europe', provider_region_name: 'Europe (EU)',
+    provider_delivery: 'player_id', provider_out_of_stock: false, package_data: {},
+  }
+  const client = packageDataForCatalog(row)
+  assert.equal(client.rechargegames.automatic, true)
+  assert.equal(client.rechargegames.game_slug, 'mobile-legends')
+  assert.equal(client.rechargegames.region_slug, 'europe')
+  assert.equal(client.rechargegames.region_name, 'Europe (EU)')
+  assert.equal(client.rechargegames.product_key, undefined)
+  const admin = packageDataForCatalog(row, { admin: true })
+  assert.equal(admin.rechargegames.automatic, true)
+})
+
+test('legacy ETECSA placeholder is recognized so live ETECSA catalog is not duplicated', () => {
+  assert.equal(isLegacyEtecsaGame({ name: 'ETECSA', slug: 'etecsa' }), true)
+  assert.equal(isLegacyEtecsaGame({ name: 'ETECSA / Soky', slug: 'etecsa-soky' }), true)
+  assert.equal(isLegacyEtecsaGame({ name: 'Free Fire', slug: 'free-fire' }), false)
 })
