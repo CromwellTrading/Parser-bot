@@ -2,7 +2,7 @@
 
 const supabase = require('../supabase')
 const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
-const { normalizeMarketPricing, calculateOfferPrices } = require('./gamePricing')
+const { DEFAULT_MARKET_PRICING, normalizeMarketPricing, calculateOfferPrices } = require('./gamePricing')
 
 const PROVIDER = 'rechargegames'
 const requestedRefreshInterval = Number(process.env.RECHARGEGAMES_CATALOG_REFRESH_MS || 3 * 60 * 60 * 1000)
@@ -28,9 +28,9 @@ async function getPlatformStoreId() {
 
 async function getPricingSettings() {
   const { data, error } = await supabase.from('synthesisone_settings')
-    .select('value').eq('key', 'game_market_pricing:normal').maybeSingle()
+    .select('value').eq('key', 'game_market_pricing:synthesisone').maybeSingle()
   if (error) throw error
-  return normalizeMarketPricing(data?.value)
+  return normalizeMarketPricing(data?.value || DEFAULT_MARKET_PRICING)
 }
 
 async function writeCatalogError(error) {
@@ -170,8 +170,8 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
       }
       const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
       if (stateError) throw stateError
-      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
-      return { ok: true, games: catalog.games.length, source_groups: catalog.stats.source_group_count, source_products: catalog.stats.source_product_count, products: offerRows.length, available_products: availableProducts, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, last_success_at: now }
+      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
+      return { ok: true, games: catalog.games.length, source_groups: catalog.stats.source_group_count, source_products: catalog.stats.source_product_count, products: offerRows.length, available_products: availableProducts, last_success_at: now }
     } catch (error) {
       await writeCatalogError(error)
       console.error('[RechargeGames] No se pudo actualizar el catálogo:', JSON.stringify({ code: error?.code || 'catalog_error', http_status: error?.status || null }))

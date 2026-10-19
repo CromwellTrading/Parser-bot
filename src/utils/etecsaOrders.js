@@ -8,8 +8,6 @@ const { getLicenseConfig, cardMatches } = require('./onboarding')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
 const { getCatalogResponse } = require('./etecsaCatalog')
-const { normalizePriceBasis } = require('./etecsaPricing')
-const { cleanProviderStatus, mapSokyLocalStatus } = require('./etecsaProviderStatus')
 const { normalizePayerPhone, isConfiguredPaymentReceiver, evaluateEtecsaPayment } = require('./etecsaPaymentMatching')
 const { evaluateOfficialStorePayment } = require('./walletPaymentMatching')
 const { findMatchingTopups } = require('./storeWallet')
@@ -29,6 +27,10 @@ function normalizeDestPhone(value) {
   return normalized.replace(/\D/g, '')
 }
 function isEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '')) }
+function cleanProviderStatus(value) {
+  const status = String(value || '').trim().toLowerCase()
+  return ['pending', 'completed', 'canceled'].includes(status) ? status : null
+}
 function orderIsBlocking(order) { return Boolean(order && CHECKOUT_LOCK_STATUSES.includes(order.status)) }
 
 function publicOrder(order) {
@@ -187,10 +189,10 @@ async function createPaymentOrder(client, body) {
 
   const offerId = normalizeText(body?.offer_id, 100)
   const priceId = normalizeText(body?.price_id, 100)
-  const basis = normalizePriceBasis(body?.price_basis)
+  const basis = String(body?.price_basis || '').trim().toUpperCase()
   const payerPhone = normalizePayerPhone(body?.payer_phone)
-  if (!offerId || !priceId || !basis) {
-    const error = new Error('Selecciona una oferta y una tarifa CUP/Saldo Móvil válidas.')
+  if (!offerId || !priceId || !['CUP', 'SALDO'].includes(basis)) {
+    const error = new Error('Selecciona una oferta y un precio válidos.')
     error.code = 'INVALID_OFFER_SELECTION'; error.status = 400; throw error
   }
   if (!/^5\d{7}$/.test(payerPhone)) {
@@ -425,8 +427,7 @@ async function syncProviderStatusForOrder(order) {
 }
 
 async function updateFromProviderStatus(order, data, providerStatus) {
-  const nextStatus = mapSokyLocalStatus(providerStatus, data)
-  if (!nextStatus) return order
+  const nextStatus = providerStatus === 'completed' ? 'COMPLETED' : providerStatus === 'canceled' ? 'REFUND_REQUIRED' : 'PROCESSING'
   if (order.status === nextStatus && order.provider_status === providerStatus && String(order.provider_reference || '') === String(data?.operator_reference || '')) return order
   const patch = {
     status: nextStatus,
@@ -612,22 +613,11 @@ async function workerTick() {
     .update({ status: 'EXPIRED', updated_at: now, failure_reason: 'PAYMENT_WINDOW_EXPIRED' })
     .eq('status', 'WAITING_PAYMENT').lt('payment_deadline_at', now)
   if (expiryError) console.error('No se pudieron expirar tickets ETECSA:', expiryError.message)
-  const [processingResult, queuedCompletedResult] = await Promise.all([
-    supabase.from('etecsa_orders').select('*').eq('status', 'PROCESSING')
-      .not('provider_recharge_id', 'is', null)
-      .order('updated_at', { ascending: true }).limit(30),
-    // Older deployments may already have marked a Soky app_token response as
-    // COMPLETED while Soky still had it queued. Keep polling those rows until
-    // the provider clears the queue or returns the final cancellation/refund.
-    supabase.from('etecsa_orders').select('*').eq('status', 'COMPLETED')
-      .eq('provider_payload->>provider_delivery_queued', 'true')
-      .not('provider_recharge_id', 'is', null)
-      .order('updated_at', { ascending: true }).limit(30),
-  ])
-  const failedRead = processingResult.error || queuedCompletedResult.error
-  if (failedRead) { console.error('No se pudieron consultar pedidos ETECSA en curso:', failedRead.message); return }
-  const orders = [...(processingResult.data || []), ...(queuedCompletedResult.data || [])]
-  for (const order of orders) await processProviderOrder(order)
+  const { data: orders, error } = await supabase.from('etecsa_orders')
+    .select('*').eq('status', 'PROCESSING').not('provider_recharge_id', 'is', null)
+    .order('updated_at', { ascending: true }).limit(30)
+  if (error) { console.error('No se pudieron consultar pedidos ETECSA en curso:', error.message); return }
+  for (const order of orders || []) await processProviderOrder(order)
 }
 
 function startEtecsaOrderWorker() {
