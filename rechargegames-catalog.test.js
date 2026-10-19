@@ -2,8 +2,8 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { normalizeCatalog } = require('../src/utils/rechargeGamesCatalogParser')
-const { clientSafePackageData } = require('../src/utils/clientSafePackageData')
+const { normalizeCatalog } = require('./src/utils/rechargeGamesCatalogParser')
+const { clientSafePackageData } = require('./src/utils/clientSafePackageData')
 
 const sample = {
   currency: 'USDT',

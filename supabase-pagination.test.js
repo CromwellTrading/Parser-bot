@@ -2,7 +2,7 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readAllRows } = require('../src/utils/supabasePagination')
+const { readAllRows } = require('./src/utils/supabasePagination')
 
 function fakeQuery(rows, pageErrors = new Map()) {
   return () => ({

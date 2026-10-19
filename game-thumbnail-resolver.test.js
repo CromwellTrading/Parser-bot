@@ -2,7 +2,7 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { pickImageUrl, relevanceScore, lookupWikipediaThumbnail } = require('../src/utils/gameThumbnailResolver')
+const { pickImageUrl, relevanceScore, lookupWikipediaThumbnail } = require('./src/utils/gameThumbnailResolver')
 
 test('extracts safe thumbnail URLs from optional provider metadata fields', () => {
   assert.equal(pickImageUrl({ thumbnail_url: 'https://cdn.example.test/game.png' }), 'https://cdn.example.test/game.png')
