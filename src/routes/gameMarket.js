@@ -17,6 +17,7 @@ const KYC_BUCKET = 'so-reseller-kyc'
 const MAX_IMAGE_BYTES = 1_500_000
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
 const THEMES = new Set(['violet', 'light', 'red', 'green', 'cyan'])
+const LAYOUT_STYLES = new Set(['hybrid', 'glass', 'minimal'])
 const RESELLER_STATUSES = new Set(['pending_review', 'changes_requested', 'approved_awaiting_deposit', 'active', 'rejected', 'suspended', 'expired'])
 
 function tokenFrom(req) {
@@ -212,7 +213,7 @@ router.get('/profile', requiredClient, async (req, res) => {
     const id = String(req.client.id)
     const { data, error } = await supabase.from('synthesisone_profiles').select('*').eq('client_id', id).maybeSingle()
     if (error) throw error
-    const profile = data || { client_id: id, display_name: req.client.name || '', theme: 'violet', age: null, province: null, municipality: null, username: null, avatar_path: null, display_name_public: false, avatar_public: false, age_public: false, location_public: false, local_data_imported: false }
+    const profile = data || { client_id: id, display_name: req.client.name || '', theme: 'violet', layout_style: 'hybrid', age: null, province: null, municipality: null, username: null, avatar_path: null, display_name_public: false, avatar_public: false, age_public: false, location_public: false, local_data_imported: false }
     return res.json({ ok: true, profile: { ...profile, avatar_url: await signedUrl(AVATAR_BUCKET, profile.avatar_path, 3600), avatar_path: undefined } })
   } catch (e) { return sendError(res, e, 'GET market profile') }
 })
@@ -227,6 +228,7 @@ router.put('/profile', requiredClient, async (req, res) => {
       patch.username = u || null
     }
     if ('theme' in b) { const t = String(b.theme || 'violet'); if (!THEMES.has(t)) throw fail(400, 'Tema no válido'); patch.theme = t }
+    if ('layout_style' in b) { const style = String(b.layout_style || 'hybrid'); if (!LAYOUT_STYLES.has(style)) throw fail(400, 'Diseño no válido'); patch.layout_style = style }
     for (const [field, max] of [['province', 80], ['municipality', 100]]) if (field in b) patch[field] = cleanText(b[field], max)
     if ('age' in b) { const a = b.age === null || b.age === '' ? null : number(b.age, 'age', { min: 1, max: 120 }); patch.age = a }
     for (const f of ['display_name_public', 'avatar_public', 'age_public', 'location_public']) if (f in b) { if (typeof b[f] !== 'boolean') throw fail(400, `${f} debe ser booleano`); patch[f] = b[f] }
@@ -254,6 +256,7 @@ router.post('/profile/import-local', requiredClient, async (req, res) => {
       }
     }
     if (!current?.theme && THEMES.has(String(b.theme))) patch.theme = String(b.theme)
+    if ((!current?.layout_style || !LAYOUT_STYLES.has(String(current.layout_style))) && LAYOUT_STYLES.has(String(b.layout_style))) patch.layout_style = String(b.layout_style)
     if (!current?.province && cleanText(b.province, 80)) patch.province = cleanText(b.province, 80)
     if (!current?.municipality && cleanText(b.municipality, 100)) patch.municipality = cleanText(b.municipality, 100)
     if ((current?.age === null || current?.age === undefined) && b.age !== null && b.age !== '' && b.age !== undefined) {
