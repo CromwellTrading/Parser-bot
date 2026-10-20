@@ -21,7 +21,7 @@ const RESELLER_STATUSES = new Set(['pending_review', 'changes_requested', 'appro
 function tokenFrom(req) {
   const auth = String(req.headers.authorization || '')
   if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim() || null
-  return req.body?.token || req.query?.token || req.headers['x-client-token'] || null
+  return req.headers['x-client-token'] || null
 }
 function fail(status, message) { const e = new Error(message); e.status = status; return e }
 function cleanText(value, max = 500) {

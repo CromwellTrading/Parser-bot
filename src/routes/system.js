@@ -7,7 +7,7 @@ const { getAutomationAvailability, setAutomationAvailability } = require('../uti
 function extractToken(req) {
   const auth = String(req.headers.authorization || '')
   if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim() || null
-  return req.body?.token || req.query?.token || req.headers['x-client-token'] || null
+  return req.headers['x-client-token'] || null
 }
 
 async function getRequestClient(req, res) {

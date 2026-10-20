@@ -24,7 +24,7 @@ const router = express.Router()
 function extractToken(req) {
   const header = String(req.headers.authorization || '')
   if (header.toLowerCase().startsWith('bearer ')) return header.slice(7).trim() || null
-  return req.body?.token || req.query?.token || req.headers['x-client-token'] || null
+  return req.headers['x-client-token'] || null
 }
 
 function isExpired(expiresAt) {
