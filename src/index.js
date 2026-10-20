@@ -51,12 +51,23 @@ app.use('/api/store', storeAccountRoutes)
 app.use('/api/store-session', storeSessionRoutes)
 
 app.get('/healthz', (req, res) => res.status(200).json({ ok: true, status: 'HEALTHY' }))
-app.get('/readyz', async (req, res) => {
+app.get('/readyz', async (_req, res) => {
   try {
-    const { error } = await supabase.from('clients').select('id', { head: true, count: 'exact' }).limit(1)
-    if (error) throw error
-    return res.status(200).json({ ok: true, status: 'READY', database: 'UP' })
-  } catch (_) {
+    // Liveness alone is not sufficient for payments. Validate the critical tables
+    // and columns needed for dual-currency Wallet reconciliation and refunds.
+    const checks = await Promise.all([
+      supabase.from('clients').select('id', { head: true, count: 'exact' }).limit(1),
+      supabase.from('store_wallets').select('balance_cup,balance_saldo', { head: true, count: 'exact' }).limit(1),
+      supabase.from('store_wallet_transactions').select('currency,amount_cup,amount_saldo,balance_after_cup,balance_after_saldo', { head: true, count: 'exact' }).limit(1),
+      supabase.from('store_wallet_topups').select('currency,amount_cup,amount_saldo,payment_review_at', { head: true, count: 'exact' }).limit(1),
+      supabase.from('game_recharge_orders').select('price_basis,payment_source,wallet_refunded_at', { head: true, count: 'exact' }).limit(1),
+    ])
+    const failed = checks.find(result => result?.error)
+    if (failed) throw failed.error
+    return res.status(200).json({ ok: true, status: 'READY', database: 'UP', checks: { database: 'ok', dual_currency_wallet: 'ok', refund_tracking: 'ok' } })
+  } catch (error) {
+    // Do not leak schema/table names or SQL errors into public health responses.
+    console.error(JSON.stringify({ event: 'READY_CHECK_FAILED', code: error?.code || null }))
     return res.status(503).json({ ok: false, status: 'NOT_READY', database: 'DOWN' })
   }
 })
