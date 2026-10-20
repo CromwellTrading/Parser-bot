@@ -2,7 +2,7 @@
 
 const supabase = require('../supabase')
 const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
-const { DEFAULT_MARKET_PRICING, normalizeMarketPricing, calculateOfferPrices } = require('./gamePricing')
+const { normalizeMarketPricing, calculateOfferPrices } = require('./gamePricing')
 
 const PROVIDER = 'rechargegames'
 const requestedRefreshInterval = Number(process.env.RECHARGEGAMES_CATALOG_REFRESH_MS || 3 * 60 * 60 * 1000)
@@ -28,9 +28,9 @@ async function getPlatformStoreId() {
 
 async function getPricingSettings() {
   const { data, error } = await supabase.from('synthesisone_settings')
-    .select('value').eq('key', 'game_market_pricing:synthesisone').maybeSingle()
+    .select('value').eq('key', 'game_market_pricing:normal').maybeSingle()
   if (error) throw error
-  return normalizeMarketPricing(data?.value || DEFAULT_MARKET_PRICING)
+  return normalizeMarketPricing(data?.value)
 }
 
 async function writeCatalogError(error) {
@@ -49,6 +49,8 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
   if (refreshInFlight) return refreshInFlight
   refreshInFlight = (async () => {
     const startedAt = new Date().toISOString()
+    let targetStoreId = null
+    let offerWriteStarted = false
     try {
       const response = await rechargeGamesRequest('/v1/products', { query: { all: 'true' } })
       const catalog = normalizeCatalog(response.data)
@@ -56,6 +58,7 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
         throw new RechargeGamesApiError('RechargeGames catalog did not contain any priced products', { status: 502, code: 'empty_catalog' })
       }
       const storeId = await getPlatformStoreId()
+      targetStoreId = storeId
       const pricing = await getPricingSettings()
       const now = new Date().toISOString()
       const gameIds = new Map()
@@ -137,8 +140,10 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
           auto_pricing: true,
           price_cup: prices.price_cup,
           price_saldo: prices.price_saldo,
-          available: !product.out_of_stock,
-          published: true,
+          // Stage all rows hidden/unavailable. A failed multi-chunk refresh must
+          // never publish a partial mix of old and new buyable prices.
+          available: false,
+          published: false,
           sort_order: 0,
           updated_at: now,
         })
@@ -146,16 +151,33 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
 
       for (let i = 0; i < offerRows.length; i += 100) {
         const chunk = offerRows.slice(i, i + 100)
+        offerWriteStarted = true
         const { error } = await supabase.from('game_market_offers')
           .upsert(chunk, { onConflict: 'store_id,provider,provider_product_key' })
         if (error) throw error
       }
 
       // Offers removed by the provider remain in history but disappear from the buyable catalog.
-      const { error: staleError } = await supabase.from('game_market_offers')
+      const staleUpdate = await supabase.from('game_market_offers')
         .update({ available: false, published: false, updated_at: now })
         .eq('store_id', storeId).eq('provider', PROVIDER).lt('provider_last_seen_at', now)
-      if (staleError) throw staleError
+      if (staleUpdate.error) throw staleUpdate.error
+      const staleNullUpdate = await supabase.from('game_market_offers')
+        .update({ available: false, published: false, updated_at: now })
+        .eq('store_id', storeId).eq('provider', PROVIDER).is('provider_last_seen_at', null)
+      if (staleNullUpdate.error) throw staleNullUpdate.error
+
+      // Commit publication only after every catalog page was persisted and stale rows disabled.
+      // The first update keeps every new/current offer visible only as unavailable; a failure
+      // before the second update cannot create a purchasable partial catalog.
+      const publication = await supabase.from('game_market_offers')
+        .update({ published: true, available: false, updated_at: now })
+        .eq('store_id', storeId).eq('provider', PROVIDER).eq('provider_last_seen_at', now)
+      if (publication.error) throw publication.error
+      const availability = await supabase.from('game_market_offers')
+        .update({ available: true, updated_at: now })
+        .eq('store_id', storeId).eq('provider', PROVIDER).eq('provider_last_seen_at', now).eq('provider_out_of_stock', false)
+      if (availability.error) throw availability.error
 
       const availableProducts = catalog.products.filter(product => !product.out_of_stock).length
       const state = {
@@ -170,9 +192,21 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
       }
       const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
       if (stateError) throw stateError
-      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
-      return { ok: true, games: catalog.games.length, source_groups: catalog.stats.source_group_count, source_products: catalog.stats.source_product_count, products: offerRows.length, available_products: availableProducts, last_success_at: now }
+      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
+      return { ok: true, games: catalog.games.length, source_groups: catalog.stats.source_group_count, source_products: catalog.stats.source_product_count, products: offerRows.length, available_products: availableProducts, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, last_success_at: now }
     } catch (error) {
+      // If persistence began but the refresh did not commit, fail closed instead of leaving
+      // a mixed partial catalog that might expose obsolete prices to customer checkout.
+      if (offerWriteStarted && targetStoreId) {
+        try {
+          const { error: disableError } = await supabase.from('game_market_offers')
+            .update({ available: false, published: false, updated_at: new Date().toISOString() })
+            .eq('store_id', targetStoreId).eq('provider', PROVIDER)
+          if (disableError) console.error('[RechargeGames] No se pudo cerrar el catálogo parcial:', String(disableError.message || 'unknown').slice(0, 160))
+        } catch (disableError) {
+          console.error('[RechargeGames] No se pudo cerrar el catálogo parcial:', String(disableError?.message || 'unknown').slice(0, 160))
+        }
+      }
       await writeCatalogError(error)
       console.error('[RechargeGames] No se pudo actualizar el catálogo:', JSON.stringify({ code: error?.code || 'catalog_error', http_status: error?.status || null }))
       throw error
