@@ -5,6 +5,7 @@ const crypto = require('crypto')
 const supabase = require('../supabase')
 const { isConnectedRechargeGamesOffer, isLegacyEtecsaGame, packageDataForCatalog } = require('../utils/gameMarketCatalogSafety')
 const { requireNonRevokedToken } = require('../utils/tokenState')
+const { canAccessGameMarket } = require('../utils/storeSessionAccess')
 const { bot, ADMINS } = require('../telegram')
 const { roundToStep, computePrices, normalizeMarketPricing } = require('../utils/gamePricing')
 const { readAllRows } = require('../utils/supabasePagination')
@@ -21,7 +22,7 @@ const RESELLER_STATUSES = new Set(['pending_review', 'changes_requested', 'appro
 function tokenFrom(req) {
   const auth = String(req.headers.authorization || '')
   if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim() || null
-  return req.headers['x-client-token'] || null
+  return req.body?.token || req.query?.token || req.headers['x-client-token'] || null
 }
 function fail(status, message) { const e = new Error(message); e.status = status; return e }
 function cleanText(value, max = 500) {
@@ -43,11 +44,17 @@ async function optionalClient(token, req = null) {
   if (!token) return null
   await requireNonRevokedToken(token)
   const { data, error } = await supabase.from('clients')
-    .select('id, name, token, active, token_used, device_id, expires_at, role, wallet, phone_number')
+    .select('id, name, token, active, token_used, device_id, expires_at, role, wallet, phone_number, store_only')
     .eq('token', token).maybeSingle()
   if (error) throw error
   if (!data) throw fail(401, 'Token inválido')
-  if (data.active === false || isExpired(data.expires_at)) throw fail(403, 'Licencia inactiva o expirada')
+  // A free store session is intentionally stored with active=false. It may read
+  // only GET /catalog; profile edits, KYC, admin and all other routes still fail.
+  if (!canAccessGameMarket(data, req?.method, req?.path)) {
+    throw fail(403, data.store_only === true
+      ? 'La sesión gratuita solo puede consultar el catálogo oficial.'
+      : 'Licencia inactiva o expirada')
+  }
   // Keep Game Market and KYC bound to the same device that existing license verification authorized.
   // This endpoint must not create a way to reuse a copied token on another phone.
   const boundDevice = String(data.device_id || '').trim()
