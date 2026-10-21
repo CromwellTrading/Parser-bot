@@ -39,7 +39,7 @@ test('each Transfermóvil transaction ID can be claimed for only one official st
 test('automatic wallet refunds are restricted to failed wallet-funded orders and are idempotent', () => {
   assert.match(migration, /v_order\.payment_source <> 'WALLET' OR v_order\.status <> 'REFUND_REQUIRED'/)
   assert.match(migration, /reference_type = 'GAME_RECHARGE_REFUND'/)
-  assert.match(walletSource, /row\.kind === 'SPEND' && row\.reference_type === 'GAME_RECHARGE'/)
+  assert.match(walletSource, /row\.kind === 'SPEND' && \['GAME_RECHARGE', 'STORE_CART'\]\.includes\(String\(row\.reference_type \|\| ''\)\.toUpperCase\(\)\)/)
 })
 
 
@@ -73,7 +73,7 @@ test('Android shows a manual refresh button and requests the reconciliation endp
   if (!mainActivitySource) return t.skip('Android app se comprueba en el repositorio SMS-relay')
   assert.match(mainActivitySource, /setNeutralButton\("🔄 ACTUALIZAR", null\)/)
   assert.match(mainActivitySource, /wallet\/topups\/\$id\/refresh/)
-  assert.match(mainActivitySource, /Saldo actual confirmado:/)
+  assert.match(mainActivitySource, /Saldos actuales independientes:/)
 })
 
 
@@ -138,7 +138,9 @@ test('Wallet-funded game orders refuse to spend when the balance and ledger are 
 })
 
 test('wallet refund reconciliation retries pending refunds even if provider configuration is unavailable', () => {
-  assert.match(gameOrdersSource, /status', 'REFUND_REQUIRED'[\s\S]*?wallet_refunded_at[\s\S]*?store_wallet_refund_game_order/)
+  assert.match(gameOrdersSource, /async function refundFailedWalletOrder\(orderId\)[\s\S]*?store_wallet_refund_cart_item[\s\S]*?store_wallet_refund_game_order/)
+  assert.match(gameOrdersSource, /GAME_RECHARGE_WALLET_REFUND_RETRY_SUCCEEDED/)
+  assert.match(gameOrdersSource, /wallet_refunded_at', null[\s\S]*?refundFailedWalletOrder\(order\.id\)/)
   const reconcile = gameOrdersSource.indexOf('async function reconcileProcessingOrders()')
   const retrySuccess = gameOrdersSource.indexOf('GAME_RECHARGE_WALLET_REFUND_RETRY_SUCCEEDED', reconcile)
   const providerGate = gameOrdersSource.indexOf("if (!String(process.env.RECHARGEGAMES_API_KEY", reconcile)
@@ -158,7 +160,7 @@ test('potential payment with exact amount and destination but a delayed bank tim
 
 test('Android never interprets a missing Wallet balance as zero at checkout', (t) => {
   if (!mainActivitySource) return t.skip('Android app se comprueba en el repositorio SMS-relay')
-  assert.match(mainActivitySource, /Saldo no confirmado[\s\S]*?val balance = wallet\.optDouble\("balance_cup", Double\.NaN\)/)
+  assert.match(mainActivitySource, /Saldo no confirmado[\s\S]*?val balanceCup = wallet\.optDouble\("balance_cup", Double\.NaN\)/)
   assert.doesNotMatch(mainActivitySource, /optDouble\("balance_cup", 0\.0\)/)
 })
 
@@ -201,7 +203,7 @@ test('an immediate Wallet refund returns the final server state instead of stale
   assert.match(walletPurchase, /const submitted = await submitProviderOrder|submitted = await submitProviderOrder/)
   assert.match(walletPurchase, /GAME_RECHARGE_WALLET_SUBMISSION_DEFERRED/)
   assert.match(walletPurchase, /let finalSubmitted = submitted/)
-  assert.match(walletPurchase, /store_wallet_refund_game_order/)
+  assert.match(walletPurchase, /refundFailedWalletOrder\(orderId\)/)
   assert.match(walletPurchase, /select\('\*'\)\.eq\('id', orderId\)\.maybeSingle\(\)/)
   assert.match(walletPurchase, /if \(refreshed\) finalSubmitted = publicOrder\(refreshed\)/)
 })
