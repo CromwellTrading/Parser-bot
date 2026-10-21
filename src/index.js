@@ -35,6 +35,8 @@ const etecsaRoutes = require('./routes/etecsa')
 const gameRechargesRoutes = require('./routes/gameRecharges')
 const storeAccountRoutes = require('./routes/storeAccount')
 const storeSessionRoutes = require('./routes/storeSession')
+const rewardsRoutes = require('./routes/rewards')
+const storeCartRoutes = require('./routes/storeCart')
 
 app.use('/api/auth', authRoutes)
 app.use('/api/sms', smsRoutes)
@@ -49,6 +51,8 @@ app.use('/api/etecsa', etecsaRoutes)
 app.use('/api/game-recharges', gameRechargesRoutes)
 app.use('/api/store', storeAccountRoutes)
 app.use('/api/store-session', storeSessionRoutes)
+app.use('/api/rewards', rewardsRoutes)
+app.use('/api/store/cart', storeCartRoutes)
 
 app.get('/healthz', (req, res) => res.status(200).json({ ok: true, status: 'HEALTHY' }))
 app.get('/readyz', async (_req, res) => {
@@ -64,6 +68,8 @@ app.get('/readyz', async (_req, res) => {
     ])
     const failed = checks.find(result => result?.error)
     if (failed) throw failed.error
+    // Rewards/cart are optional modules: their migrations must not gate service readiness
+    // or stop existing customers from reaching payments during staged rollout.
     return res.status(200).json({ ok: true, status: 'READY', database: 'UP', checks: { database: 'ok', dual_currency_wallet: 'ok', refund_tracking: 'ok' } })
   } catch (error) {
     // Do not leak schema/table names or SQL errors into public health responses.
@@ -84,6 +90,7 @@ function startWorkers() {
   require('./utils/rechargeGamesCatalog').startRechargeGamesCatalogWorker()
   require('./utils/rechargeGamesOrders').startRechargeGamesOrderWorker()
   require('./utils/paymentSmsReconciler').startPaymentSmsReconciler()
+  require('./utils/storeCartOrders').startStoreCartWorker()
   require('./utils/healthMonitor').startHealthMonitor()
 }
 
