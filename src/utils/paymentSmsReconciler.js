@@ -5,6 +5,7 @@ const { parseSms } = require('./parser')
 const { processIncomingTransfer: processEtecsaTransfer } = require('./etecsaOrders')
 const { processIncomingTransfer: processGameTransfer } = require('./rechargeGamesOrders')
 const { processIncomingTransfer: processWalletTransfer } = require('./storeWallet')
+const { processIncomingTransfer: processCartTransfer, getCartFeatureStatus } = require('./storeCartOrders')
 const { readAllRows } = require('./supabasePagination')
 
 let started = false
@@ -33,12 +34,14 @@ async function reconcileRecentPaymentSms() {
     // Don't repeatedly scan old SMS if no store ticket can currently be paid/reconciled.
     // EXPIRED tickets stay eligible only when their bank transaction timestamp proves it
     // happened during the ticket window (enforced by each payment matcher).
-    const [etecsaTickets, gameTickets, walletTickets] = await Promise.all([
+    const cartAvailable = await getCartFeatureStatus().then(v => v.enabled).catch(() => false)
+    const [etecsaTickets, gameTickets, walletTickets, cartTickets] = await Promise.all([
       supabase.from('etecsa_orders').select('created_at').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }).limit(1000),
       supabase.from('game_recharge_orders').select('created_at').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }).limit(1000),
       supabase.from('store_wallet_topups').select('created_at').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }).limit(1000),
+      ...(cartAvailable ? [supabase.from('store_cart_orders').select('created_at').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }).limit(1000)] : []),
     ])
-    for (const result of [etecsaTickets, gameTickets, walletTickets]) if (result.error) throw result.error
+    for (const result of [etecsaTickets, gameTickets, walletTickets, ...((cartAvailable && cartTickets) ? [cartTickets] : [])]) if (result.error) throw result.error
     // Do not cap reviewed completed tickets at an arbitrary 100: a customer's successful
     // credit may need ledger repair after a past partial/manual operation.
     const reviewedCompletedWallet = await readAllRows(() => supabase.from('store_wallet_topups')
@@ -58,7 +61,7 @@ async function reconcileRecentPaymentSms() {
       if (error) console.error(JSON.stringify({ ts: new Date().toISOString(), event: 'PAYMENT_RECONCILE_COMPLETED_WALLET_REPAIR_FAILED', topup_id: topup.id, code: error.code || null, message: String(error.message || 'unknown').slice(0, 160) }))
       else console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'PAYMENT_RECONCILE_COMPLETED_WALLET_REPAIR_OK', topup_id: topup.id }))
     }
-    const tickets = [...(etecsaTickets.data || []), ...(gameTickets.data || []), ...(walletTickets.data || [])]
+    const tickets = [...(etecsaTickets.data || []), ...(gameTickets.data || []), ...(walletTickets.data || []), ...((cartAvailable && cartTickets) ? (cartTickets.data || []) : [])]
     if (!tickets.length) return { scanned: 0, matched: 0, skipped: true, reason: reviewedCompletedWallet.length ? 'REVIEWED_WALLET_RECONCILED' : 'NO_RECONCILABLE_TICKETS' }
     const oldestTicketMs = Math.min(...tickets.map(row => Date.parse(row.created_at || '')).filter(Number.isFinite))
     const cutoffMs = Number.isFinite(oldestTicketMs) ? Math.max(lookbackCutoffMs, oldestTicketMs - 2 * 60 * 1000) : lookbackCutoffMs
@@ -109,24 +112,28 @@ async function reconcileRecentPaymentSms() {
       let etecsa = null
       let game = null
       let wallet = null
-      if (validCupPayment) {
+      let cart = null
+      let ambiguousCart = false
+      if (validCupPayment && cartAvailable) {
         try {
-          etecsa = await processEtecsaTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
+          cart = await processCartTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
+          ambiguousCart = cart?.ambiguous === true
         } catch (error) {
-          console.error('[PaymentReconciler] ETECSA match failed:', error?.code || error?.message || 'unknown')
-        }
-        try {
-          game = await processGameTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
-        } catch (error) {
-          console.error('[PaymentReconciler] Game match failed:', error?.code || error?.message || 'unknown')
+          console.error('[PaymentReconciler] Cart match failed:', error?.code || error?.message || 'unknown')
+          ambiguousCart = true
         }
       }
-      try {
-        wallet = await processWalletTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id })
-      } catch (error) {
-        console.error('[PaymentReconciler] Wallet match failed:', JSON.stringify({ sms_log_id: row.id, code: error?.code || null, message: String(error?.message || 'unknown').slice(0, 160) }))
+      if (validCupPayment && !cart && !ambiguousCart) {
+        try { etecsa = await processEtecsaTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id }) }
+        catch (error) { console.error('[PaymentReconciler] ETECSA match failed:', error?.code || error?.message || 'unknown') }
+        try { game = await processGameTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id }) }
+        catch (error) { console.error('[PaymentReconciler] Game match failed:', error?.code || error?.message || 'unknown') }
       }
-      if (etecsa || game || wallet) matched += 1
+      if (!ambiguousCart && !cart) {
+        try { wallet = await processWalletTransfer({ client, parsed, receivedAt: row.received_at, smsLogId: row.id }) }
+        catch (error) { console.error('[PaymentReconciler] Wallet match failed:', JSON.stringify({ sms_log_id: row.id, code: error?.code || null, message: String(error?.message || 'unknown').slice(0, 160) })) }
+      }
+      if (etecsa || game || wallet || (cart && !cart.ambiguous)) matched += 1
     }
     if (rowCapReached) {
       console.warn(JSON.stringify({ ts: new Date().toISOString(), event: 'PAYMENT_RECONCILE_ROW_CAP_REACHED', max_rows: MAX_SMS_ROWS, lookback_hours: LOOKBACK_HOURS, cutoff }))

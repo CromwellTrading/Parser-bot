@@ -14,6 +14,8 @@ const { normalizePayerPhone, isConfiguredPaymentReceiver, evaluateEtecsaPayment 
 const { evaluateOfficialStorePayment } = require('./walletPaymentMatching')
 const { findMatchingTopups } = require('./storeWallet')
 const { claimPaymentTransaction } = require('./paymentTransactionClaims')
+const { calculateDiscount, reserveDiscount, releaseDiscount, finalizePaidOrder } = require('./rewards')
+const { assertNoWaitingCart } = require('./cartFeaturePolicy')
 
 const SOKY_API_BASE = 'https://api.sokyrecargas.com/api/v1'
 const PAYMENT_WINDOW_MS = 30 * 60 * 1000
@@ -21,6 +23,7 @@ const CHECKOUT_LOCK_STATUSES = ['WAITING_PAYMENT']
 let workerStarted = false
 
 function nowIso() { return new Date().toISOString() }
+function errorWithStatus(message, status = 400, code = 'ETECSA_ERROR') { const error = new Error(message); error.status = status; error.code = code; return error }
 function normalizeText(value, max = 300) {
   return String(value || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max)
 }
@@ -44,6 +47,10 @@ function publicOrder(order) {
     price_label: order.price_label,
     price_basis: order.price_basis,
     amount: Number(order.payment_amount),
+    base_amount: Number(order.reward_base_amount || order.payment_amount),
+    discount_percent: Number(order.reward_discount_percent || 0),
+    discount_amount: Number(order.reward_discount_amount || 0),
+    welcome_discount: order.welcome_discount === true,
     currency: 'CUP',
     payer_phone: order.payer_phone,
     created_at: order.created_at,
@@ -83,6 +90,7 @@ async function expireOrderIfNeeded(order) {
     .eq('id', order.id).eq('status', 'WAITING_PAYMENT')
     .select('*').maybeSingle()
   if (error) throw error
+  if (data) await releaseDiscount(order.client_id, { reward_coupon_id: order.reward_coupon_id, welcome_discount: order.welcome_discount }, `ETECSA:${order.id}`).catch(() => {})
   return data || order
 }
 
@@ -139,6 +147,7 @@ async function getCheckoutConfig() {
 }
 
 async function createPaymentOrder(client, body) {
+  await assertNoWaitingCart(client.id)
   const automation = await getAutomationAvailability()
   if (!automation.enabled) {
     const error = new Error(automation.message || 'Las automatizaciones están temporalmente desactivadas.')
@@ -205,11 +214,13 @@ async function createPaymentOrder(client, body) {
     const error = new Error('La oferta ya no está disponible. Actualiza el catálogo y vuelve a seleccionarla.')
     error.code = 'ETECSA_OFFER_UNAVAILABLE'; error.status = 409; throw error
   }
-  const amount = basis === 'CUP' ? Number(price.price_cup) : Number(price.price_saldo)
-  if (!Number.isSafeInteger(amount) || amount <= 0) {
+  const baseAmount = basis === 'CUP' ? Number(price.price_cup) : Number(price.price_saldo)
+  if (!Number.isSafeInteger(baseAmount) || baseAmount <= 0) {
     const error = new Error('El precio seleccionado no es válido. Vuelve a cargar el catálogo.')
     error.code = 'ETECSA_INVALID_PRICE'; error.status = 409; throw error
   }
+  const discount = await calculateDiscount(client, { amount: baseAmount, currency: basis, couponCode: body?.coupon_code, source: 'ETECSA' })
+  const amount = discount.finalAmount
 
   const createdAt = new Date()
   const deadline = new Date(createdAt.getTime() + PAYMENT_WINDOW_MS)
@@ -222,6 +233,11 @@ async function createPaymentOrder(client, body) {
     price_label: normalizeText(price.label, 120),
     price_basis: basis,
     payment_amount: amount,
+    ...(discount.featureEnabled ? {
+      reward_base_amount: baseAmount, reward_discount_percent: discount.discountPercent || null,
+      reward_discount_amount: discount.discountAmount || 0, reward_coupon_id: discount.couponId || null,
+      welcome_discount: discount.welcomeDiscount === true,
+    } : {}),
     payer_phone: payerPhone,
     destination_card: paymentConfig.paymentCard,
     confirmation_phone: paymentConfig.paymentPhone,
@@ -242,7 +258,13 @@ async function createPaymentOrder(client, body) {
     }
     throw error
   }
-  notifyAdmins(`🧾 Ticket ETECSA creado · ${publicOrder(order).ticket}\nProducto: ${order.offer_name} · ${order.price_label}\nImporte: ${amount} CUP\nTarjeta destino: ${order.destination_card}\nTeléfono a confirmar: ${order.confirmation_phone}\nPagador: ${payerPhone}\nEstado: esperando pago`).catch(() => {})
+  const orderRef = `ETECSA:${order.id}`
+  const reserved = await reserveDiscount(client.id, discount, orderRef)
+  if (!reserved) {
+    await supabase.from('etecsa_orders').update({ status: 'CANCELED', canceled_at: nowIso(), failure_reason: 'REWARD_RESERVATION_FAILED', updated_at: nowIso() }).eq('id', order.id).eq('status', 'WAITING_PAYMENT')
+    throw errorWithStatus('El cupón acaba de utilizarse en otra compra. Actualiza tus cupones e inténtalo de nuevo.', 409, 'COUPON_RESERVATION_FAILED')
+  }
+  notifyAdmins(`🧾 Ticket ETECSA creado · ${publicOrder(order).ticket}\nProducto: ${order.offer_name} · ${order.price_label}\nImporte: ${amount} CUP${discount.discountAmount ? `\nDescuento: ${discount.discountPercent}% (-${discount.discountAmount} CUP)` : ''}\nTarjeta destino: ${order.destination_card}\nTeléfono a confirmar: ${order.confirmation_phone}\nPagador: ${payerPhone}\nEstado: esperando pago`).catch(() => {})
   console.log(JSON.stringify({ ts: nowIso(), event: 'ETECSA_ORDER_CREATED', order_id: order.id, client_id: client.id, status: order.status, amount }))
   return publicOrder(order)
 }
@@ -266,6 +288,7 @@ async function cancelPaymentOrder(clientId, orderId) {
   if (!updated) {
     const e = new Error('La operación cambió de estado y no se pudo cancelar.'); e.status = 409; e.code = 'ETECSA_ORDER_STATE_CHANGED'; throw e
   }
+  await releaseDiscount(clientId, { reward_coupon_id: updated.reward_coupon_id, welcome_discount: updated.welcome_discount }, `ETECSA:${updated.id}`).catch(() => {})
   return publicOrder(updated)
 }
 
@@ -374,6 +397,7 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     throw error
   }
   if (!updated) return null
+  await finalizePaidOrder(client, { source: 'ETECSA', order: updated })
   console.log(JSON.stringify({ ts: nowIso(), event: 'ETECSA_PAYMENT_MATCHED', order_id: updated.id, client_id: client.id, transaction_id: updated.payment_transaction_id || null }))
   await notifyAdmins(`✅ Pago ETECSA detectado · ${publicOrder(updated).ticket}\nProducto: ${updated.offer_name} · ${updated.price_label}\nImporte: ${updated.payment_amount} CUP\nPagador: ${updated.payer_phone}\nEl cliente debe completar los datos del destinatario.`)
   return { order_id: updated.id, status: updated.status, ticket: publicOrder(updated).ticket }

@@ -6,6 +6,7 @@ const { getLicenseConfig } = require('./onboarding')
 const { normalizePhone, parseSms } = require('./parser')
 const { readAllRows } = require('./supabasePagination')
 const { normalizePayerPhone, isConfiguredPaymentReceiver } = require('./etecsaPaymentMatching')
+const { assertNoWaitingCart } = require('./cartFeaturePolicy')
 const { evaluateOfficialStorePayment, evaluateWalletTopupPayment, evaluateSaldoWalletTransfer, isPotentialWalletTopupPayment } = require('./walletPaymentMatching')
 const { claimPaymentTransaction } = require('./paymentTransactionClaims')
 const { bot, ADMINS } = require('../telegram')
@@ -224,6 +225,7 @@ El sistema no modificó los saldos. Revisa los registros y no pidas al cliente q
 }
 
 async function assertNoActiveCheckout(clientId) {
+  await assertNoWaitingCart(clientId)
   const [etecsa, game, topup] = await Promise.all([
     supabase.from('etecsa_orders').select('id,status,payment_deadline_at').eq('client_id', clientId).eq('status', 'WAITING_PAYMENT').limit(1),
     supabase.from('game_recharge_orders').select('id,status,payment_deadline_at').eq('client_id', clientId).eq('status', 'WAITING_PAYMENT').limit(1),
@@ -678,26 +680,50 @@ async function getStoreStatusSnapshot(clientId) {
   })
   const [etecsaRows, gameRows, topupRows] = await Promise.all([
     queryRows('etecsa_orders', 'id,offer_name,price_label,payment_amount,status,created_at,updated_at,paid_at,completed_at,failure_reason', q => q.in('status', ['WAITING_PAYMENT', 'PAYMENT_RECEIVED_WAITING_DETAILS', 'PROCESSING', 'SUBMITTING_TO_SOKY', 'SUBMITTING_TO_PROVIDER', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED'])),
-    queryRows('game_recharge_orders', 'id,game_name,offer_title,payment_amount,price_basis,status,created_at,updated_at,paid_at,completed_at,failure_reason,payment_source,wallet_refunded_at', q => q.in('status', ['WAITING_PAYMENT', 'PAYMENT_RECEIVED_WAITING_DETAILS', 'PROCESSING', 'SUBMITTING_TO_PROVIDER', 'SUBMITTING_TO_SOKY', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED', 'REFUNDED'])),
+    queryRows('game_recharge_orders', 'id,game_name,offer_title,payment_amount,price_basis,status,created_at,updated_at,paid_at,completed_at,failure_reason,payment_source,wallet_refunded_at,provider_delivery,provider_status,provider_delivery_note,destination_card,confirmation_phone,payer_phone', q => q.in('status', ['WAITING_PAYMENT', 'PAYMENT_RECEIVED_WAITING_DETAILS', 'PROCESSING', 'SUBMITTING_TO_PROVIDER', 'SUBMITTING_TO_SOKY', 'FULFILLMENT_REVIEW', 'REFUND_REQUIRED', 'REFUNDED'])),
     queryRows('store_wallet_topups', 'id,amount_cup,amount_saldo,currency,status,created_at,updated_at,paid_at,payment_deadline_at,payment_review_at,payment_review_reason', q => q.or('status.eq.WAITING_PAYMENT,payment_review_at.not.is.null'), { includeAll: true }),
   ])
   const etecsa = { data: etecsaRows }
   const games = { data: gameRows }
   const topups = { data: topupRows }
   const entries = []
-  for (const row of etecsa.data || []) entries.push({
+  // Optional cart table is never queried while the feature flag/schema is off. If the
+  // optional read fails, the legacy status feed still works normally.
+  let cartRows = []
+  try {
+    if (await cartFeatureAvailable()) {
+      const result = await readAllRows(() => supabase.from('store_cart_orders')
+        .select('id,ticket,price_basis,payment_source,payment_amount,status,created_at,updated_at,paid_at,payment_deadline_at,item_count')
+        .eq('client_id', clientId).order('updated_at', { ascending: false }), { pageSize: 500, maxRows: 10000 })
+      cartRows = result || []
+    }
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'CART_STATUS_SNAPSHOT_SKIPPED', code: error?.code || 'OPTIONAL_READ_FAILED' }))
+  }
+  const cartChildOrderIds = new Set()
+  if (cartRows.length) {
+    try {
+      const children = await readAllRows(() => supabase.from('store_cart_items').select('child_order_id').eq('client_id', clientId), { pageSize: 500, maxRows: 10000 })
+      for (const child of children || []) if (child.child_order_id) cartChildOrderIds.add(String(child.child_order_id))
+    } catch (error) {
+      console.warn(JSON.stringify({ event: 'CART_CHILD_STATUS_FILTER_SKIPPED', code: error?.code || 'OPTIONAL_READ_FAILED' }))
+    }
+  }
+  for (const row of etecsa.data || []) if (!cartChildOrderIds.has(String(row.id))) entries.push({
     id: row.id, ticket_id: row.id, receipt_code: `SO-ET-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
     source: 'ETECSA', title: `${row.offer_name}${row.price_label ? ` · ${row.price_label}` : ''}`,
     amount_cup: Number(row.payment_amount), currency: 'CUP', status: row.status,
     message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at,
     paid_at: row.paid_at, completed_at: row.completed_at,
   })
-  for (const row of games.data || []) entries.push({
+  for (const row of games.data || []) if (!cartChildOrderIds.has(String(row.id))) entries.push({
     id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
     source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}`,
     amount: Number(row.payment_amount), currency: String(row.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP', status: row.wallet_refunded_at ? 'REFUNDED' : row.status,
     message: shortFailure(row.wallet_refunded_at ? 'REFUNDED' : row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at,
     paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL', wallet_refunded_at: row.wallet_refunded_at || null,
+    provider_delivery: row.provider_delivery || null, provider_status: row.provider_status || null, delivery_note: row.provider_delivery_note || null,
+    destination_card: row.status === 'WAITING_PAYMENT' ? (row.destination_card || null) : null, confirmation_phone: row.status === 'WAITING_PAYMENT' ? (row.confirmation_phone || null) : null, payer_phone: row.status === 'WAITING_PAYMENT' ? (row.payer_phone || null) : null,
   })
   for (const row of topups.data || []) entries.push({
     id: row.id, ticket_id: row.id, receipt_code: `SO-WL-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
@@ -706,6 +732,15 @@ async function getStoreStatusSnapshot(clientId) {
     payment_review_required: Boolean(row.payment_review_at), created_at: row.created_at, updated_at: row.updated_at,
     paid_at: row.paid_at, payment_deadline_at: row.payment_deadline_at,
   })
+  for (const row of cartRows) {
+    const currency = String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP'
+    const amount = Number(row.payment_amount)
+    entries.push({ id: row.id, ticket_id: row.id, receipt_code: row.ticket || `SC-${String(row.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`,
+      source: 'CART', title: `Compra conjunta · ${Number(row.item_count || 0)} ofertas`, amount, amount_cup: currency === 'CUP' ? amount : undefined,
+      amount_saldo: currency === 'SALDO' ? amount : undefined, currency, price_basis: currency, payment_source: row.payment_source,
+      status: row.status, message: shortFailure(row.status, null), created_at: row.created_at, updated_at: row.updated_at,
+      paid_at: row.paid_at, payment_deadline_at: row.payment_deadline_at })
+  }
   entries.sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || ''))
   return entries
 }
@@ -713,19 +748,41 @@ async function getStoreStatusSnapshot(clientId) {
 async function getStoreHistory(clientId) {
   const [etecsa, games, topups, ledger] = await Promise.all([
     supabase.from('etecsa_orders').select('id,offer_name,price_label,payment_amount,price_basis,status,created_at,updated_at,paid_at,completed_at,failure_reason').eq('client_id', clientId).order('created_at', { ascending: false }).limit(50),
-    supabase.from('game_recharge_orders').select('id,game_name,offer_title,payment_amount,price_basis,status,payment_source,created_at,updated_at,paid_at,completed_at,failure_reason,wallet_refunded_at').eq('client_id', clientId).order('created_at', { ascending: false }).limit(50),
+    supabase.from('game_recharge_orders').select('id,game_name,offer_title,payment_amount,price_basis,status,payment_source,created_at,updated_at,paid_at,completed_at,failure_reason,wallet_refunded_at,provider_delivery,provider_status,provider_delivery_note,destination_card,confirmation_phone,payer_phone').eq('client_id', clientId).order('created_at', { ascending: false }).limit(50),
     supabase.from('store_wallet_topups').select('id,amount_cup,amount_saldo,currency,status,created_at,updated_at,paid_at,payment_deadline_at,payment_review_at,payment_review_reason').eq('client_id', clientId).order('created_at', { ascending: false }).limit(30),
     supabase.from('store_wallet_transactions').select('id,kind,currency,amount_cup,amount_saldo,reference_type,reference_id,description,created_at').eq('client_id', clientId).order('created_at', { ascending: false }).limit(100),
   ])
   for (const r of [etecsa, games, topups, ledger]) if (r.error) throw r.error
+  let cartHistory = []
+  try {
+    if (await cartFeatureAvailable()) {
+      const carts = await supabase.from('store_cart_orders')
+        .select('id,price_basis,payment_source,payment_amount,status,created_at,updated_at,paid_at,item_count')
+        .eq('client_id', clientId).order('created_at', { ascending: false }).limit(50)
+      if (carts.error) throw carts.error
+      cartHistory = carts.data || []
+    }
+  } catch (error) {
+    console.warn(JSON.stringify({ event: 'CART_HISTORY_SKIPPED', code: error?.code || 'OPTIONAL_READ_FAILED' }))
+  }
+  const cartChildOrderIds = new Set()
+  if (cartHistory.length) {
+    try {
+      const children = await readAllRows(() => supabase.from('store_cart_items').select('child_order_id').eq('client_id', clientId), { pageSize: 500, maxRows: 10000 })
+      for (const child of children || []) if (child.child_order_id) cartChildOrderIds.add(String(child.child_order_id))
+    } catch (error) {
+      console.warn(JSON.stringify({ event: 'CART_HISTORY_CHILD_FILTER_SKIPPED', code: error?.code || 'OPTIONAL_READ_FAILED' }))
+    }
+  }
   const entries = []
-  for (const row of etecsa.data || []) entries.push({
+  for (const row of etecsa.data || []) if (!cartChildOrderIds.has(String(row.id))) entries.push({
     id: row.id, ticket_id: row.id, receipt_code: `SO-ET-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
     source: 'ETECSA', title: `${row.offer_name}${row.price_label ? ` · ${row.price_label}` : ''}${row.price_basis === 'SALDO' ? ' · tarifa Saldo Móvil' : ''}`,
     amount_cup: Number(row.payment_amount), currency: 'CUP', price_basis: row.price_basis || 'CUP', status: row.status,
     message: shortFailure(row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at,
   })
   for (const row of games.data || []) {
+    if (cartChildOrderIds.has(String(row.id))) continue
     const effectiveStatus = row.wallet_refunded_at ? 'REFUNDED' : row.status
     entries.push({
       id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
@@ -733,7 +790,18 @@ async function getStoreHistory(clientId) {
       amount: Number(row.payment_amount), currency: String(row.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP', price_basis: row.price_basis || 'CUP', status: effectiveStatus,
       message: shortFailure(effectiveStatus, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at,
       payment_source: row.payment_source || 'TRANSFERMOVIL', wallet_refunded_at: row.wallet_refunded_at || null,
+      provider_delivery: row.provider_delivery || null, provider_status: row.provider_status || null, delivery_note: row.provider_delivery_note || null,
+      destination_card: row.status === 'WAITING_PAYMENT' ? (row.destination_card || null) : null, confirmation_phone: row.status === 'WAITING_PAYMENT' ? (row.confirmation_phone || null) : null, payer_phone: row.status === 'WAITING_PAYMENT' ? (row.payer_phone || null) : null,
     })
+  }
+  for (const row of cartHistory) {
+    const currency = String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP'
+    const amount = Number(row.payment_amount)
+    entries.push({ id: row.id, ticket_id: row.id, receipt_code: `SC-${String(row.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`,
+      source: 'CART', title: `Compra conjunta · ${Number(row.item_count || 0)} ofertas`, amount,
+      ...(currency === 'SALDO' ? { amount_saldo: amount } : { amount_cup: amount }), currency, price_basis: currency,
+      payment_source: row.payment_source, status: row.status, message: shortFailure(row.status, null), created_at: row.created_at,
+      updated_at: row.updated_at, paid_at: row.paid_at })
   }
   // Paid top-ups are represented by their CREDIT ledger movement to avoid double-counting.
   for (const row of topups.data || []) {
@@ -744,7 +812,7 @@ async function getStoreHistory(clientId) {
   }
   for (const row of ledger.data || []) {
     // Wallet-funded Game Market purchases are already present in the order history.
-    if (row.kind === 'SPEND' && row.reference_type === 'GAME_RECHARGE') continue
+    if (row.kind === 'SPEND' && ['GAME_RECHARGE', 'STORE_CART'].includes(String(row.reference_type || '').toUpperCase())) continue
     const currency = String(row.currency || 'CUP').toUpperCase()
     const amount = Number(currency === 'SALDO' ? row.amount_saldo : row.amount_cup)
     entries.push({ id: row.id, ticket_id: row.reference_type === 'WALLET_TOPUP' ? row.reference_id : row.id, receipt_code: row.reference_type === 'WALLET_TOPUP' && row.reference_id ? `SO-WL-${String(row.reference_id).replace(/-/g, '').slice(0, 10).toUpperCase()}` : `SO-MV-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, reference_type: row.reference_type, reference_id: row.reference_id, source: 'WALLET_MOVEMENT', title: row.description || (row.kind === 'CREDIT' ? 'Fondos añadidos' : row.kind === 'REFUND' ? 'Devolución a Wallet' : 'Movimiento de Wallet'), amount, ...(currency === 'SALDO' ? { amount_saldo: amount } : { amount_cup: amount }), currency, status: row.kind, message: row.kind === 'SPEND' ? 'Compra descontada del saldo.' : row.kind === 'REFUND' ? 'Importe devuelto al saldo.' : 'Saldo añadido a Wallet.', created_at: row.created_at, updated_at: row.created_at })

@@ -10,7 +10,7 @@ const supabase = require('../supabase')
 async function claimPaymentTransaction({ transactionId, clientId, source, orderId }) {
   const id = String(transactionId || '').trim().slice(0, 120)
   if (!id) return true // Legacy SMS without a transaction identifier uses strict ticket matching.
-  const allowedSources = new Set(['ETECSA', 'GAMEMARKET', 'WALLET_TOPUP'])
+  const allowedSources = new Set(['ETECSA', 'GAMEMARKET', 'WALLET_TOPUP', 'CART'])
   if (!allowedSources.has(source) || !clientId || !orderId) {
     const error = new Error('Invalid payment transaction claim')
     error.code = 'INVALID_PAYMENT_CLAIM'

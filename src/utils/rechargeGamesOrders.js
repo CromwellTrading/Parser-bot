@@ -15,6 +15,8 @@ const { getPlatformStoreId } = require('./rechargeGamesCatalog')
 const { verifyWebhookSignature } = require('./rechargeGamesWebhookSecurity')
 const { findMatchingTopups } = require('./storeWallet')
 const { claimPaymentTransaction } = require('./paymentTransactionClaims')
+const { calculateDiscount, reserveDiscount, releaseDiscount, finalizePaidOrder } = require('./rewards')
+const { assertNoWaitingCart, cartFeatureAvailable } = require('./cartFeaturePolicy')
 
 const PAYMENT_WINDOW_MS = 30 * 60 * 1000
 const BLOCKING_STATUSES = ['WAITING_PAYMENT']
@@ -47,6 +49,10 @@ function publicOrder(order) {
     provider_delivery: order.provider_delivery,
     price_basis: order.price_basis,
     amount: Number(order.payment_amount),
+    base_amount: Number(order.reward_base_amount || order.payment_amount),
+    discount_percent: Number(order.reward_discount_percent || 0),
+    discount_amount: Number(order.reward_discount_amount || 0),
+    welcome_discount: order.welcome_discount === true,
     currency: String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(order.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP',
     payer_phone: order.payer_phone,
     player_id: order.player_id || null,
@@ -65,8 +71,18 @@ function publicOrder(order) {
       server_id: order.provider_delivery === 'player_id' && /mobile[-_ ]?legends/i.test(String(order.provider_game_slug || '')),
     },
   }
-  if (order.status === 'WAITING_PAYMENT') {
-    result.payment = { card: order.destination_card, confirmation_phone: order.confirmation_phone }
+  // Always return transfer instructions for pending/reviewable transfer tickets in a
+  // stable shape. Android supports both the nested legacy payload and top-level aliases.
+  if (String(order.status || '').toUpperCase() === 'WAITING_PAYMENT' &&
+      String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() !== 'WALLET') {
+    result.destination_card = order.destination_card || null
+    result.confirmation_phone = order.confirmation_phone || null
+    result.payment = {
+      method: 'TRANSFERMOVIL',
+      card: order.destination_card || null,
+      confirmation_phone: order.confirmation_phone || null,
+      currency: 'CUP',
+    }
   }
   return result
 }
@@ -84,6 +100,7 @@ async function expireOrderIfNeeded(order) {
     .update({ status: 'EXPIRED', failure_reason: 'PAYMENT_WINDOW_EXPIRED', updated_at: nowIso() })
     .eq('id', order.id).eq('status', 'WAITING_PAYMENT').select('*').maybeSingle()
   if (error) throw error
+  if (data) await releaseDiscount(order.client_id, { reward_coupon_id: order.reward_coupon_id, welcome_discount: order.welcome_discount }, `GAME_MARKET:${order.id}`).catch(() => {})
   return data || order
 }
 
@@ -100,6 +117,7 @@ async function findBlockingOrder(clientId) {
 }
 
 async function assertNoOtherWaitingCheckout(clientId) {
+  await assertNoWaitingCart(clientId)
   const gameOrder = await findBlockingOrder(clientId)
   if (gameOrder) throw Object.assign(errorWithStatus('Ya tienes una compra de juegos pendiente de pago. Págala o cancélala antes de iniciar otra.', 409, 'CHECKOUT_ACTIVE'), { order: publicOrder(gameOrder) })
 
@@ -164,7 +182,10 @@ async function createPaymentOrder(client, body) {
   const automation = await getAutomationAvailability()
   if (!automation.enabled) throw errorWithStatus(automation.message || 'Los pagos automáticos están temporalmente desactivados.', 503, 'AUTOMATION_UNAVAILABLE')
   const paymentConfig = getLicenseConfig()
-  if (!paymentConfig.configured || paymentConfig.currency !== 'CUP') throw errorWithStatus('El método de pago no está configurado. Inténtalo más tarde.', 503, 'PAYMENT_CONFIG_MISSING')
+  if (!paymentConfig.configured || paymentConfig.currency !== 'CUP' ||
+      !String(paymentConfig.paymentCard || '').trim() || !String(paymentConfig.paymentPhone || '').trim()) {
+    throw errorWithStatus('La transferencia no está configurada completamente. No se creó ningún ticket; inténtalo más tarde.', 503, 'PAYMENT_CONFIG_MISSING')
+  }
 
   await assertNoOtherWaitingCheckout(client.id)
   const offerId = cleanText(body?.offer_id, 100)
@@ -183,7 +204,10 @@ async function createPaymentOrder(client, body) {
     throw errorWithStatus('Introduce también el ID del servidor antes de crear el ticket.', 400, 'SERVER_ID_REQUIRED')
   }
   const amount = Number(offer.price_cup)
+  const baseAmount = amount
   if (!Number.isSafeInteger(amount) || amount <= 0) throw errorWithStatus('El precio seleccionado no es válido. Actualiza el catálogo e inténtalo de nuevo.', 409, 'INVALID_LOCAL_PRICE')
+  const discount = await calculateDiscount(client, { amount: baseAmount, currency: basis, couponCode: body?.coupon_code, source: 'GAME_MARKET' })
+  const finalAmount = discount.finalAmount
   const providerMeta = offer.package_data?.rechargegames || {}
   const providerCost = Number(providerMeta.provider_price_usdt ?? offer.base_cost_usd)
   if (!Number.isFinite(providerCost) || providerCost <= 0) throw errorWithStatus('El precio del paquete está siendo actualizado. Inténtalo de nuevo.', 409, 'PROVIDER_PRICE_UNAVAILABLE')
@@ -206,7 +230,12 @@ async function createPaymentOrder(client, body) {
     provider_kind: providerMeta.provider_kind || 'topup',
     provider_cost_usdt: providerCost,
     price_basis: basis,
-    payment_amount: amount,
+    payment_amount: finalAmount,
+    ...(discount.featureEnabled ? {
+      reward_base_amount: baseAmount, reward_discount_percent: discount.discountPercent || null,
+      reward_discount_amount: discount.discountAmount || 0, reward_coupon_id: discount.couponId || null,
+      welcome_discount: discount.welcomeDiscount === true,
+    } : {}),
     payer_phone: payerPhone,
     player_id: playerId,
     server_id: serverId,
@@ -226,9 +255,15 @@ async function createPaymentOrder(client, body) {
     }
     throw error
   }
+  const orderRef = `GAME_MARKET:${order.id}`
+  const reserved = await reserveDiscount(client.id, discount, orderRef)
+  if (!reserved) {
+    await supabase.from('game_recharge_orders').update({ status: 'CANCELED', canceled_at: nowIso(), failure_reason: 'REWARD_RESERVATION_FAILED', updated_at: nowIso() }).eq('id', order.id).eq('status', 'WAITING_PAYMENT')
+    throw errorWithStatus('El cupón acaba de utilizarse en otra compra. Actualiza tus cupones e inténtalo de nuevo.', 409, 'COUPON_RESERVATION_FAILED')
+  }
   const publicData = publicOrder(order)
-  notifyAdmins(`🎮 Ticket de juego creado · ${publicData.ticket}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nImporte: ${amount} CUP (${basis})\nTarjeta destino: ${order.destination_card}\nTeléfono a confirmar: ${order.confirmation_phone}\nPagador: ${payerPhone}\nEstado: esperando pago`).catch(() => {})
-  console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_ORDER_CREATED', order_id: order.id, client_id: client.id, provider_product_key_hash: crypto.createHash('sha256').update(order.provider_product_key).digest('hex').slice(0, 16), amount, basis }))
+  notifyAdmins(`🎮 Ticket de juego creado · ${publicData.ticket}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nImporte: ${finalAmount} CUP (${basis})${discount.discountAmount ? `\nDescuento: ${discount.discountPercent}% (-${discount.discountAmount} CUP)` : ''}\nTarjeta destino: ${order.destination_card}\nTeléfono a confirmar: ${order.confirmation_phone}\nPagador: ${payerPhone}\nEstado: esperando pago`).catch(() => {})
+  console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_ORDER_CREATED', order_id: order.id, client_id: client.id, provider_product_key_hash: crypto.createHash('sha256').update(order.provider_product_key).digest('hex').slice(0, 16), amount: finalAmount, basis }))
   return publicData
 }
 
@@ -241,6 +276,34 @@ async function createWalletGameOrder(client, body) {
   if (!offerId || !['CUP', 'SALDO'].includes(basis)) throw errorWithStatus('Selecciona un paquete y una moneda válida para Wallet.', 400, 'INVALID_OFFER_SELECTION')
   const idempotencyKey = cleanText(body?.idempotency_key, 128)
   if (!/^[A-Za-z0-9_.:-]{8,128}$/.test(idempotencyKey)) throw errorWithStatus('No se pudo verificar el intento de compra. Vuelve a intentarlo.', 400, 'INVALID_IDEMPOTENCY_KEY')
+
+  // Resolve a retry before recalculating or reserving a coupon. A successful Wallet
+  // debit must remain idempotent even when the coupon has since become USED.
+  const { data: priorMovement, error: priorMovementError } = await supabase.from('store_wallet_transactions')
+    .select('reference_type,reference_id,currency').eq('client_id', client.id).eq('idempotency_key', idempotencyKey).maybeSingle()
+  if (priorMovementError) throw priorMovementError
+  if (priorMovement) {
+    if (priorMovement.reference_type !== 'GAME_RECHARGE' || priorMovement.currency !== basis) {
+      throw errorWithStatus('Este intento ya se utilizó. Inicia una nueva compra.', 409, 'IDEMPOTENCY_KEY_REUSED')
+    }
+    const { data: priorOrder, error: priorOrderError } = await supabase.from('game_recharge_orders').select('*')
+      .eq('id', priorMovement.reference_id).eq('client_id', client.id).maybeSingle()
+    if (priorOrderError) throw priorOrderError
+    if (!priorOrder) throw errorWithStatus('La compra anterior requiere revisión. No se volvió a cobrar.', 409, 'IDEMPOTENT_ORDER_UNAVAILABLE')
+    const requestedPlayerId = cleanText(body?.player_id, 200) || null
+    const requestedServerId = cleanText(body?.server_id, 200) || null
+    if (String(priorOrder.offer_id) !== String(offerId) || String(priorOrder.player_id || '') !== String(requestedPlayerId || '') ||
+        String(priorOrder.server_id || '') !== String(requestedServerId || '')) {
+      throw errorWithStatus('Este intento ya está vinculado a otra compra. Inicia un nuevo intento.', 409, 'IDEMPOTENCY_KEY_REUSED')
+    }
+    if (!['REFUND_REQUIRED', 'REFUNDED'].includes(String(priorOrder.status || '').toUpperCase())) {
+      await finalizePaidOrder(client, { source: 'GAME_MARKET', order: priorOrder })
+    } else {
+      await releaseDiscount(client.id, { reward_coupon_id: priorOrder.reward_coupon_id, welcome_discount: priorOrder.welcome_discount }, `GAME_MARKET:${priorOrder.id}`).catch(() => {})
+    }
+    return publicOrder(priorOrder)
+  }
+
   await assertNoOtherWaitingCheckout(client.id)
   const offer = await getProviderOffer(offerId)
   const playerId = cleanText(body?.player_id, 200) || null
@@ -249,8 +312,10 @@ async function createWalletGameOrder(client, body) {
   if (offer.provider_delivery === 'player_id' && /mobile[-_ ]?legends/i.test(String(offer.provider_game_slug || '')) && !serverId) {
     throw errorWithStatus('Introduce también el ID del servidor antes de comprar.', 400, 'SERVER_ID_REQUIRED')
   }
-  const amount = Number(basis === 'SALDO' ? offer.price_saldo : offer.price_cup)
-  if (!Number.isSafeInteger(amount) || amount <= 0) throw errorWithStatus(`El precio de este paquete en ${basis === 'SALDO' ? 'Saldo Móvil' : 'CUP'} no está disponible.`, 409, 'INVALID_LOCAL_PRICE')
+  const baseAmount = Number(basis === 'SALDO' ? offer.price_saldo : offer.price_cup)
+  if (!Number.isSafeInteger(baseAmount) || baseAmount <= 0) throw errorWithStatus(`El precio de este paquete en ${basis === 'SALDO' ? 'Saldo Móvil' : 'CUP'} no está disponible.`, 409, 'INVALID_LOCAL_PRICE')
+  const discount = await calculateDiscount(client, { amount: baseAmount, currency: basis, couponCode: body?.coupon_code, source: 'GAME_MARKET' })
+  const amount = discount.finalAmount
   const providerMeta = offer.package_data?.rechargegames || {}
   const providerCost = Number(providerMeta.provider_price_usdt ?? offer.base_cost_usd)
   if (!Number.isFinite(providerCost) || providerCost <= 0) throw errorWithStatus('El precio del paquete se está actualizando. Inténtalo más tarde.', 409, 'PROVIDER_PRICE_UNAVAILABLE')
@@ -267,12 +332,21 @@ async function createWalletGameOrder(client, body) {
     provider_delivery: offer.provider_delivery || providerMeta.delivery,
     provider_kind: providerMeta.provider_kind || 'topup', provider_cost_usdt: providerCost,
     price_basis: basis, payment_amount: amount, payer_phone: null,
+    ...(discount.featureEnabled ? {
+      reward_base_amount: baseAmount, reward_discount_percent: discount.discountPercent || null,
+      reward_discount_amount: discount.discountAmount || 0, reward_coupon_id: discount.couponId || null,
+      welcome_discount: discount.welcomeDiscount === true,
+    } : {}),
     player_id: playerId, server_id: serverId, buyer_ref: `SO-${id}`,
   }
+  const orderRef = `GAME_MARKET:${id}`
+  const reserved = await reserveDiscount(client.id, discount, orderRef)
+  if (!reserved) throw errorWithStatus('El cupón acaba de utilizarse en otra compra. Actualiza tus cupones e inténtalo de nuevo.', 409, 'COUPON_RESERVATION_FAILED')
   const { data: rpcData, error: rpcError } = await supabase.rpc('store_wallet_create_game_order', {
     p_client_id: client.id, p_amount: amount, p_order: orderPayload, p_idempotency_key: idempotencyKey, p_currency: basis,
   })
   if (rpcError) {
+    await releaseDiscount(client.id, { couponId: discount.couponId, welcomeDiscount: discount.welcomeDiscount }, orderRef).catch(() => {})
     if (String(rpcError.message || '').includes('INSUFFICIENT_WALLET_BALANCE')) {
       throw errorWithStatus(`No tienes suficiente saldo ${basis === 'SALDO' ? 'móvil' : 'CUP'} en Wallet. Añade fondos en esa moneda o elige otro paquete.`, 409, 'INSUFFICIENT_WALLET_BALANCE')
     }
@@ -282,7 +356,15 @@ async function createWalletGameOrder(client, body) {
   }
   const rawOrder = rpcData?.order || rpcData
   const orderId = rawOrder?.id || id
-  const createdOrder = rpcData?.order ? publicOrder(rpcData.order) : null
+  if (discount.featureEnabled) {
+    const { error: rewardMetadataError } = await supabase.from('game_recharge_orders').update({
+      reward_base_amount: baseAmount, reward_discount_percent: discount.discountPercent || null,
+      reward_discount_amount: discount.discountAmount || 0, reward_coupon_id: discount.couponId || null,
+      welcome_discount: discount.welcomeDiscount === true,
+    }).eq('id', orderId).eq('client_id', client.id)
+    if (rewardMetadataError) console.error(JSON.stringify({ ts: nowIso(), event: 'REWARD_ORDER_METADATA_SAVE_FAILED', order_id: orderId, code: rewardMetadataError.code || 'DB_ERROR' }))
+  }
+  const createdOrder = rpcData?.order ? publicOrder({ ...rpcData.order, reward_base_amount: baseAmount, reward_discount_percent: discount.discountPercent, reward_discount_amount: discount.discountAmount, reward_coupon_id: discount.couponId, welcome_discount: discount.welcomeDiscount }) : null
   console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_DEBITED', order_id: orderId, client_id: client.id, currency: basis, amount, balance_cup: Number(rpcData?.balance_cup || 0), balance_saldo: Number(rpcData?.balance_saldo || 0) }))
   // If the same idempotency key is replayed, return the existing order. The recovery
   // worker resolves a stale SUBMITTING_TO_PROVIDER state by buyer_ref, avoiding a
@@ -308,7 +390,7 @@ async function createWalletGameOrder(client, body) {
 
   let finalSubmitted = submitted
   if (submitted.status === 'REFUND_REQUIRED') {
-    const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: orderId })
+    const { error: refundError } = await refundFailedWalletOrder(orderId)
     if (refundError) {
       console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: orderId, code: refundError.code || 'REFUND_FAILED' }))
       notifyAdmins(`🚨 Devolución pendiente · ${makeTicket(orderId)}\nNo se pudo devolver automáticamente el saldo de Wallet. El sistema reintentará la operación; revisa la incidencia y no pidas otro pago al cliente.`).catch(() => {})
@@ -321,6 +403,14 @@ async function createWalletGameOrder(client, body) {
       .select('*').eq('id', orderId).maybeSingle()
     if (refreshError) throw refreshError
     if (refreshed) finalSubmitted = publicOrder(refreshed)
+  }
+  if (String(finalSubmitted?.status || '').toUpperCase() === 'REFUNDED') {
+    await releaseDiscount(client.id, { couponId: discount.couponId, welcomeDiscount: discount.welcomeDiscount }, orderRef).catch(() => {})
+  } else {
+    await finalizePaidOrder(client, { source: 'GAME_MARKET', order: {
+      id: orderId, client_id: client.id, paid_at: nowIso(), price_basis: basis, payment_amount: amount, reward_base_amount: baseAmount,
+      reward_coupon_id: discount.couponId || null, welcome_discount: discount.welcomeDiscount === true,
+    } })
   }
   return finalSubmitted
 }
@@ -354,7 +444,36 @@ async function cancelPaymentOrder(clientId, orderId) {
     .eq('id', orderId).eq('client_id', clientId).eq('status', 'WAITING_PAYMENT').select('*').maybeSingle()
   if (updateError) throw updateError
   if (!updated) throw errorWithStatus('La operación cambió de estado y no se pudo cancelar.', 409, 'ORDER_STATE_CHANGED')
+  await releaseDiscount(clientId, { reward_coupon_id: updated.reward_coupon_id, welcome_discount: updated.welcome_discount }, `GAME_MARKET:${updated.id}`).catch(() => {})
   return publicOrder(updated)
+}
+
+async function refundFailedWalletOrder(orderId) {
+  // Before the opt-in cart schema is fully ready, preserve the exact legacy refund path.
+  // This avoids querying new columns or tables during a staged production deployment.
+  if (!(await cartFeatureAvailable().catch(() => false))) {
+    return supabase.rpc('store_wallet_refund_game_order', { p_order_id: orderId })
+  }
+  const { data: order, error: orderError } = await supabase.from('game_recharge_orders')
+    .select('id,client_id,store_cart_id,payment_source,status').eq('id', orderId).maybeSingle()
+  if (orderError) return { data: null, error: orderError }
+  if (!order) return { data: null, error: Object.assign(new Error('ORDER_NOT_FOUND'), { code: 'ORDER_NOT_FOUND' }) }
+  if (order.store_cart_id) {
+    // A cart child did not debit the Wallet independently. Refund exactly its parent-cart
+    // line via the dedicated RPC; never credit it through the legacy per-order ledger.
+    const { data: item, error: itemError } = await supabase.from('store_cart_items')
+      .select('id,status').eq('cart_id', order.store_cart_id).eq('child_order_id', order.id).maybeSingle()
+    if (itemError) return { data: null, error: itemError }
+    if (!item) return { data: null, error: Object.assign(new Error('CART_ITEM_NOT_FOUND'), { code: 'CART_ITEM_NOT_FOUND' }) }
+    if (item.status !== 'REFUNDED') {
+      const { error: markError } = await supabase.from('store_cart_items').update({
+        status: 'REFUND_REQUIRED', failure_reason: 'DELIVERY_FAILED', updated_at: nowIso(),
+      }).eq('id', item.id).neq('status', 'REFUNDED')
+      if (markError) return { data: null, error: markError }
+    }
+    return supabase.rpc('store_wallet_refund_cart_item', { p_cart_item_id: item.id })
+  }
+  return supabase.rpc('store_wallet_refund_game_order', { p_order_id: orderId })
 }
 
 function providerFailureReason(error) {
@@ -403,7 +522,7 @@ async function persistProviderResult(order, providerOrder, raw = null) {
   } else if (status === 'REFUND_REQUIRED') {
     console.error('[RechargeGames] La entrega falló después del pago local:', JSON.stringify({ order_id: order.id, provider_order_id: patch.provider_order_id, provider_status: providerStatus }))
     if (data.payment_source === 'WALLET') {
-      const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: data.id })
+      const { error: refundError } = await refundFailedWalletOrder(data.id)
       if (refundError) {
         console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: data.id, code: refundError.code || 'REFUND_FAILED' }))
       } else {
@@ -441,7 +560,7 @@ async function markProviderFailure(order, error) {
 
   let finalOrder = data
   if (status === 'REFUND_REQUIRED' && data.payment_source === 'WALLET') {
-    const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: data.id })
+    const { error: refundError } = await refundFailedWalletOrder(data.id)
     if (refundError) {
       console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: data.id, code: refundError.code || 'REFUND_FAILED' }))
     } else {
@@ -538,13 +657,21 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   }
   const candidates = await readAllRows(buildCandidateQuery, { pageSize: 500, maxRows: 100_000 })
   const matchedCandidates = []
+  const matchDiagnostics = []
   for (const candidate of candidates || []) {
     // Cross-client RECIBIDO receipts are accepted only from the configured
     // payment destination phone; ENVIADO remains scoped to the ticket owner.
-    if (isDestinationReceipt && !isConfiguredPaymentReceiver(client, candidate)) continue
-    if (candidate.status === 'EXPIRED' && !parsed?.transaction_at) continue
+    if (isDestinationReceipt && !isConfiguredPaymentReceiver(client, candidate)) {
+      matchDiagnostics.push({ ticket: makeTicket(candidate.id), status: candidate.status, reasons: ['RECEIVER_PHONE_NOT_CONFIGURED_FOR_TICKET'] })
+      continue
+    }
+    if (candidate.status === 'EXPIRED' && !parsed?.transaction_at) {
+      matchDiagnostics.push({ ticket: makeTicket(candidate.id), status: candidate.status, reasons: ['EXPIRED_WITHOUT_BANK_TIMESTAMP'] })
+      continue
+    }
     const result = evaluateOfficialStorePayment(parsed, candidate, receivedAt)
     if (result.matched) matchedCandidates.push({ order: candidate, evaluation: result })
+    else matchDiagnostics.push({ ticket: makeTicket(candidate.id), status: candidate.status, reasons: result.reasons || [] })
     const potentiallyRelevant = ['AMOUNT_MISMATCH', 'DESTINATION_CARD_MISMATCH', 'PAYER_PHONE_MISMATCH', 'PAYER_PHONE_NOT_IN_SMS', 'PAYMENT_OUTSIDE_WINDOW']
     if (candidate.status === 'WAITING_PAYMENT' && Date.now() > Date.parse(candidate.payment_deadline_at || '') &&
       ['ENVIADO', 'RECIBIDO'].includes(direction) && Number(parsed?.amount) === Number(candidate.payment_amount) &&
@@ -554,7 +681,18 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     }
   }
   if (matchedCandidates.length !== 1) {
-    if (matchedCandidates.length > 1) console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', direction, matching_ticket_count: matchedCandidates.length }))
+    if (matchedCandidates.length > 1) {
+      console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', direction, matching_ticket_count: matchedCandidates.length }))
+    } else if (String(parsed?.network || '').toUpperCase() === 'PAGOMOVIL' &&
+        ['TARJETA_TARJETA', 'MONEDERO_TARJETA'].includes(String(parsed?.type || '').toUpperCase())) {
+      // Log only reason codes and booleans. Do not log SMS text, phones or account digits.
+      console.warn(JSON.stringify({
+        ts: nowIso(), event: 'GAME_RECHARGE_PAYMENT_NO_MATCH', direction,
+        candidate_count: (candidates || []).length, diagnostic_sample: matchDiagnostics.slice(0, 8),
+        has_transaction_id: Boolean(parsed?.transaction_id), has_sender_phone: Boolean(normalizePayerPhone(parsed?.sender_phone)),
+        has_receiver_account: Boolean(parsed?.receiver_account),
+      }))
+    }
     return null
   }
   const { order: selected, evaluation } = matchedCandidates[0]
@@ -611,6 +749,7 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     throw updateError
   }
   if (!updated) return null
+  await finalizePaidOrder(client, { source: 'GAME_MARKET', order: updated })
   console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_PAYMENT_MATCHED', order_id: updated.id, client_id: client.id, transaction_id: updated.payment_transaction_id || null, status: updated.status }))
   notifyAdmins(`✅ Pago recibido para recarga de juego · ${makeTicket(updated.id)}\nJuego: ${updated.game_name}\nPaquete: ${updated.offer_title}\nImporte: ${updated.payment_amount} CUP\nPagador: ${updated.payer_phone}\n${nextStatus === 'SUBMITTING_TO_PROVIDER' ? 'Enviando el pedido al proveedor.' : 'Faltan datos del jugador; el cliente debe completarlos.'}`).catch(() => {})
   if (nextStatus === 'SUBMITTING_TO_PROVIDER') {
@@ -618,6 +757,210 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     return { order_id: updated.id, status: submitted.status, ticket: makeTicket(updated.id) }
   }
   return { order_id: updated.id, status: updated.status, ticket: makeTicket(updated.id) }
+}
+
+async function listAdminPaymentReviewOrders({ limit = 60 } = {}) {
+  const safeLimit = Math.max(1, Math.min(100, Number.parseInt(limit, 10) || 60))
+  const pendingQuery = await supabase.from('game_recharge_orders').select('*')
+    .in('status', ['WAITING_PAYMENT', 'EXPIRED'])
+    .order('created_at', { ascending: false }).limit(safeLimit)
+  if (pendingQuery.error) throw pendingQuery.error
+
+  // Include inconsistent rows that may have been manually marked paid/completed in
+  // Supabase before the provider order was submitted. These need an explicit review.
+  const recoveryQuery = await supabase.from('game_recharge_orders').select('*')
+    .in('status', ['PAID', 'COMPLETED', 'PROCESSING', 'SUBMITTING_TO_PROVIDER', 'FULFILLMENT_REVIEW', 'PAYMENT_RECEIVED_WAITING_DETAILS'])
+    .is('provider_order_id', null).is('provider_delivery_note', null)
+    .order('created_at', { ascending: false }).limit(safeLimit)
+  if (recoveryQuery.error) throw recoveryQuery.error
+
+  const pendingRows = (pendingQuery.data || []).map(order => ({ order, review_kind: 'PAYMENT_PENDING' }))
+  const recoveryRows = (recoveryQuery.data || [])
+    .filter(order => !order.wallet_refunded_at && !['delivered', 'failed'].includes(String(order.provider_status || '').toLowerCase()))
+    .map(order => ({ order, review_kind: 'DELIVERY_RECOVERY' }))
+  const codeRecoveryQuery = await supabase.from('game_recharge_orders').select('*')
+    .eq('provider_delivery', 'code').is('provider_delivery_note', null)
+    .in('status', ['PAID', 'COMPLETED', 'PROCESSING', 'SUBMITTING_TO_PROVIDER', 'FULFILLMENT_REVIEW'])
+    .order('updated_at', { ascending: false }).limit(safeLimit)
+  if (codeRecoveryQuery.error) throw codeRecoveryQuery.error
+  const codeRecoveryRows = (codeRecoveryQuery.data || [])
+    .filter(order => !order.wallet_refunded_at && Boolean(order.provider_order_id || String(order.provider_status || '').toLowerCase() === 'delivered'))
+    .map(order => ({ order, review_kind: 'CODE_DELIVERY_RECOVERY' }))
+  const unique = new Map()
+  for (const item of [...pendingRows, ...recoveryRows, ...codeRecoveryRows]) unique.set(String(item.order.id), item)
+  return [...unique.values()]
+    .sort((a, b) => Date.parse(b.order.created_at || 0) - Date.parse(a.order.created_at || 0))
+    .slice(0, safeLimit)
+    .map(({ order, review_kind }) => ({
+      ...publicOrder(order),
+      // Admin review needs the historical destination even when someone manually
+      // changed a legacy row to PAID/COMPLETED; publicOrder only exposes payment
+      // instructions while an order is waiting for payment.
+      destination_card: order.destination_card || null,
+      confirmation_phone: order.confirmation_phone || null,
+      payment: String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' ? null : {
+        method: 'TRANSFERMOVIL', card: order.destination_card || null,
+        confirmation_phone: order.confirmation_phone || null, currency: 'CUP',
+      },
+      client_id: order.client_id, review_kind,
+      manual_payment_confirmed_at: order.payment_manual_confirmed_at || null,
+    }))
+}
+
+async function recoverCodeDelivery(adminClient, orderId) {
+  if (String(adminClient?.role || '').toLowerCase() !== 'admin') {
+    throw errorWithStatus('Esta operación requiere permisos de administrador.', 403, 'ADMIN_REQUIRED')
+  }
+  const normalizedId = cleanText(orderId, 80)
+  if (!normalizedId) throw errorWithStatus('El identificador del ticket no es válido.', 400, 'ORDER_ID_REQUIRED')
+  const { data: order, error } = await supabase.from('game_recharge_orders').select('*').eq('id', normalizedId).maybeSingle()
+  if (error) throw error
+  if (!order) throw errorWithStatus('No se encontró el ticket.', 404, 'ORDER_NOT_FOUND')
+  if (String(order.provider_delivery || '').toLowerCase() !== 'code') {
+    throw errorWithStatus('Este paquete no está configurado para entregar un código.', 409, 'ORDER_IS_NOT_CODE_DELIVERY')
+  }
+  if (order.wallet_refunded_at || ['REFUNDED', 'REFUND_REQUIRED'].includes(String(order.status || '').toUpperCase())) {
+    throw errorWithStatus('El pedido tiene una devolución o una resolución pendiente.', 409, 'ORDER_REQUIRES_SEPARATE_RESOLUTION')
+  }
+  if (cleanText(order.provider_delivery_note, 1000)) return { order: publicOrder(order), recovered: false, already_has_code: true }
+  if (!['PAID', 'COMPLETED', 'PROCESSING', 'SUBMITTING_TO_PROVIDER', 'FULFILLMENT_REVIEW'].includes(String(order.status || '').toUpperCase())) {
+    throw errorWithStatus('El pedido todavía no está confirmado como pagado/procesándose. No se consultó ni creó otra orden.', 409, 'ORDER_NOT_READY_FOR_CODE_RECOVERY')
+  }
+  if (!String(order.buyer_ref || '').trim() && !String(order.provider_order_id || '').trim()) {
+    throw errorWithStatus('El ticket no tiene una referencia segura para buscar el pedido original. No se creará otra orden automáticamente.', 409, 'PROVIDER_IDEMPOTENCY_REFERENCE_MISSING')
+  }
+
+  // Recovery is lookup-only. It never submits POST /v1/orders, so this action cannot
+  // buy a second code by accident. Prefer the saved provider ID; buyer_ref is fallback.
+  let remote
+  if (order.provider_order_id) {
+    const response = await rechargeGamesRequest(`/v1/orders/${encodeURIComponent(order.provider_order_id)}`)
+    remote = response.data?.order || response.data
+  } else {
+    remote = await findProviderOrderByBuyerRef(order.buyer_ref)
+  }
+  if (!remote || !remote.order_id) {
+    throw errorWithStatus('No se encontró el pedido original en el proveedor. No se creó una nueva orden; requiere revisión manual.', 409, 'PROVIDER_ORDER_NOT_FOUND')
+  }
+  const providerStatus = String(remote.status || '').toLowerCase()
+  const deliveryNote = cleanText(remote.delivery_note, 1000) || null
+  if (providerStatus === 'delivered' && !deliveryNote) {
+    throw errorWithStatus('El proveedor marca la entrega como completada, pero no devolvió el código. Se conservó el ticket para revisión.', 502, 'PROVIDER_DELIVERY_CODE_MISSING')
+  }
+  const update = {
+    provider_order_id: cleanText(remote.order_id, 120),
+    provider_status: providerStatus || order.provider_status || null,
+    provider_delivery_note: deliveryNote,
+    provider_payload: remote,
+    updated_at: nowIso(),
+  }
+  if (providerStatus === 'delivered' && deliveryNote) {
+    update.status = 'COMPLETED'
+    update.completed_at = nowIso()
+    update.paid_at = order.paid_at || nowIso()
+    update.failure_reason = null
+    update.provider_failure_reason = null
+  } else if (providerStatus === 'pending') {
+    update.status = 'PROCESSING'
+    update.failure_reason = null
+  } else if (providerStatus === 'failed') {
+    update.status = 'REFUND_REQUIRED'
+    update.provider_failure_reason = cleanText(remote.failure_reason, 1000) || null
+    update.failure_reason = providerFailureReason({ code: remote.failure_reason })
+  } else {
+    throw errorWithStatus('El proveedor devolvió un estado que no permite recuperar el código con seguridad.', 502, 'PROVIDER_STATUS_UNRECOGNIZED')
+  }
+  let query = supabase.from('game_recharge_orders').update(update).eq('id', order.id).eq('status', order.status)
+  query = order.provider_order_id ? query.eq('provider_order_id', order.provider_order_id) : query.is('provider_order_id', null)
+  if (deliveryNote) query = query.is('provider_delivery_note', null)
+  const { data: saved, error: saveError } = await query.select('*').maybeSingle()
+  if (saveError) throw saveError
+  if (!saved) {
+    const { data: latest, error: readError } = await supabase.from('game_recharge_orders').select('*').eq('id', order.id).maybeSingle()
+    if (readError) throw readError
+    if (cleanText(latest?.provider_delivery_note, 1000)) return { order: publicOrder(latest), recovered: false, already_has_code: true }
+    throw errorWithStatus('El ticket cambió mientras se recuperaba el código. Actualiza el historial antes de reintentar.', 409, 'ORDER_STATE_CHANGED')
+  }
+  if (update.status === 'REFUND_REQUIRED' && saved.payment_source === 'WALLET') {
+    const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: saved.id })
+    if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_AUTO_REFUND_FAILED', order_id: saved.id, code: refundError.code || 'REFUND_FAILED' }))
+  }
+  if (update.status === 'REFUND_REQUIRED') {
+    notifyAdmins(`⚠️ Código/entrega fallida · ${makeTicket(saved.id)}\nJuego: ${saved.game_name}\nProveedor: failed. Revisa la devolución antes de pedir otro pago.`).catch(() => {})
+  }
+  if (update.status === 'COMPLETED') notifyAdmins(`✅ Código recuperado · ${makeTicket(saved.id)}\nJuego: ${saved.game_name}\nPaquete: ${saved.offer_title}`).catch(() => {})
+  const { data: finalOrder, error: finalError } = await supabase.from('game_recharge_orders').select('*').eq('id', saved.id).maybeSingle()
+  if (finalError) throw finalError
+  return { order: publicOrder(finalOrder || saved), recovered: update.status === 'COMPLETED', provider_lookup_only: true }
+}
+
+async function confirmPaymentManually(adminClient, orderId, { confirmation = false, note = '' } = {}) {
+  if (String(adminClient?.role || '').toLowerCase() !== 'admin') {
+    throw errorWithStatus('Esta operación requiere permisos de administrador.', 403, 'ADMIN_REQUIRED')
+  }
+  if (confirmation !== true) throw errorWithStatus('Confirma expresamente que verificaste el pago antes de continuar.', 400, 'PAYMENT_CONFIRMATION_REQUIRED')
+  const normalizedId = cleanText(orderId, 80)
+  if (!normalizedId) throw errorWithStatus('El identificador del ticket no es válido.', 400, 'ORDER_ID_REQUIRED')
+  const { data: order, error } = await supabase.from('game_recharge_orders').select('*').eq('id', normalizedId).maybeSingle()
+  if (error) throw error
+  if (!order) throw errorWithStatus('No se encontró el ticket.', 404, 'ORDER_NOT_FOUND')
+  if (String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET') {
+    throw errorWithStatus('Este pedido utiliza Wallet; no debe aprobarse como transferencia.', 409, 'WALLET_ORDER_CANNOT_BE_MANUALLY_PAID')
+  }
+
+  const status = String(order.status || '').toUpperCase()
+  const providerStatus = String(order.provider_status || '').toLowerCase()
+  const hasProviderEvidence = Boolean(order.provider_order_id || order.provider_delivery_note || ['delivered', 'failed'].includes(providerStatus))
+  if (['REFUNDED', 'REFUND_REQUIRED'].includes(status) || order.wallet_refunded_at) {
+    throw errorWithStatus('El pedido tiene una devolución o una resolución pendiente. No se reenviará automáticamente.', 409, 'ORDER_REQUIRES_SEPARATE_RESOLUTION')
+  }
+  if (hasProviderEvidence) {
+    if (order.provider_order_id && ['SUBMITTING_TO_PROVIDER', 'PROCESSING', 'FULFILLMENT_REVIEW', 'COMPLETED'].includes(status)) {
+      // Existing provider ID wins; let the reconciliation worker update its status.
+      return { order: publicOrder(order), resumed: true, provider_lookup_pending: true }
+    }
+    throw errorWithStatus('El proveedor ya registra un resultado para este pedido. Comprueba su estado antes de actuar.', 409, 'PROVIDER_RESULT_ALREADY_EXISTS')
+  }
+  if (!cleanText(order.buyer_ref, 200)) {
+    throw errorWithStatus('El ticket no tiene una referencia de proveedor segura. No se enviará un pedido nuevo para evitar duplicados.', 409, 'PROVIDER_IDEMPOTENCY_REFERENCE_MISSING')
+  }
+  const recoverableStatuses = [
+    'WAITING_PAYMENT', 'EXPIRED', 'PAYMENT_RECEIVED_WAITING_DETAILS',
+    'SUBMITTING_TO_PROVIDER', 'PROCESSING', 'FULFILLMENT_REVIEW', 'PAID', 'COMPLETED',
+  ]
+  if (!recoverableStatuses.includes(status)) {
+    throw errorWithStatus(`El ticket está en estado ${order.status}; no se puede recuperar desde este flujo.`, 409, 'ORDER_NOT_RECOVERABLE')
+  }
+  const needsPlayer = String(order.provider_delivery || '').toLowerCase() === 'player_id'
+  if (needsPlayer && !cleanText(order.player_id, 200)) {
+    throw errorWithStatus('El ticket no tiene el ID de jugador requerido. No se enviará al proveedor.', 409, 'PLAYER_ID_REQUIRED')
+  }
+  if (needsPlayer && /mobile[-_ ]?legends/i.test(String(order.provider_game_slug || '')) && !cleanText(order.server_id, 200)) {
+    throw errorWithStatus('El ticket no tiene el ID de servidor requerido. No se enviará al proveedor.', 409, 'SERVER_ID_REQUIRED')
+  }
+
+  // Confirming a transfer returns the row to the normal provider-submit state.
+  // Reuse its original buyer_ref so provider retries are idempotent.
+  const paidAt = order.paid_at || nowIso()
+  const { data: updated, error: updateError } = await supabase.from('game_recharge_orders').update({
+    status: 'SUBMITTING_TO_PROVIDER', payment_source: 'TRANSFERMOVIL', paid_at: paidAt, completed_at: null,
+    payment_manual_confirmed_at: nowIso(), payment_manual_confirmed_by: String(adminClient.id || ''),
+    payment_manual_confirmation_note: cleanText(note || 'Pago verificado manualmente desde administración.', 300),
+    failure_reason: null, provider_failure_reason: null, updated_at: nowIso(),
+  }).eq('id', order.id).eq('status', order.status).select('*').maybeSingle()
+  if (updateError) throw updateError
+  if (!updated) {
+    const { data: latest, error: latestError } = await supabase.from('game_recharge_orders').select('*').eq('id', order.id).maybeSingle()
+    if (latestError) throw latestError
+    if (latest?.provider_order_id) return { order: publicOrder(latest), resumed: true, provider_lookup_pending: true }
+    throw errorWithStatus('El ticket cambió mientras se confirmaba el pago. Actualiza el estado antes de reintentar.', 409, 'ORDER_STATE_CHANGED')
+  }
+  // Manual settlements count as paid too. Resolve the original order owner inside
+  // finalizePaidOrder; rewards failure is intentionally non-fatal to fulfilment.
+  await finalizePaidOrder({ id: null }, { source: 'GAME_MARKET', order: updated })
+  notifyAdmins(`🛠️ Pago verificado manualmente · ${makeTicket(updated.id)}\nJuego: ${updated.game_name}\nPaquete: ${updated.offer_title}\nImporte: ${updated.payment_amount} CUP\nAdministrador: ${String(adminClient.id || 'admin')}`).catch(() => {})
+  const submitted = await submitProviderOrder(updated.id, { playerId: updated.player_id, serverId: updated.server_id })
+  return { order: submitted, resumed: ['SUBMITTING_TO_PROVIDER', 'PROCESSING', 'FULFILLMENT_REVIEW', 'PAID', 'COMPLETED'].includes(status) }
 }
 
 async function handleProviderWebhook(event, webhookId) {
@@ -712,7 +1055,7 @@ async function handleProviderWebhook(event, webhookId) {
   } else {
     console.warn('[RechargeGames] El proveedor marcó el pedido como fallido tras recibir el pago local:', JSON.stringify({ order_id: order.id, provider_order_id: patch.provider_order_id }))
     if (updatedOrder.payment_source === 'WALLET') {
-      const { error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: order.id })
+      const { error: refundError } = await refundFailedWalletOrder(order.id)
       if (refundError) console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_WEBHOOK_REFUND_FAILED', order_id: order.id, code: refundError.code || 'REFUND_FAILED' }))
     }
     notifyAdmins(`⚠️ Recarga de juego fallida · ${makeTicket(order.id)}\n${order.game_name} · ${order.offer_title}\nPago recibido; comprueba la devolución o resolución antes de solicitar otro pago.`).catch(() => {})
@@ -743,14 +1086,16 @@ async function reconcileProcessingOrders() {
     // Recover Wallet refunds independently of API-key/provider availability. A failed
     // first refund attempt must not leave the client debited indefinitely.
     try {
-      const { data: refunds, error: refundQueryError } = await supabase.from('game_recharge_orders')
+      let refundQuery = supabase.from('game_recharge_orders')
         .select('id,client_id,payment_amount,updated_at').eq('payment_source', 'WALLET')
         .eq('status', 'REFUND_REQUIRED').is('wallet_refunded_at', null)
-        .order('updated_at', { ascending: true }).limit(100)
+      // Only exclude cart lines after the full optional migration is confirmed complete.
+      if (await cartFeatureAvailable().catch(() => false)) refundQuery = refundQuery.is('store_cart_id', null)
+      const { data: refunds, error: refundQueryError } = await refundQuery.order('updated_at', { ascending: true }).limit(100)
       if (refundQueryError) throw refundQueryError
       for (const order of refunds || []) {
         try {
-          const { data: refundResult, error: refundError } = await supabase.rpc('store_wallet_refund_game_order', { p_order_id: order.id })
+          const { data: refundResult, error: refundError } = await refundFailedWalletOrder(order.id)
           if (refundError) {
             console.error(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_WALLET_REFUND_RETRY_FAILED', order_id: order.id, code: refundError.code || 'REFUND_FAILED' }))
             // Advance the retry cursor even when the RPC itself fails. Otherwise the
@@ -844,7 +1189,12 @@ module.exports = {
   verifyWebhookSignature,
   handleProviderWebhook,
   getPlatformStoreId,
+  getProviderOffer,
+  submitProviderOrder,
   startRechargeGamesOrderWorker,
   reconcileProcessingOrders,
   publicOrder,
+  listAdminPaymentReviewOrders,
+  confirmPaymentManually,
+  recoverCodeDelivery,
 }
