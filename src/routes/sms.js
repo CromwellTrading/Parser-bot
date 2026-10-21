@@ -12,6 +12,7 @@ const { expireDueLicenses } = require('../utils/licenseExpiry')
 const { processIncomingTransfer } = require('../utils/etecsaOrders')
 const { processIncomingTransfer: processGameRechargeTransfer } = require('../utils/rechargeGamesOrders')
 const { processIncomingTransfer: processWalletTransfer } = require('../utils/storeWallet')
+const { processIncomingTransfer: processCartTransfer, getCartFeatureStatus } = require('../utils/storeCartOrders')
 
 const MAX_SMS_AGE_MS = Number(process.env.MAX_SMS_AGE_MS || 30 * 24 * 60 * 60 * 1000)
 const MAX_FUTURE_SKEW_MS = Number(process.env.MAX_SMS_FUTURE_SKEW_MS || 5 * 60 * 1000)
@@ -166,13 +167,27 @@ router.post('/ingest', async (req, res) => {
       let etecsaOrderUpdate = null
       let gameRechargeOrderUpdate = null
       let walletTopupUpdate = null
-      try { etecsaOrderUpdate = await processIncomingTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
-      catch (orderError) { console.error('Error comprobando pago de ticket ETECSA:', orderError.code || orderError.message) }
-      try { gameRechargeOrderUpdate = await processGameRechargeTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
-      catch (orderError) { console.error('Error comprobando pago de recarga de juego:', orderError.code || orderError.message) }
-      try { walletTopupUpdate = await processWalletTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
-      catch (orderError) { console.error('Error comprobando recarga de Wallet:', orderError.code || orderError.message) }
-      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, event_id: eventId, status: 'QUEUED', ...(etecsaOrderUpdate ? { etecsa_order_update: etecsaOrderUpdate } : {}), ...(gameRechargeOrderUpdate ? { game_recharge_order_update: gameRechargeOrderUpdate } : {}), ...(walletTopupUpdate ? { wallet_topup_update: walletTopupUpdate } : {}) })
+      let cartOrderUpdate = null
+      let ambiguousCartPayment = false
+      try {
+        const cartFeature = await getCartFeatureStatus()
+        if (cartFeature.enabled) cartOrderUpdate = await processCartTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id })
+        ambiguousCartPayment = cartOrderUpdate?.ambiguous === true
+      } catch (orderError) {
+        console.error('Error comprobando pago de carrito duplicado:', orderError.code || orderError.message)
+        // Fail closed: do not let the same receipt fall through to legacy tickets if
+        // the enabled cart matcher could not prove that no cart owns this payment.
+        ambiguousCartPayment = true
+      }
+      if (!cartOrderUpdate && !ambiguousCartPayment) {
+        try { etecsaOrderUpdate = await processIncomingTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
+        catch (orderError) { console.error('Error comprobando pago de ticket ETECSA:', orderError.code || orderError.message) }
+        try { gameRechargeOrderUpdate = await processGameRechargeTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
+        catch (orderError) { console.error('Error comprobando pago de recarga de juego:', orderError.code || orderError.message) }
+        try { walletTopupUpdate = await processWalletTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: existing.id }) }
+        catch (orderError) { console.error('Error comprobando recarga de Wallet:', orderError.code || orderError.message) }
+      }
+      return res.status(200).json({ ok: true, duplicate: true, parsed, log_id: existing.id, event_id: eventId, status: 'QUEUED', ...(cartOrderUpdate && !cartOrderUpdate.ambiguous ? { cart_order_update: cartOrderUpdate } : {}), ...(cartOrderUpdate?.ambiguous ? { cart_payment_review: cartOrderUpdate } : {}), ...(etecsaOrderUpdate ? { etecsa_order_update: etecsaOrderUpdate } : {}), ...(gameRechargeOrderUpdate ? { game_recharge_order_update: gameRechargeOrderUpdate } : {}), ...(walletTopupUpdate ? { wallet_topup_update: walletTopupUpdate } : {}), ...(ambiguousCartPayment ? { payment_review_required: true } : {}) })
     }
 
     const payload = {
@@ -217,12 +232,28 @@ router.post('/ingest', async (req, res) => {
     let etecsaOrderUpdate = null
     let gameRechargeOrderUpdate = null
     let walletTopupUpdate = null
-    try { etecsaOrderUpdate = await processIncomingTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
-    catch (orderError) { console.error('Error comprobando pago de ticket ETECSA:', orderError.code || orderError.message) }
-    try { gameRechargeOrderUpdate = await processGameRechargeTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
-    catch (orderError) { console.error('Error comprobando pago de recarga de juego:', orderError.code || orderError.message) }
-    try { walletTopupUpdate = await processWalletTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
-    catch (orderError) { console.error('Error comprobando recarga de Wallet:', orderError.code || orderError.message) }
+    let cartOrderUpdate = null
+    let ambiguousCartPayment = false
+    try {
+      const cartFeature = await getCartFeatureStatus()
+      if (cartFeature.enabled) cartOrderUpdate = await processCartTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id })
+      ambiguousCartPayment = cartOrderUpdate?.ambiguous === true
+    } catch (orderError) {
+      console.error('Error comprobando pago de carrito:', orderError.code || orderError.message)
+      // Once cart support is enabled, a matching error must not let the same receipt
+      // fall through and pay a legacy ticket with an identical amount.
+      ambiguousCartPayment = true
+    }
+    // A matched cart owns the whole transfer. An ambiguous cart/legacy collision must
+    // not be arbitrarily assigned by the legacy matcher chain.
+    if (!cartOrderUpdate && !ambiguousCartPayment) {
+      try { etecsaOrderUpdate = await processIncomingTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
+      catch (orderError) { console.error('Error comprobando pago de ticket ETECSA:', orderError.code || orderError.message) }
+      try { gameRechargeOrderUpdate = await processGameRechargeTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
+      catch (orderError) { console.error('Error comprobando pago de recarga de juego:', orderError.code || orderError.message) }
+      try { walletTopupUpdate = await processWalletTransfer({ client, parsed, receivedAt: receivedIso, smsLogId: log?.id }) }
+      catch (orderError) { console.error('Error comprobando recarga de Wallet:', orderError.code || orderError.message) }
+    }
 
     const webhookPayload = buildWebhookPayload(client, parsed, sender, body, receivedIso, eventId, log?.id, messageHash)
     const hasWebhooks = Boolean(canDispatchPersonalWebhook(client) && (client.webhook_url || client.webhook_url_2 || client.webhook_url_3))
@@ -247,6 +278,8 @@ router.post('/ingest', async (req, res) => {
       ...(etecsaOrderUpdate ? { etecsa_order_update: etecsaOrderUpdate } : {}),
       ...(gameRechargeOrderUpdate ? { game_recharge_order_update: gameRechargeOrderUpdate } : {}),
       ...(walletTopupUpdate ? { wallet_topup_update: walletTopupUpdate } : {}),
+      ...(cartOrderUpdate && !cartOrderUpdate.ambiguous ? { cart_order_update: cartOrderUpdate } : {}),
+      ...(ambiguousCartPayment ? { payment_review_required: true } : {}),
     })
   } catch (error) {
     if (error.code === 'TOKEN_REVOKED') {

@@ -8,6 +8,7 @@ const { refreshCatalog, getCatalogStatus } = require('../utils/rechargeGamesCata
 const {
   getCheckoutConfig, createPaymentOrder, getRecentOrders, getOwnedOrder,
   cancelPaymentOrder, submitRecipientDetails, handleProviderWebhook,
+  listAdminPaymentReviewOrders, confirmPaymentManually, recoverCodeDelivery,
 } = require('../utils/rechargeGamesOrders')
 const { verifyWebhookSignature } = require('../utils/rechargeGamesWebhookSecurity')
 const { checkPlayerRegion } = require('../utils/rechargeGamesRegionCheck')
@@ -128,6 +129,27 @@ router.post('/orders/:id/cancel', async (req, res) => {
 router.post('/orders/:id/recipient', async (req, res) => {
   try { return res.json({ ok: true, order: await submitRecipientDetails(req.client.id, req.params.id, req.body || {}) }) }
   catch (error) { return errorResponse(res, error, 'No se pudieron enviar los datos del jugador.') }
+})
+
+router.get('/admin/payment-review', requireAdmin, async (req, res) => {
+  try {
+    const limit = Number.parseInt(String(req.query.limit || '60'), 10)
+    return res.json({ ok: true, orders: await listAdminPaymentReviewOrders({ limit }) })
+  } catch (error) { return errorResponse(res, error, 'No se pudieron cargar los tickets pendientes de revisión.') }
+})
+
+router.post('/admin/orders/:id/recover-delivery', requireAdmin, async (req, res) => {
+  try { return res.json({ ok: true, ...(await recoverCodeDelivery(req.client, req.params.id)) }) }
+  catch (error) { return errorResponse(res, error, 'No se pudo recuperar el código del proveedor.') }
+})
+
+router.post('/admin/orders/:id/confirm-payment', requireAdmin, async (req, res) => {
+  try {
+    const result = await confirmPaymentManually(req.client, req.params.id, {
+      confirmation: req.body?.confirmation === true, note: req.body?.note || '',
+    })
+    return res.json({ ok: true, ...result })
+  } catch (error) { return errorResponse(res, error, 'No se pudo confirmar el pago y enviar el pedido.') }
 })
 
 router.post('/admin/check-connection', requireAdmin, async (req, res) => {

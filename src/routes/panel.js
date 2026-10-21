@@ -10,6 +10,7 @@ const { getAutomationAvailability, setAutomationAvailability } = require('../uti
 const opsDashboard = require('../utils/opsDashboard')
 const { reconcileRecentPaymentSms } = require('../utils/paymentSmsReconciler')
 const { createIpRateLimiter } = require('../utils/ipRateLimit')
+const { createCampaign, listCampaigns } = require('../utils/rewards')
 
 const ADMIN_SESSION_COOKIE = 'synthesisone_admin_session'
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000
@@ -130,6 +131,24 @@ router.post('/api/ops/reconcile-payments', async (_req, res) => {
 router.get('/api/ops/announcements', async (_req, res) => {
   try { res.json({ ok: true, announcements: await opsDashboard.listAnnouncements({ limit: 100 }) }) }
   catch (error) { res.status(500).json({ ok: false, error: 'No se pudieron cargar los avisos.' }) }
+})
+
+// ── Rewards: admin-managed flash missions ─────────────────────────────────────
+router.get('/api/rewards/campaigns', async (_req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store')
+    res.json({ ok: true, campaigns: await listCampaigns() })
+  } catch (error) {
+    res.status(error.status || 503).json({ ok: false, error: 'No se pudieron cargar las misiones. Comprueba que las migraciones estén aplicadas.' })
+  }
+})
+router.post('/api/rewards/campaigns', async (req, res) => {
+  try {
+    const campaign = await createCampaign(null, req.body || {})
+    res.status(200).json({ ok: true, campaign })
+  } catch (error) {
+    res.status(error.status || 503).json({ ok: false, error: error.status ? error.message : 'No se pudo guardar la misión. Comprueba que las migraciones estén aplicadas.' })
+  }
 })
 
 router.post('/api/ops/announcements', async (req, res) => {
@@ -1200,6 +1219,7 @@ tr:hover td{background:#ffffff04}
       <div class="tab" onclick="tab('support')">Soporte <span id="support-unread-badge" class="badge badge-off" style="display:none">0</span></div>
       <div class="tab" onclick="tab('automation')">Automatización</div>
       <div class="tab" onclick="tab('ops')">Salud y pagos</div>
+      <div class="tab" onclick="tab('rewards')">Misiones flash</div>
     </div>
 
     <!-- CLIENTES -->
@@ -1313,6 +1333,34 @@ tr:hover td{background:#ffffff04}
       <div id="ops-announcements"><div class="loading">Cargando avisos…</div></div>
       <p class="automation-hint">La conciliación vuelve a examinar SMS ya almacenados; nunca solicita otro pago ni acredita comprobantes ambiguos. Resolver una incidencia solo cierra la alerta, no cambia el saldo ni el estado financiero.</p>
     </div>
+
+    <!-- MISIONES / CAMPAÑAS FLASH -->
+    <div id="tab-rewards" style="display:none">
+      <div class="sec-head"><span class="sec-title">Misiones relámpago · Recompensas</span><button class="btn btn-sm btn-blue" onclick="loadFlashCampaigns()">↻ Actualizar</button></div>
+      <p class="automation-hint" style="margin-bottom:16px">Las misiones solo cuentan compras en CUP pagadas y verificadas durante el periodo. La recompensa se emite una sola vez por cliente y campaña. Guardar una campaña no activa el programa global de recompensas.</p>
+      <div class="form-panel open" style="display:block">
+        <div class="form-row" style="grid-template-columns:1fr 1fr">
+          <div class="inp-group"><label>Clave única de campaña</label><input id="flash-key" maxlength="48" placeholder="ej. fin-de-semana-octubre" /></div>
+          <div class="inp-group"><label>Título visible al cliente</label><input id="flash-title" maxlength="100" placeholder="Misión relámpago" /></div>
+        </div>
+        <div class="inp-group"><label>Descripción</label><textarea id="flash-description" maxlength="500" placeholder="Qué debe conseguir el cliente…"></textarea></div>
+        <div class="form-row" style="grid-template-columns:1fr 1fr">
+          <div class="inp-group"><label>Inicio (hora local del navegador)</label><input id="flash-start" type="datetime-local" /></div>
+          <div class="inp-group"><label>Fin (hora local del navegador)</label><input id="flash-end" type="datetime-local" /></div>
+        </div>
+        <div class="form-row" style="grid-template-columns:1fr 1fr">
+          <div class="inp-group"><label>Compra mínima para contar (CUP; estrictamente superior)</label><input id="flash-min-purchase" type="number" min="0" step="1" value="0" /></div>
+          <div class="inp-group"><label>Número de compras válidas necesarias</label><input id="flash-required" type="number" min="1" max="100" step="1" value="1" /></div>
+        </div>
+        <div class="form-row" style="grid-template-columns:1fr 1fr">
+          <div class="inp-group"><label>Descuento de la recompensa (%)</label><input id="flash-percent" type="number" min="0.01" max="100" step="0.01" value="3" /></div>
+          <div class="inp-group"><label>Subtotal mínimo para usar el cupón (CUP)</label><input id="flash-min-reward" type="number" min="0" step="1" value="0" /></div>
+        </div>
+        <label style="display:flex;gap:8px;align-items:center;margin-bottom:14px"><input type="checkbox" id="flash-active" /> Campaña activa durante las fechas indicadas</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" style="width:auto" onclick="saveFlashCampaign()">Guardar misión</button><button class="btn btn-sm btn-red" onclick="resetFlashCampaignForm()">Limpiar formulario</button></div>
+      </div>
+      <div id="flash-campaigns"><div class="loading">Cargando misiones…</div></div>
+    </div>
   </main>
 </div>
 
@@ -1403,8 +1451,9 @@ async function loadAll() {
   await loadLogs()
   await loadOps()
   await loadAnnouncements()
+  await loadFlashCampaigns()
 }
-if (window.PANEL_AUTHENTICATED) { loadAll().catch(e => console.error('Error cargando panel:', e)) }
+if (window.PANEL_AUTHENTICATED) { resetFlashCampaignForm(); loadAll().catch(e => console.error('Error cargando panel:', e)) }
 
 let CLIENTS = []
 
@@ -1899,9 +1948,94 @@ async function createAnnouncement() {
   } catch (e) { toast(String(e.message || e), true) }
 }
 
+// ── Rewards / flash missions ───────────────────────────────────────────────────
+let FLASH_CAMPAIGNS = []
+function localDateTimeValue(value) {
+  const date = value ? new Date(value) : null
+  if (!date || !Number.isFinite(date.getTime())) return ''
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
+}
+function resetFlashCampaignForm() {
+  document.getElementById('flash-key').value = ''
+  document.getElementById('flash-title').value = ''
+  document.getElementById('flash-description').value = ''
+  const start = new Date(Date.now() + 60 * 1000); start.setSeconds(0, 0)
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000)
+  document.getElementById('flash-start').value = localDateTimeValue(start.toISOString())
+  document.getElementById('flash-end').value = localDateTimeValue(end.toISOString())
+  document.getElementById('flash-min-purchase').value = '0'
+  document.getElementById('flash-required').value = '1'
+  document.getElementById('flash-percent').value = '3'
+  document.getElementById('flash-min-reward').value = '0'
+  document.getElementById('flash-active').checked = false
+}
+async function loadFlashCampaigns() {
+  const host = document.getElementById('flash-campaigns')
+  if (!host) return
+  try {
+    const data = await api('/rewards/campaigns')
+    if (!data || data.error || !Array.isArray(data.campaigns)) throw new Error(data?.error || 'No se pudieron cargar las misiones')
+    FLASH_CAMPAIGNS = data.campaigns
+    if (!FLASH_CAMPAIGNS.length) { host.innerHTML = '<div class="empty">Todavía no hay misiones relámpago.</div>'; return }
+    host.innerHTML = '<div class="tbl-wrap"><table><thead><tr><th>Misión</th><th>Periodo</th><th>Objetivo</th><th>Recompensa</th><th>Estado</th><th>Acciones</th></tr></thead><tbody>' + FLASH_CAMPAIGNS.map(c => {
+      const state = c.active ? 'ACTIVA' : 'PAUSADA'
+      const objective = \`\${Number(c.required_purchases || 1)} compra(s) > \${Number(c.minimum_purchase_cup || 0).toLocaleString('es-ES')} CUP\`
+      const reward = \`\${Number(c.reward_percent || 0)}% · mínimo \${Number(c.reward_minimum_subtotal_cup || 0).toLocaleString('es-ES')} CUP\`
+      return \`<tr><td><strong>\${escapeHtml(c.title)}</strong><br><small>\${escapeHtml(c.campaign_key)}</small><br><small>\${escapeHtml(c.description || '')}</small></td><td>\${escapeHtml(new Date(c.starts_at).toLocaleString())}<br>→ \${escapeHtml(new Date(c.ends_at).toLocaleString())}</td><td>\${escapeHtml(objective)}</td><td>\${escapeHtml(reward)}</td><td>\${state}</td><td><button class="btn btn-sm btn-blue" data-flash-edit="\${escapeHtml(c.campaign_key)}">Editar</button> <button class="btn btn-sm \${c.active ? 'btn-red' : 'btn-green'}" data-flash-toggle="\${escapeHtml(c.campaign_key)}">\${c.active ? 'Pausar' : 'Activar'}</button></td></tr>\`
+    }).join('') + '</tbody></table></div>'
+    host.querySelectorAll('[data-flash-edit]').forEach(button => button.addEventListener('click', () => {
+      const c = FLASH_CAMPAIGNS.find(item => item.campaign_key === button.dataset.flashEdit)
+      if (!c) return
+      document.getElementById('flash-key').value = c.campaign_key || ''
+      document.getElementById('flash-title').value = c.title || ''
+      document.getElementById('flash-description').value = c.description || ''
+      document.getElementById('flash-start').value = localDateTimeValue(c.starts_at)
+      document.getElementById('flash-end').value = localDateTimeValue(c.ends_at)
+      document.getElementById('flash-min-purchase').value = String(c.minimum_purchase_cup || 0)
+      document.getElementById('flash-required').value = String(c.required_purchases || 1)
+      document.getElementById('flash-percent').value = String(c.reward_percent || 3)
+      document.getElementById('flash-min-reward').value = String(c.reward_minimum_subtotal_cup || 0)
+      document.getElementById('flash-active').checked = c.active === true
+      document.getElementById('flash-key').focus()
+    }))
+    host.querySelectorAll('[data-flash-toggle]').forEach(button => button.addEventListener('click', async () => {
+      const c = FLASH_CAMPAIGNS.find(item => item.campaign_key === button.dataset.flashToggle)
+      if (!c) return
+      try {
+        const data = await api('/rewards/campaigns', {method:'POST', body:JSON.stringify({...c, active:!c.active})})
+        if (data.error) throw new Error(data.error)
+        toast(c.active ? 'Misión pausada' : 'Misión activada')
+        await loadFlashCampaigns()
+      } catch (e) { toast(String(e.message || e), true) }
+    }))
+  } catch (e) { host.innerHTML = \`<div class="empty">\${escapeHtml(String(e.message || e))}</div>\` }
+}
+async function saveFlashCampaign() {
+  const key = document.getElementById('flash-key').value.trim().toLowerCase()
+  const title = document.getElementById('flash-title').value.trim()
+  const description = document.getElementById('flash-description').value.trim()
+  const startRaw = document.getElementById('flash-start').value
+  const endRaw = document.getElementById('flash-end').value
+  if (!key || !title || !startRaw || !endRaw) return toast('Completa la clave, el título y las fechas.', true)
+  const start = new Date(startRaw), end = new Date(endRaw)
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start) return toast('La fecha final debe ser posterior al inicio.', true)
+  const body = {campaign_key:key,title,description,starts_at:start.toISOString(),ends_at:end.toISOString(),
+    minimum_purchase_cup:Number(document.getElementById('flash-min-purchase').value),
+    required_purchases:Number(document.getElementById('flash-required').value),
+    reward_percent:Number(document.getElementById('flash-percent').value),
+    reward_minimum_subtotal_cup:Number(document.getElementById('flash-min-reward').value),
+    active:document.getElementById('flash-active').checked}
+  try {
+    const data = await api('/rewards/campaigns', {method:'POST', body:JSON.stringify(body)})
+    if (data.error) throw new Error(data.error)
+    toast('Misión guardada')
+    await loadFlashCampaigns()
+  } catch (e) { toast(String(e.message || e), true) }
+}
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function tab(name) {
-  const names=['clients','logs','support','automation','ops']
+  const names=['clients','logs','support','automation','ops','rewards']
   document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('on',names[i]===name))
   for (const key of names) {
     const el=document.getElementById('tab-'+key)
@@ -1911,6 +2045,7 @@ function tab(name) {
   if (name==='support') loadSupportThreads()
   if (name==='automation') loadAutomationStatus()
   if (name==='ops') { loadOps(); loadAnnouncements() }
+  if (name==='rewards') loadFlashCampaigns()
   if (SUPPORT_REFRESH) { clearInterval(SUPPORT_REFRESH); SUPPORT_REFRESH=null }
   if (name==='support') SUPPORT_REFRESH=setInterval(()=>{loadSupportThreads();if(SUPPORT_CLIENT_ID)openSupportThread(SUPPORT_CLIENT_ID)},10000)
 }
