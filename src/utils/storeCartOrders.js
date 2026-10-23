@@ -6,6 +6,8 @@ const { getProviderOffer, submitProviderOrder } = require('./rechargeGamesOrders
 const { submitRecipientDetails: submitEtecsaRecipientDetails } = require('./etecsaOrders')
 const { getCatalogResponse } = require('./etecsaCatalog')
 const { getLicenseConfig } = require('./onboarding')
+const { getPaymentConfig } = require('./paymentDestinations')
+const { safeAutomationMessage } = require('./customerMessages')
 const { getAutomationAvailability } = require('./systemSettings')
 const { evaluateOfficialStorePayment, isConfiguredPaymentReceiver } = require('./walletPaymentMatching')
 const { readAllRows } = require('./supabasePagination')
@@ -171,7 +173,7 @@ async function createCartOrder(client, body) {
   const items = await validateCartItems(body?.items, paymentMethod, basis)
   const payerCandidate = paymentMethod === 'TRANSFERMOVIL' ? phone(body?.payer_phone) : null
   if (paymentMethod === 'TRANSFERMOVIL' && !/^5\d{7}$/.test(payerCandidate || '')) throw err('Introduce el móvil cubano desde el que realizarás la transferencia.', 400, 'INVALID_PAYER_PHONE')
-  const requestShape = { payment_method: paymentMethod, price_basis: basis, coupon_code: couponCode.toUpperCase(), payer_phone: payerCandidate, items: items.map(x => ({ source: x.source, offer_id: x.offer_id, price_id: x.price_id, player_id: x.player_id, server_id: x.server_id, recipient: x.recipient, recipient_name: x.recipient_name, email: x.email })) }
+  const requestShape = { payment_method: paymentMethod, price_basis: basis, coupon_code: couponCode.toUpperCase(), payer_phone: payerCandidate, payment_destination_id: paymentMethod === 'TRANSFERMOVIL' ? String(body?.payment_destination_id || '') : '', items: items.map(x => ({ source: x.source, offer_id: x.offer_id, price_id: x.price_id, player_id: x.player_id, server_id: x.server_id, recipient: x.recipient, recipient_name: x.recipient_name, email: x.email })) }
   const fingerprint = hash(requestShape)
   // For both transfer and Wallet, a lost HTTP response may be retried with the same key.
   // Return the original cart instead of opening a second ticket or reserving twice.
@@ -215,8 +217,9 @@ async function createCartOrder(client, body) {
   let paymentConfig = null
   if (paymentMethod === 'TRANSFERMOVIL') {
     const automation = await getAutomationAvailability()
-    if (!automation.enabled) throw err(automation.message || 'Los pagos automáticos están temporalmente desactivados.', 503, 'AUTOMATION_UNAVAILABLE')
-    paymentConfig = getLicenseConfig()
+    if (!automation.enabled) throw err(safeAutomationMessage(automation.message), 503, 'AUTOMATION_UNAVAILABLE')
+    try { paymentConfig = await getPaymentConfig(getLicenseConfig(), body?.payment_destination_id) }
+    catch (error) { throw err(error.message || 'No hay una cuenta de transferencia activa.', error.status || 503, error.code || 'PAYMENT_CONFIG_MISSING') }
     if (!paymentConfig.configured || paymentConfig.currency !== 'CUP') throw err('El pago automático no está configurado. Inténtalo más tarde.', 503, 'PAYMENT_CONFIG_MISSING')
     payerPhone = payerCandidate
   } else if (basis === 'SALDO' && couponCode) {

@@ -5,6 +5,8 @@ const supabase = require('../supabase')
 const { readAllRows } = require('./supabasePagination')
 const { bot, ADMINS } = require('../telegram')
 const { getLicenseConfig, cardMatches } = require('./onboarding')
+const { getPaymentConfig, getPaymentDestinations } = require('./paymentDestinations')
+const { safeAutomationMessage } = require('./customerMessages')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
 const { normalizePayerPhone, isConfiguredPaymentReceiver } = require('./etecsaPaymentMatching')
@@ -36,6 +38,13 @@ function errorWithStatus(message, status, code) {
 }
 function makeTicket(id) { return `RG-${String(id || '').replace(/-/g, '').slice(0, 8).toUpperCase()}` }
 
+function customerSafeOrderText(value, fallback = null) {
+  const text = String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300)
+  if (!text) return fallback
+  if (/\b(recharge[\s_-]?games|soky(?:recargas)?|render|supabase|postgrest|service[\s_-]?role|api[\s_-]?key)\b/i.test(text)) return fallback
+  return text
+}
+
 function publicOrder(order) {
   if (!order) return null
   const result = {
@@ -62,8 +71,8 @@ function publicOrder(order) {
     paid_at: order.paid_at || null,
     updated_at: order.updated_at,
     provider_status: order.provider_status || null,
-    delivery_note: order.provider_delivery_note || null,
-    failure_reason: order.wallet_refunded_at ? 'La entrega falló y el importe ya fue devuelto a tu Wallet.' : order.status === 'REFUND_REQUIRED' ? 'La entrega falló. Tu caso requiere resolución; no vuelvas a pagar.' : order.status === 'FULFILLMENT_REVIEW' ? 'El pedido necesita revisión. No vuelvas a pagar.' : order.failure_reason || null,
+    delivery_note: customerSafeOrderText(order.provider_delivery_note, String(order.status || '').toUpperCase() === 'COMPLETED' ? 'Entrega confirmada.' : null),
+    failure_reason: order.wallet_refunded_at ? 'La entrega falló y el importe ya fue devuelto a tu Wallet.' : order.status === 'REFUND_REQUIRED' ? 'La entrega falló. Tu caso requiere resolución; no vuelvas a pagar.' : order.status === 'FULFILLMENT_REVIEW' ? 'El pedido necesita revisión. No vuelvas a pagar.' : customerSafeOrderText(order.failure_reason, null),
     payment_source: order.payment_source || 'TRANSFERMOVIL',
     requirements: {
       delivery: order.provider_delivery,
@@ -150,12 +159,14 @@ async function assertNoOtherWaitingCheckout(clientId) {
 
 async function getCheckoutConfig() {
   const automation = await getAutomationAvailability()
-  const config = getLicenseConfig()
+  const destinations = await getPaymentDestinations().catch(() => [])
+  const first = destinations[0] || null
+  const configured = Boolean(first && first.card_number && first.confirmation_phone && getLicenseConfig().currency === 'CUP')
   return {
     automation_enabled: automation.enabled,
-    automation_message: automation.message,
-    payment_configured: Boolean(config.configured && config.currency === 'CUP'),
-    payment: config.configured ? { card: config.paymentCard, confirmation_phone: config.paymentPhone, currency: 'CUP' } : null,
+    automation_message: safeAutomationMessage(automation.message),
+    payment_configured: configured,
+    payment: configured ? { card: first.card_number, confirmation_phone: first.confirmation_phone, destination_id: first.id, destinations, currency: 'CUP' } : null,
   }
 }
 
@@ -180,8 +191,10 @@ async function getProviderOffer(offerId) {
 
 async function createPaymentOrder(client, body) {
   const automation = await getAutomationAvailability()
-  if (!automation.enabled) throw errorWithStatus(automation.message || 'Los pagos automáticos están temporalmente desactivados.', 503, 'AUTOMATION_UNAVAILABLE')
-  const paymentConfig = getLicenseConfig()
+  if (!automation.enabled) throw errorWithStatus(safeAutomationMessage(automation.message), 503, 'AUTOMATION_UNAVAILABLE')
+  let paymentConfig
+  try { paymentConfig = await getPaymentConfig(getLicenseConfig(), body?.payment_destination_id) }
+  catch (error) { throw errorWithStatus(error.message || 'No hay una cuenta de transferencia activa.', error.status || 503, error.code || 'PAYMENT_CONFIG_MISSING') }
   if (!paymentConfig.configured || paymentConfig.currency !== 'CUP' ||
       !String(paymentConfig.paymentCard || '').trim() || !String(paymentConfig.paymentPhone || '').trim()) {
     throw errorWithStatus('La transferencia no está configurada completamente. No se creó ningún ticket; inténtalo más tarde.', 503, 'PAYMENT_CONFIG_MISSING')

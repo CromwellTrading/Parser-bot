@@ -3,6 +3,8 @@
 const crypto = require('crypto')
 const supabase = require('../supabase')
 const { getLicenseConfig } = require('./onboarding')
+const { getPaymentConfig } = require('./paymentDestinations')
+const { safeCustomerText } = require('./customerMessages')
 const { normalizePhone, parseSms } = require('./parser')
 const { readAllRows } = require('./supabasePagination')
 const { normalizePayerPhone, isConfiguredPaymentReceiver } = require('./etecsaPaymentMatching')
@@ -260,7 +262,9 @@ async function createTopup(client, body) {
   let destinationCard = null
   let confirmationPhone = null
   if (currency === 'CUP') {
-    const config = getLicenseConfig()
+    let config
+    try { config = await getPaymentConfig(getLicenseConfig(), body?.payment_destination_id) }
+    catch (error) { throw fail(error.message || 'No hay una cuenta de transferencia activa.', error.status || 503, error.code || 'PAYMENT_CONFIG_MISSING') }
     if (!config.configured || config.currency !== 'CUP') throw fail('El método de pago CUP está temporalmente no disponible.', 503, 'PAYMENT_CONFIG_MISSING')
     destinationCard = config.paymentCard
     confirmationPhone = config.paymentPhone
@@ -269,7 +273,7 @@ async function createTopup(client, body) {
     // phone must be configured and have an SMS-relay client online in the backend.
     confirmationPhone = normalizePayerPhone(process.env.STORE_WALLET_SALDO_RECEIVER_PHONE || '').replace(/\D/g, '')
     if (!/^5\d{7}$/.test(confirmationPhone || '')) {
-      throw fail('El depósito de Saldo Móvil todavía no está configurado. Administración debe definir STORE_WALLET_SALDO_RECEIVER_PHONE.', 503, 'SALDO_WALLET_RECEIVER_NOT_CONFIGURED')
+      throw fail('El depósito de Saldo Móvil no está disponible en este momento. Inténtalo más tarde.', 503, 'SALDO_WALLET_RECEIVER_NOT_CONFIGURED')
     }
     // First query the exact normalized phone; if historical rows use a different
     // formatting, page through clients and compare normalized values rather than
@@ -722,7 +726,7 @@ async function getStoreStatusSnapshot(clientId) {
     amount: Number(row.payment_amount), currency: String(row.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP', status: row.wallet_refunded_at ? 'REFUNDED' : row.status,
     message: shortFailure(row.wallet_refunded_at ? 'REFUNDED' : row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at,
     paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL', wallet_refunded_at: row.wallet_refunded_at || null,
-    provider_delivery: row.provider_delivery || null, provider_status: row.provider_status || null, delivery_note: row.provider_delivery_note || null,
+    provider_delivery: row.provider_delivery || null, provider_status: row.provider_status || null, delivery_note: safeCustomerText(row.provider_delivery_note, row.status === 'COMPLETED' ? 'Entrega confirmada.' : null, 300),
     destination_card: row.status === 'WAITING_PAYMENT' ? (row.destination_card || null) : null, confirmation_phone: row.status === 'WAITING_PAYMENT' ? (row.confirmation_phone || null) : null, payer_phone: row.status === 'WAITING_PAYMENT' ? (row.payer_phone || null) : null,
   })
   for (const row of topups.data || []) entries.push({
@@ -790,7 +794,7 @@ async function getStoreHistory(clientId) {
       amount: Number(row.payment_amount), currency: String(row.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP', price_basis: row.price_basis || 'CUP', status: effectiveStatus,
       message: shortFailure(effectiveStatus, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at,
       payment_source: row.payment_source || 'TRANSFERMOVIL', wallet_refunded_at: row.wallet_refunded_at || null,
-      provider_delivery: row.provider_delivery || null, provider_status: row.provider_status || null, delivery_note: row.provider_delivery_note || null,
+      provider_delivery: row.provider_delivery || null, provider_status: row.provider_status || null, delivery_note: safeCustomerText(row.provider_delivery_note, effectiveStatus === 'COMPLETED' ? 'Entrega confirmada.' : null, 300),
       destination_card: row.status === 'WAITING_PAYMENT' ? (row.destination_card || null) : null, confirmation_phone: row.status === 'WAITING_PAYMENT' ? (row.confirmation_phone || null) : null, payer_phone: row.status === 'WAITING_PAYMENT' ? (row.payer_phone || null) : null,
     })
   }

@@ -5,6 +5,8 @@ const supabase = require('../supabase')
 const { readAllRows } = require('./supabasePagination')
 const { bot, ADMINS } = require('../telegram')
 const { getLicenseConfig, cardMatches } = require('./onboarding')
+const { getPaymentConfig, getPaymentDestinations } = require('./paymentDestinations')
+const { safeAutomationMessage } = require('./customerMessages')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
 const { getCatalogResponse } = require('./etecsaCatalog')
@@ -132,17 +134,15 @@ async function findBlockingOrder(clientId) {
 }
 
 async function getCheckoutConfig() {
-  const licenseConfig = getLicenseConfig()
   const automation = await getAutomationAvailability()
+  const destinations = await getPaymentDestinations().catch(() => [])
+  const first = destinations[0] || null
+  const configured = Boolean(first && first.card_number && first.confirmation_phone && getLicenseConfig().currency === 'CUP')
   return {
     automation_enabled: automation.enabled,
-    automation_message: automation.message,
-    payment_configured: Boolean(licenseConfig.configured && licenseConfig.currency === 'CUP'),
-    payment: licenseConfig.configured ? {
-      card: licenseConfig.paymentCard,
-      confirmation_phone: licenseConfig.paymentPhone,
-      currency: 'CUP',
-    } : null,
+    automation_message: safeAutomationMessage(automation.message),
+    payment_configured: configured,
+    payment: configured ? { card: first.card_number, confirmation_phone: first.confirmation_phone, destination_id: first.id, destinations, currency: 'CUP' } : null,
   }
 }
 
@@ -150,10 +150,12 @@ async function createPaymentOrder(client, body) {
   await assertNoWaitingCart(client.id)
   const automation = await getAutomationAvailability()
   if (!automation.enabled) {
-    const error = new Error(automation.message || 'Las automatizaciones están temporalmente desactivadas.')
+    const error = new Error(safeAutomationMessage(automation.message))
     error.code = 'AUTOMATION_UNAVAILABLE'; error.status = 503; throw error
   }
-  const paymentConfig = getLicenseConfig()
+  let paymentConfig
+  try { paymentConfig = await getPaymentConfig(getLicenseConfig(), body?.payment_destination_id) }
+  catch (error) { throw errorWithStatus(error.message || 'No hay una cuenta de transferencia activa.', error.status || 503, error.code || 'ETECSA_PAYMENT_CONFIG_MISSING') }
   if (!paymentConfig.configured || paymentConfig.currency !== 'CUP') {
     const error = new Error('El pago automático no está configurado. Inténtalo más tarde.')
     error.code = 'ETECSA_PAYMENT_CONFIG_MISSING'; error.status = 503; throw error
