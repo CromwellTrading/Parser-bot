@@ -17,6 +17,8 @@ const { evaluateActivationTiming } = require('../utils/onboarding')
 const { encryptActivationSecret } = require('../utils/activationSecretVault')
 const { expireDueLicenses } = require('../utils/licenseExpiry')
 const { getAutomationAvailability } = require('../utils/systemSettings')
+const { getPaymentDestinations, resolvePaymentDestination } = require('../utils/paymentDestinations')
+const { safeAutomationMessage } = require('../utils/customerMessages')
 
 const SESSION_TTL_HOURS = Number(process.env.ACTIVATION_SESSION_TTL_HOURS || 24)
 const MAX_BOOTSTRAP_SMS_AGE_MS = Number(process.env.ACTIVATION_MAX_SMS_AGE_MS || 2 * 60 * 60 * 1000)
@@ -65,8 +67,9 @@ function publicActivation(session, includeSecret = false) {
       amount: Number(session.price_amount || CONFIG.amount),
       price_type: session.price_type || 'initial',
       currency: CONFIG.currency,
-      card: CONFIG.paymentCard || null,
-      confirmation_phone: CONFIG.paymentPhone || null,
+      card: session.destination_card || null,
+      confirmation_phone: session.confirmation_phone || null,
+      destination_id: session.payment_destination_id || null,
     },
   }
   if (includeSecret) result.activation_secret = includeSecret === true ? session.activation_secret : undefined
@@ -245,6 +248,8 @@ async function createClientFromPayment(session, parsed, receivedIso) {
 
 router.get('/config', async (req, res) => {
   const automation = await getAutomationAvailability()
+  let destinations = []
+  try { destinations = automation.enabled ? await getPaymentDestinations() : [] } catch (_) {}
   let price = { amount: CONFIG.amount, price_type: 'initial', renewal: false }
   const phoneNumber = normalizeRegisteredPhone(req.query?.phone_number || req.query?.phoneNumber || '')
   if (phoneNumber && /^5\d{7}$/.test(phoneNumber)) {
@@ -256,17 +261,19 @@ router.get('/config', async (req, res) => {
   res.set('Cache-Control', 'no-store')
   res.json({
     ok: true,
-    configured: CONFIG.configured,
+    configured: automation.enabled && destinations.length > 0 && CONFIG.amount !== null,
     automation_enabled: automation.enabled,
-    automation_message: automation.message,
+    automation_message: safeAutomationMessage(automation.message),
     payment: {
       amount: price.amount,
       price_type: price.price_type,
       renewal_amount: RENEWAL_PRICE_AMOUNT,
       initial_amount: CONFIG.amount,
       currency: CONFIG.currency,
-      card: CONFIG.paymentCard || null,
-      confirmation_phone: CONFIG.paymentPhone || null,
+      card: destinations[0]?.card_number || null,
+      confirmation_phone: destinations[0]?.confirmation_phone || null,
+      destination_id: destinations[0]?.id || null,
+      destinations,
       duration_days: CONFIG.durationDays,
       payment_window_ms: PAYMENT_WINDOW_MS,
       confirmation_grace_ms: CONFIRMATION_GRACE_MS,
@@ -325,7 +332,7 @@ router.post('/register', async (req, res) => {
     // anuncia que el SMS relay no está disponible.
     const automation = await getAutomationAvailability()
     if (!automation.enabled) {
-      return res.status(503).json({ ok: false, code: 'AUTOMATION_UNAVAILABLE', error: automation.message, automation_enabled: false })
+      return res.status(503).json({ ok: false, code: 'AUTOMATION_UNAVAILABLE', error: safeAutomationMessage(automation.message), automation_enabled: false })
     }
     const price = await getPriceForPhone(phoneNumber)
 
@@ -386,18 +393,24 @@ router.post('/start', async (req, res) => {
     if (!session) return
     const automation = await getAutomationAvailability()
     if (!automation.enabled) {
-      return res.status(503).json({ ok: false, code: 'AUTOMATION_UNAVAILABLE', error: automation.message, automation_enabled: false })
+      return res.status(503).json({ ok: false, code: 'AUTOMATION_UNAVAILABLE', error: safeAutomationMessage(automation.message), automation_enabled: false })
     }
     if (!['READY_TO_PAY', 'WAITING_PAYMENT', 'WAITING_LATE_CONFIRMATION'].includes(session.status)) {
       return res.status(409).json({ error: 'Sesión no disponible para iniciar el pago', status: session.status })
     }
 
     if (session.status === 'READY_TO_PAY') {
+      let destination
+      try { destination = await resolvePaymentDestination(req.body?.payment_destination_id || '') }
+      catch (error) { return res.status(error.status || 503).json({ ok: false, code: error.code || 'PAYMENT_CONFIG_MISSING', error: error.message || 'No hay una cuenta de transferencia activa.' }) }
       const started = Date.now()
       const paymentDeadline = started + PAYMENT_WINDOW_MS
       const confirmationDeadline = paymentDeadline + CONFIRMATION_GRACE_MS
       const updated = await updateSession(session.activation_id, {
         status: 'WAITING_PAYMENT',
+        destination_card: destination.card_number,
+        confirmation_phone: destination.confirmation_phone,
+        payment_destination_id: destination.id === 'legacy-env' ? null : destination.id,
         payment_started_at: new Date(started).toISOString(),
         payment_deadline_at: new Date(paymentDeadline).toISOString(),
         confirmation_deadline_at: new Date(confirmationDeadline).toISOString(),
@@ -560,7 +573,7 @@ router.post('/sms', async (req, res) => {
 
     const receivedIso = receivedDate.toISOString()
     const parsed = parseSms(sender, body, receivedIso)
-    const sessionConfig = { ...CONFIG, amount: Number(session.price_amount || CONFIG.amount) }
+    const sessionConfig = { ...CONFIG, amount: Number(session.price_amount || CONFIG.amount), paymentCard: session.destination_card || null, paymentPhone: session.confirmation_phone || null, configured: Boolean(session.destination_card && session.confirmation_phone) }
     const evaluation = evaluateLicensePayment(parsed, session, sessionConfig)
     const timing = evaluateActivationTiming({
       paymentStartedAt: session.payment_started_at,

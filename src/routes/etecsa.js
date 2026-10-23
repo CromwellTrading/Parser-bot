@@ -10,6 +10,7 @@ const {
   verifySokyWebhookSignature, handleSokyWebhook, listAdminOrders,
 } = require('../utils/etecsaOrders')
 const { requireNonRevokedToken } = require('../utils/tokenState')
+const { safeCustomerText } = require('../utils/customerMessages')
 const { canUseOfficialStore } = require('../utils/storeSessionAccess')
 const {
   getPricingSettings,
@@ -101,7 +102,7 @@ router.post('/webhook', async (req, res) => {
     const result = await handleSokyWebhook(req.body || {})
     return res.status(200).json({ ok: true, ...result })
   } catch (error) {
-    if (error.status) return res.status(error.status).json({ error: error.message })
+    if (error.status) return res.status(error.status).json({ error: safeCustomerText(error.message, 'No se pudo completar la operación.', 500) })
     console.error('Error procesando aviso Soky ETECSA:', error.code || error.message)
     return res.status(500).json({ error: 'No se pudo procesar el aviso.' })
   }
@@ -154,7 +155,7 @@ router.post('/orders', async (req, res) => {
     return res.status(201).json({ ok: true, order })
   } catch (error) {
     if (error.status) return res.status(error.status).json({
-      code: error.code || 'ETECSA_ORDER_ERROR', error: error.message,
+      code: error.code || 'ETECSA_ORDER_ERROR', error: safeCustomerText(error.message, 'No se pudo completar la operación.', 500),
       ...(error.order ? { order: error.order } : {}),
     })
     console.error('Error creando ticket ETECSA:', error.code || error.message)
@@ -167,7 +168,7 @@ router.post('/orders/:id/cancel', async (req, res) => {
     const order = await cancelPaymentOrder(req.client.id, req.params.id)
     return res.json({ ok: true, order })
   } catch (error) {
-    if (error.status) return res.status(error.status).json({ code: error.code || 'ETECSA_ORDER_ERROR', error: error.message })
+    if (error.status) return res.status(error.status).json({ code: error.code || 'ETECSA_ORDER_ERROR', error: safeCustomerText(error.message, 'No se pudo completar la operación.', 500) })
     console.error('Error cancelando ticket ETECSA:', error.code || error.message)
     return res.status(500).json({ error: 'No se pudo cancelar la operación.' })
   }
@@ -178,7 +179,7 @@ router.post('/orders/:id/recipient', async (req, res) => {
     const order = await submitRecipientDetails(req.client.id, req.params.id, req.body || {})
     return res.json({ ok: true, order })
   } catch (error) {
-    if (error.status) return res.status(error.status).json({ code: error.code || 'ETECSA_ORDER_ERROR', error: error.message })
+    if (error.status) return res.status(error.status).json({ code: error.code || 'ETECSA_ORDER_ERROR', error: safeCustomerText(error.message, 'No se pudo completar la operación.', 500) })
     console.error('Error enviando pedido ETECSA a Soky:', error.code || error.message)
     return res.status(500).json({ error: 'No se pudo enviar la solicitud. No realices otro pago.' })
   }

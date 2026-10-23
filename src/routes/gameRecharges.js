@@ -12,6 +12,7 @@ const {
 } = require('../utils/rechargeGamesOrders')
 const { verifyWebhookSignature } = require('../utils/rechargeGamesWebhookSecurity')
 const { checkPlayerRegion } = require('../utils/rechargeGamesRegionCheck')
+const { safeCustomerText } = require('../utils/customerMessages')
 
 const router = express.Router()
 
@@ -26,7 +27,7 @@ function isExpired(expiresAt) {
   return !Number.isNaN(expires.getTime()) && expires < new Date()
 }
 function errorResponse(res, error, fallback = 'No se pudo completar la operación.') {
-  if (error?.status) return res.status(error.status).json({ code: error.code || 'GAME_RECHARGE_ERROR', error: error.message, ...(error.order ? { order: error.order } : {}) })
+  if (error?.status) return res.status(error.status).json({ code: error.code || 'GAME_RECHARGE_ERROR', error: safeCustomerText(error.message, fallback, 500) || fallback, ...(error.order ? { order: error.order } : {}) })
   console.error('[RechargeGames] Error interno:', error?.code || error?.message || 'unknown')
   return res.status(500).json({ error: fallback })
 }

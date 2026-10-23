@@ -9,6 +9,7 @@ const { createWalletGameOrder } = require('../utils/rechargeGamesOrders')
 const { listAnnouncements } = require('../utils/opsDashboard')
 
 const router = express.Router()
+const { safeCustomerText } = require('../utils/customerMessages')
 
 function extractToken(req) {
   const header = String(req.headers.authorization || '')
@@ -40,7 +41,7 @@ async function requireStoreClient(req, res, next) {
 }
 
 function respondError(res, error, fallback) {
-  if (error?.status) return res.status(error.status).json({ ok: false, code: error.code || 'STORE_ACCOUNT_ERROR', error: error.message, ...(error.order ? { order: error.order } : {}) })
+  if (error?.status) return res.status(error.status).json({ ok: false, code: error.code || 'STORE_ACCOUNT_ERROR', error: safeCustomerText(error.message, fallback, 500) || fallback, ...(error.order ? { order: error.order } : {}) })
   console.error('[StoreAccount] Error:', error?.code || error?.message || 'unknown')
   return res.status(500).json({ ok: false, error: fallback })
 }
