@@ -24,3 +24,13 @@ test('reward pricing rejects invalid amounts and discount percentages', () => {
   assert.throws(() => roundedDiscount(-1, 5), /non-negative finite number/)
   assert.throws(() => roundedDiscount(100, 101), /between 0 and 100/)
 })
+
+test('welcome discount tiers exposed to the UI exactly match the server thresholds', () => {
+  const { WELCOME_DISCOUNT_TIERS } = require('../src/utils/rewardPricing')
+  assert.deepEqual(WELCOME_DISCOUNT_TIERS.map(tier => tier.percent), [3, 7, 10])
+  assert.deepEqual(WELCOME_DISCOUNT_TIERS.map(tier => [tier.min, tier.max, tier.min_inclusive, tier.max_inclusive]), [
+    [0, 3000, true, false],
+    [3000, 7000, true, true],
+    [7000, null, false, false],
+  ])
+})
