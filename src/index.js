@@ -37,6 +37,7 @@ const storeAccountRoutes = require('./routes/storeAccount')
 const storeSessionRoutes = require('./routes/storeSession')
 const rewardsRoutes = require('./routes/rewards')
 const storeCartRoutes = require('./routes/storeCart')
+const appUpdatesRoutes = require('./routes/appUpdates')
 
 app.use('/api/auth', authRoutes)
 app.use('/api/sms', smsRoutes)
@@ -53,6 +54,7 @@ app.use('/api/store', storeAccountRoutes)
 app.use('/api/store-session', storeSessionRoutes)
 app.use('/api/rewards', rewardsRoutes)
 app.use('/api/store/cart', storeCartRoutes)
+app.use('/api/app-updates', appUpdatesRoutes)
 
 app.get('/healthz', (req, res) => res.status(200).json({ ok: true, status: 'HEALTHY' }))
 app.get('/readyz', async (_req, res) => {
