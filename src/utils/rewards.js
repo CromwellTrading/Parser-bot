@@ -2,7 +2,7 @@
 
 const crypto = require('crypto')
 const supabase = require('../supabase')
-const { welcomePercent, roundedDiscount } = require('./rewardPricing')
+const { WELCOME_DISCOUNT_TIERS, welcomePercent, roundedDiscount } = require('./rewardPricing')
 const { rewardsEnabled, emptyDiscountQuote, isRewardsSchemaUnavailable } = require('./rewardFeaturePolicy')
 
 const WELCOME_WINDOW_MS = 24 * 60 * 60 * 1000
@@ -383,6 +383,7 @@ async function evaluateMissionRewards(clientId) {
 
   const currentWeek = all.filter(e => e.currency === 'CUP' && Number(e.base_amount || e.amount) > 1000 && Date.parse(e.paid_at) >= period.weekStart.getTime() && Date.parse(e.paid_at) < period.weekEnd.getTime())
   const daySet = new Set(currentWeek.map(e => havanaParts(new Date(e.paid_at)).key))
+  const currentWeekDayKeys = [...daySet].sort()
   if (daySet.size >= 5) await issueCoupon({ clientId, source: 'MISSION_WEEKLY', sourceKey: `mission:weekly:${period.weekKey}`, percent: 3 })
 
   const previousWeekStart = new Date(period.weekStart.getTime() - 7 * 86400000)
@@ -403,12 +404,20 @@ async function evaluateMissionRewards(clientId) {
   for (const campaign of activeCampaigns.data || []) {
     const campaignEvents = all.filter(e => Date.parse(e.paid_at) >= Date.parse(campaign.starts_at) && Date.parse(e.paid_at) <= now.getTime() && e.currency === 'CUP' && Number(e.base_amount || e.amount) > Number(campaign.minimum_purchase_cup || 0))
     const count = campaignEvents.length
-    campaignProgress.push({ id: campaign.id, campaign_key: campaign.campaign_key, title: campaign.title, description: campaign.description, ends_at: campaign.ends_at, progress: count, target: Number(campaign.required_purchases), completed: count >= Number(campaign.required_purchases), reward_percent: Number(campaign.reward_percent) })
+    // Expose the already-configured campaign rules so the client can explain them verbatim.
+    // These fields are presentation metadata only; eligibility and coupon issuance stay here.
+    campaignProgress.push({
+      id: campaign.id, campaign_id: campaign.id, campaign_key: campaign.campaign_key, title: campaign.title, description: campaign.description,
+      starts_at: campaign.starts_at, ends_at: campaign.ends_at, minimum_purchase_cup: Number(campaign.minimum_purchase_cup || 0),
+      required_purchases: Number(campaign.required_purchases), progress: count, target: Number(campaign.required_purchases),
+      completed: count >= Number(campaign.required_purchases), reward_percent: Number(campaign.reward_percent),
+      reward_minimum_subtotal_cup: Number(campaign.reward_minimum_subtotal_cup || 0),
+    })
     if (count >= Number(campaign.required_purchases)) {
       await issueCoupon({ clientId, source: 'MISSION_FLASH', sourceKey: `campaign:${campaign.id}`, percent: Number(campaign.reward_percent), minimumSubtotalCup: Number(campaign.reward_minimum_subtotal_cup || 0) })
     }
   }
-  return { period, all, currentMonthCount: currentMonth.length, currentWeekDays: daySet.size, previousWeekDays: previousWeekDays.size, campaignProgress }
+  return { period, all, currentMonthCount: currentMonth.length, currentWeekDays: daySet.size, currentWeekDayKeys, previousWeekDays: previousWeekDays.size, campaignProgress }
 }
 
 async function recordPaidPurchase(client, { source, orderId, amount, baseAmount = null, currency = 'CUP', paidAt = null, itemCount = 1, hasGameMarket = null, hasEtecsa = null }) {
@@ -497,8 +506,13 @@ async function getDashboard(client, installedAt = null) {
   const { count: referralsCount, error: referralCountError } = await supabase.from('reward_referrals').select('id', { count: 'exact', head: true })
     .eq('referrer_client_id', client.id).eq('status', 'QUALIFIED')
   if (referralCountError) throw referralCountError
+  // A registered referral is someone who linked this code; a valid referral is only
+  // counted by reward_referrals after their first verified paid purchase. This is read-only.
+  const { count: referralsRegisteredCount, error: registeredReferralError } = await supabase.from('reward_profiles')
+    .select('client_id', { count: 'exact', head: true }).eq('referred_by_client_id', client.id)
+  if (registeredReferralError) throw registeredReferralError
   const couponResult = await supabase.from('reward_coupons').select('id,coupon_code,source,source_key,discount_percent,minimum_subtotal_cup,minimum_exclusive,status,issued_at,expires_at,used_at')
-    .eq('client_id', client.id).order('issued_at', { ascending: false }).limit(100)
+    .eq('client_id', client.id).order('issued_at', { ascending: false }).limit(1000)
   if (couponResult.error) throw couponResult.error
   const welcomeEndsAt = new Date(Date.parse(profile.welcome_started_at) + WELCOME_WINDOW_MS).toISOString()
   const remaining = Math.max(0, Date.parse(welcomeEndsAt) - Date.now())
@@ -509,27 +523,62 @@ async function getDashboard(client, installedAt = null) {
   const monthlyGoalProgress = mission.currentMonthCount
   const weeklyGoalProgress = mission.currentWeekDays
   const linkedReferral = profile.referred_by_client_id ? { linked: true, code: profile.referred_by_code, linked_at: profile.referral_bound_at } : { linked: false, code: null, linked_at: null }
+  const nowMs = Date.now()
+  const welcomeReserved = Boolean(profile.welcome_reserved_order_ref && Date.parse(profile.welcome_reserved_until || '') > nowMs)
+  const welcomeUsed = Boolean(profile.welcome_used_at)
+  const firstCupAlreadyPurchased = Boolean(profile.first_cup_purchase_at)
+  const welcomeStatus = welcomeUsed ? 'USED'
+    : welcomeReserved ? 'PENDING_CONFIRMATION'
+      : (remaining <= 0 || firstCupAlreadyPurchased) ? 'EXPIRED'
+        : 'AVAILABLE'
+  const lastPaidEvent = mission.all.reduce((latest, event) => {
+    const at = Date.parse(event.paid_at || '')
+    return Number.isFinite(at) && at > (latest?.at || 0) ? { at, paid_at: event.paid_at } : latest
+  }, null)
+  const returnEligibleAt = lastPaidEvent ? new Date(lastPaidEvent.at + 30 * 86400000).toISOString() : null
+  const recentThirty = mission.all.filter(event => Date.parse(event.paid_at || '') >= nowMs - 30 * 86400000)
+  const lastServiceEventAt = sourcePredicate => recentThirty
+    .filter(sourcePredicate)
+    .reduce((latest, event) => Math.max(latest, Date.parse(event.paid_at || '') || 0), 0)
+  const lastGameMarketAt = lastServiceEventAt(event => event.has_game_market === true || event.source === 'GAME_MARKET')
+  const lastEtecsaAt = lastServiceEventAt(event => event.has_etecsa === true || event.source === 'ETECSA')
+  const gameMarketCompleted = lastGameMarketAt > 0
+  const etecsaCompleted = lastEtecsaAt > 0
+  const explorerExpiresAt = gameMarketCompleted !== etecsaCompleted
+    ? new Date((gameMarketCompleted ? lastGameMarketAt : lastEtecsaAt) + 30 * 86400000).toISOString()
+    : null
   const missions = [
     { id: 'welcome', title: 'Oferta de bienvenida', description: 'Descuento automático en tu primera compra en CUP, durante las primeras 24 horas.', progress: profile.first_cup_purchase_at ? 1 : (remaining > 0 ? 0 : 0), target: 1, completed: Boolean(profile.welcome_used_at || profile.first_cup_purchase_at), expires_at: welcomeEndsAt, remaining_ms: remaining, reward: '3%, 7% o 10% según el total en CUP' },
     { id: 'referrals_10', title: 'Embajador · 10 referidos', description: 'Invita a diez clientes que completen su primera compra pagada.', progress: Math.min(10, Number(referralsCount || 0)), target: 10, completed: Number(referralsCount || 0) >= 10, reward: 'Cupón del 5%' },
     { id: 'referrals_20', title: 'Embajador · 20 referidos', description: 'Consigue veinte referidos válidos.', progress: Math.min(20, Number(referralsCount || 0)), target: 20, completed: Number(referralsCount || 0) >= 20, reward: 'Cupón del 10% para carritos superiores a 8.000 CUP' },
     { id: 'referrals_30', title: 'Embajador · 30 referidos', description: 'Consigue treinta referidos válidos.', progress: Math.min(30, Number(referralsCount || 0)), target: 30, completed: Number(referralsCount || 0) >= 30, reward: 'Cupón del 15% para carritos superiores a 25.000 CUP' },
-    { id: 'monthly', title: 'Cliente frecuente', description: 'Completa tres compras pagadas de más de 15.000 CUP durante este mes.', progress: Math.min(3, monthlyGoalProgress), target: 3, completed: monthlyGoalProgress >= 3, period_start: monthStart, period_end: monthEnd, reward: 'Cupón del 7%' },
-    { id: 'weekly', title: 'Racha semanal', description: 'Compra por más de 1.000 CUP en cinco días distintos de esta semana.', progress: Math.min(5, weeklyGoalProgress), target: 5, completed: weeklyGoalProgress >= 5, period_start: weeklyStart, period_end: weeklyEnd, reward: 'Cupón del 3%' },
+    { id: 'monthly', title: 'Cliente frecuente', description: 'Completa tres compras pagadas de más de 15.000 CUP durante este mes.', progress: Math.min(3, monthlyGoalProgress), target: 3, completed: monthlyGoalProgress >= 3, period_key: mission.period.monthKey, period_start: monthStart, period_end: monthEnd, reward: 'Cupón del 7%' },
+    { id: 'weekly', title: 'Racha semanal', description: 'Compra por más de 1.000 CUP en cinco días distintos de esta semana.', progress: Math.min(5, weeklyGoalProgress), target: 5, completed: weeklyGoalProgress >= 5, period_key: mission.period.weekKey, period_start: weeklyStart, period_end: weeklyEnd, reward: 'Cupón del 3%' },
     { id: 'recruit', title: 'Recluta novato', description: 'Consigue tres referidos válidos.', progress: Math.min(3, Number(referralsCount || 0)), target: 3, completed: Number(referralsCount || 0) >= 3, reward: 'Cupón del 2%' },
-    { id: 'explorer', title: 'Explorador de SynthesisOne', description: 'Compra en Game Market y ETECSA dentro de un periodo de 30 días.', progress: [mission.all.some(e => Date.parse(e.paid_at) >= Date.now() - 30 * 86400000 && (e.has_game_market === true || e.source === 'GAME_MARKET')), mission.all.some(e => Date.parse(e.paid_at) >= Date.now() - 30 * 86400000 && (e.has_etecsa === true || e.source === 'ETECSA'))].filter(Boolean).length, target: 2, completed: mission.all.some(e => Date.parse(e.paid_at) >= Date.now() - 30 * 86400000 && (e.has_game_market === true || e.source === 'GAME_MARKET')) && mission.all.some(e => Date.parse(e.paid_at) >= Date.now() - 30 * 86400000 && (e.has_etecsa === true || e.source === 'ETECSA')), reward: 'Cupón del 3%' },
+    { id: 'explorer', title: 'Explorador de SynthesisOne', description: 'Compra en Game Market y ETECSA dentro de un periodo de 30 días.', progress: Number(gameMarketCompleted) + Number(etecsaCompleted), target: 2, completed: gameMarketCompleted && etecsaCompleted, game_market_completed: gameMarketCompleted, etecsa_completed: etecsaCompleted, expires_at: explorerExpiresAt, reward: 'Cupón del 3%' },
     { id: 'collector', title: 'Coleccionista de ofertas', description: 'Completa una compra con al menos tres ofertas en un mismo carrito.', progress: mission.all.some(e => Number(e.item_count) >= 3) ? 1 : 0, target: 1, completed: mission.all.some(e => Number(e.item_count) >= 3), reward: 'Cupón del 3%' },
     { id: 'return', title: 'El regreso del héroe', description: 'Vuelve después de 30 días sin compras y realiza una compra superior a 3.000 CUP.', progress: couponResult.data.filter(c => c.source === 'MISSION_RETURN').length > 0 ? 1 : 0, target: 1, completed: couponResult.data.some(c => c.source === 'MISSION_RETURN'), reward: 'Cupón del 3%' },
-    { id: 'streak', title: 'Racha imparable', description: 'Completa la misión semanal durante dos semanas consecutivas.', progress: (mission.previousWeekDays >= 5 ? 1 : 0) + (weeklyGoalProgress >= 5 ? 1 : 0), target: 2, completed: mission.previousWeekDays >= 5 && weeklyGoalProgress >= 5, reward: 'Cupón del 3% por mantener la racha' },
+    { id: 'streak', title: 'Racha imparable', description: 'Completa la misión semanal durante dos semanas consecutivas.', progress: (mission.previousWeekDays >= 5 ? 1 : 0) + (weeklyGoalProgress >= 5 ? 1 : 0), target: 2, completed: mission.previousWeekDays >= 5 && weeklyGoalProgress >= 5, period_key: mission.period.weekKey, period_start: weeklyStart, period_end: weeklyEnd, reward: 'Cupón del 3% por mantener la racha' },
     ...mission.campaignProgress.map(c => ({ id: `flash:${c.campaign_key}`, type: 'flash', ...c, reward: `Cupón del ${c.reward_percent}%` })),
   ]
   return {
     ok: true,
-    profile: { referral_code: profile.referral_code, referred_by: linkedReferral, referrals_count: Number(referralsCount || 0) },
-    welcome: { started_at: profile.welcome_started_at, ends_at: welcomeEndsAt, remaining_ms: remaining, available: remaining > 0 && !profile.first_cup_purchase_at && !profile.welcome_used_at },
+    profile: {
+      referral_code: profile.referral_code, referred_by: linkedReferral,
+      referrals_count: Number(referralsCount || 0), referrals_registered_count: Number(referralsRegisteredCount || 0),
+    },
+    welcome: {
+      started_at: profile.welcome_started_at, ends_at: welcomeEndsAt, remaining_ms: remaining,
+      available: welcomeStatus === 'AVAILABLE', status: welcomeStatus,
+      reserved_until: welcomeReserved ? profile.welcome_reserved_until : null, discount_tiers: WELCOME_DISCOUNT_TIERS,
+    },
+    return_mission: { last_paid_purchase_at: lastPaidEvent?.paid_at || null, eligible_at: returnEligibleAt, eligible: Boolean(lastPaidEvent && nowMs >= lastPaidEvent.at + 30 * 86400000) },
     missions,
     coupons: couponResult.data || [],
-    progress: { monthly_purchases_over_15000: monthlyGoalProgress, weekly_distinct_days_over_1000: weeklyGoalProgress },
+    progress: {
+      monthly_purchases_over_15000: monthlyGoalProgress, weekly_distinct_days_over_1000: weeklyGoalProgress,
+      weekly_day_keys: mission.currentWeekDayKeys,
+    },
   }
 }
 
@@ -578,7 +627,7 @@ async function listCampaigns({ activeOnly = false } = {}) {
 }
 
 module.exports = {
-  WELCOME_WINDOW_MS, welcomePercent, roundedDiscount, periodInfo, rewardsEnabled, rewardsSchemaReady,
+  WELCOME_WINDOW_MS, WELCOME_DISCOUNT_TIERS, welcomePercent, roundedDiscount, periodInfo, rewardsEnabled, rewardsSchemaReady,
   ensureProfile, applyReferral, calculateDiscount, reserveDiscount, releaseDiscount,
   recordPaidPurchase, finalizePaidOrder, getDashboard, issueCoupon, createCampaign, listCampaigns,
 }
