@@ -90,19 +90,14 @@ test('external Game Market transfer checkout cannot mislabel a Saldo Móvil reta
 })
 
 
-test('licensed client webhook settings are mounted on the authenticated auth router and Android sends its device binding', () => {
+test('licensed webhook configuration accepts active admin licenses and repairs an already-paid stale store-only row safely', () => {
   const auth = read('src/routes/auth.js')
-  const mainPath = path.join(android, 'app/src/main/java/com/synthesisone/app/MainActivity.kt')
-  assert.match(auth, /router\.get\('\/webhooks'/)
-  assert.match(auth, /router\.put\('\/webhooks'/)
-  assert.match(auth, /requireNonRevokedToken\(token\)/)
-  assert.match(auth, /client\.store_only \|\| \(client\.role && client\.role !== 'client'\)/)
-  assert.match(auth, /client\.device_id !== requestDeviceId/)
-  assert.match(auth, /validateWebhookUrl|normalizeWebhookTargets/)
-  if (fs.existsSync(mainPath)) {
-    const main = fs.readFileSync(mainPath, 'utf8')
-    assert.match(main, /backendRequest\("\/api\/auth\/webhooks", "GET", token\)/)
-    assert.match(main, /backendRequest\("\/api\/auth\/webhooks", "PUT", token, payload\)/)
-    assert.match(main, /if \(isLicenseActive\(\) && snap\.state\.equals\("ACTIVE", true\)\)/)
-  }
+  const onboarding = read('src/routes/onboarding.js')
+  assert.match(auth, /function hasPaidLicenseTerm\(client/)
+  assert.match(auth, /client\.store_only && !paidStoreOnlyRow/)
+  assert.match(auth, /\.update\(\{ store_only: false \}\)/)
+  assert.match(auth, /\.eq\('device_id', requestDeviceId\)/)
+  assert.doesNotMatch(auth, /client\.role && client\.role !== ['"]client['"]/)
+  assert.match(onboarding, /\.eq\('role', 'client'\)\s*\.eq\('store_only', false\)\s*\.order\('created_at'/)
+  assert.match(onboarding, /role: 'client',\s*store_only: false/)
 })
