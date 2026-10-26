@@ -5,6 +5,7 @@ const supabase = require('../supabase')
 const { secretsMatch, getConfiguredAdminSecret } = require('../utils/adminAuth')
 const { validateWebhookUrl } = require('../utils/webhookDelivery')
 const { expireDueLicenses, isExpired } = require('../utils/licenseExpiry')
+const { calculateLicenseExtension } = require('../utils/licenseManagement')
 const { decryptActivationSecret } = require('../utils/activationSecretVault')
 const { getAutomationAvailability, setAutomationAvailability } = require('../utils/systemSettings')
 const opsDashboard = require('../utils/opsDashboard')
@@ -675,6 +676,84 @@ router.put('/api/clients/:id/toggle', async (req, res) => {
   const { data, error } = await supabase.from('clients').update({ active: nowActive }).eq('id', req.params.id).select().single()
   if (error) return res.status(500).json({ error: error.message })
   res.json(data)
+})
+
+// Explicit admin action: extend the existing license without rotating its token
+// or changing the device binding. This also reactivates expired/suspended clients.
+router.put('/api/clients/:id/extend-license', async (req, res) => {
+  try {
+    await expireDueLicenses()
+
+    const { data: client, error: clientError } = await supabase
+      .from('clients')
+      .select('id, name, token, role, store_only, active, expires_at')
+      .eq('id', req.params.id)
+      .maybeSingle()
+
+    if (clientError) throw clientError
+    if (!client || client.store_only) return res.status(404).json({ error: 'Cliente no encontrado' })
+    if (client.role === 'admin') return res.status(409).json({ error: 'Las cuentas de administrador no necesitan una licencia de pago.' })
+
+    let expiresAt
+    try {
+      expiresAt = calculateLicenseExtension(client.expires_at, req.body?.days == null ? 30 : req.body.days)
+    } catch (error) {
+      return res.status(error.status || 400).json({ error: error.message })
+    }
+
+    // Update expiration first. An expired client remains inactive until the
+    // current token is restored from the blacklist successfully.
+    const { error: expiryError } = await supabase
+      .from('clients')
+      .update({ expires_at: expiresAt })
+      .eq('id', client.id)
+    if (expiryError) throw expiryError
+
+    if (client.token) {
+      const { error: blacklistError } = await supabase
+        .from('token_blacklist')
+        .delete()
+        .eq('token', client.token)
+      if (blacklistError) {
+        console.error('No se pudo restaurar el token al extender licencia:', blacklistError)
+        // Avoid reporting a successful extension when token restoration failed.
+        // Roll back the expiry when possible; an already-expired client remains inactive.
+        const { error: rollbackError } = await supabase
+          .from('clients')
+          .update({ expires_at: client.expires_at })
+          .eq('id', client.id)
+        if (rollbackError) console.error('No se pudo revertir el vencimiento tras un error de token:', rollbackError)
+        return res.status(500).json({ error: 'No se pudo restaurar el token; no se completó la operación. Reintenta.' })
+      }
+    }
+
+    const { data: updated, error: activationError } = await supabase
+      .from('clients')
+      .update({ active: true, expires_at: expiresAt })
+      .eq('id', client.id)
+      .select('id, name, active, expires_at, role')
+      .single()
+
+    if (activationError) throw activationError
+
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      event: 'CLIENT_LICENSE_EXTENDED_BY_ADMIN',
+      client_id: updated.id,
+      days_added: Number(req.body?.days == null ? 30 : req.body.days),
+      expires_at: updated.expires_at,
+    }))
+
+    return res.json({
+      ok: true,
+      message: 'Licencia activada y ampliada correctamente.',
+      days_added: Number(req.body?.days == null ? 30 : req.body.days),
+      client: updated,
+    })
+  } catch (error) {
+    console.error('Error al extender licencia desde el panel:', error)
+    return res.status(500).json({ error: 'No se pudo activar o extender la licencia.' })
+  }
 })
 
 router.get('/api/clients/:id/webhook-deliveries', async (req, res) => {
@@ -1574,8 +1653,11 @@ function renderClients(clients) {
     } else {
       const activeClass = c.active ? 'btn-red' : 'btn-green'
       const activeText = c.active ? 'Desactivar' : 'Activar'
+      const licenseAction = c.role === 'admin' ? '' :
+        '<button class="btn btn-sm btn-green" data-id="' + id + '" data-name="' + name + '" onclick="extendLicense(this.dataset.id, this.dataset.name)" title="Activar licencia o añadir días">+ Licencia</button>'
       actionButtons =
         '<button class="btn btn-sm ' + activeClass + '" data-id="' + id + '" onclick="toggle(this.dataset.id)">' + activeText + '</button>' +
+        licenseAction +
         '<button class="btn btn-sm btn-blue" data-id="' + id + '" onclick="openWebhooksById(this.dataset.id)">Webhooks</button>' +
         '<button class="btn btn-sm btn-purple" data-id="' + id + '" onclick="renewToken(this.dataset.id, this.dataset.name)" data-name="' + name + '">↺ Token</button>' +
         '<button class="btn btn-sm btn-blue" data-id="' + id + '" onclick="showInfo(this.dataset.id)">Detalles</button>' +
@@ -1620,6 +1702,24 @@ async function toggle(id) {
   await api('/clients/'+id+'/toggle', {method:'PUT'})
   toast('Estado actualizado')
   loadClients()
+}
+
+async function extendLicense(id, name) {
+  const rawDays = prompt('¿Cuántos días deseas añadir a la licencia de "' + name + '"?\\nSe sumarán al vencimiento actual o desde hoy si ya expiró.', '30')
+  if (rawDays === null) return
+  const trimmed = String(rawDays).trim()
+  if (!/^\d+$/.test(trimmed)) return toast('Introduce un número entero de días.', true)
+  const days = Number(trimmed)
+  if (!Number.isInteger(days) || days < 1 || days > 3650) return toast('Los días deben estar entre 1 y 3650.', true)
+  if (!confirm('Se activará la licencia y se añadirán ' + days + ' días. El token y el dispositivo actual se conservarán. ¿Continuar?')) return
+  const result = await api('/clients/' + id + '/extend-license', {
+    method: 'PUT',
+    body: JSON.stringify({ days })
+  })
+  if (result.error) return toast(result.error, true)
+  const expires = result.client?.expires_at ? new Date(result.client.expires_at).toLocaleString('es') : '—'
+  toast('Licencia activa. Nuevo vencimiento: ' + expires)
+  await loadClients()
 }
 
 async function renewToken(id, name) {
