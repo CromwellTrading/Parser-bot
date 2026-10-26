@@ -176,6 +176,7 @@ async function createClientFromPayment(session, parsed, receivedIso) {
       .select('*')
       .eq('phone_number', session.phone_number)
       .eq('role', 'client')
+      .eq('store_only', false)
       .order('created_at', { ascending: false })
       .limit(1)
     if (findError) throw findError
@@ -191,6 +192,7 @@ async function createClientFromPayment(session, parsed, receivedIso) {
           token_used: true,
           phone_number: session.phone_number,
           role: 'client',
+          store_only: false,
         })
         .eq('id', previous.id)
         .select('*')
@@ -220,6 +222,7 @@ async function createClientFromPayment(session, parsed, receivedIso) {
       active: true,
       token_used: true,
       role: 'client',
+      store_only: false,
     })
     .select('*')
     .single()

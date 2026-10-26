@@ -15,8 +15,15 @@ const { normalizeWebhookTargets } = require('../utils/clientWebhooks')
 
 function isExpired(expiresAt) {
   if (!expiresAt) return false
-  const expires = new Date(expiresAt)
-  return !Number.isNaN(expires.getTime()) && expires < new Date()
+  const expiryMs = Date.parse(expiresAt)
+  // An unreadable expiration must not accidentally grant access.
+  return !Number.isFinite(expiryMs) || expiryMs <= Date.now()
+}
+
+function hasPaidLicenseTerm(client, now = Date.now()) {
+  if (!client || client.active !== true || !client.expires_at) return false
+  const expiryMs = Date.parse(client.expires_at)
+  return Number.isFinite(expiryMs) && expiryMs > now
 }
 
 function extractToken(req) {
@@ -62,20 +69,51 @@ async function authorizeWebhookSettings(req, res) {
     res.status(401).json({ ok: false, error: 'La licencia no es válida.' })
     return null
   }
-  if (client.store_only || (client.role && client.role !== 'client')) {
+  // A normal free-store session is inactive and has no expiration. A past
+  // renewal bug could, however, reactivate that row as a paid license while
+  // leaving store_only=true. Accept that state only when it has an active,
+  // explicit future term; the flag is cleared below after device validation.
+  const paidStoreOnlyRow = client.store_only === true && hasPaidLicenseTerm(client)
+  if (client.store_only && !paidStoreOnlyRow) {
     res.status(403).json({ ok: false, error: 'Esta función requiere una licencia de automatización activa.' })
     return null
   }
-  if (!client.active || isExpired(client.expires_at)) {
+  if (client.active !== true || isExpired(client.expires_at)) {
     res.status(403).json({ ok: false, error: 'Tu licencia no está activa o ha vencido.' })
     return null
   }
 
+  // The role does not determine whether a license is paid: administrator
+  // accounts can configure their own webhook as long as their license and
+  // device binding are valid.
   const requestDeviceId = String(req.headers['x-device-id'] || '').trim()
   if (!client.device_id || !requestDeviceId || client.device_id !== requestDeviceId) {
     res.status(403).json({ ok: false, error: 'Este dispositivo no coincide con el asociado a la licencia. Sincroniza la app y vuelve a intentarlo.' })
     return null
   }
+
+  if (paidStoreOnlyRow) {
+    // One-time, compare-and-set repair for already-activated licenses that
+    // were mistakenly left marked as store-only. Never promotes an inactive,
+    // unexpired-less or differently-bound free-store session.
+    const { data: repaired, error: repairError } = await supabase
+      .from('clients')
+      .update({ store_only: false })
+      .eq('id', client.id)
+      .eq('store_only', true)
+      .eq('active', true)
+      .eq('device_id', requestDeviceId)
+      .gt('expires_at', new Date().toISOString())
+      .select('id, name, token, active, token_used, device_id, phone_number, card1, card2, card3, wallet, webhook_url, webhook_url_2, webhook_url_3, created_at, expires_at, role, store_only')
+      .maybeSingle()
+    if (repairError) throw repairError
+    if (!repaired) {
+      res.status(403).json({ ok: false, error: 'No se pudo confirmar la licencia en este dispositivo. Sincroniza la app y vuelve a intentarlo.' })
+      return null
+    }
+    return repaired
+  }
+
   return client
 }
 
