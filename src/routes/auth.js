@@ -10,6 +10,8 @@ const {
 const { normalizePhone } = require('../utils/parser')
 const { requireNonRevokedToken } = require('../utils/tokenState')
 const { expireDueLicenses } = require('../utils/licenseExpiry')
+const { ensureWebhookSecret } = require('../utils/webhookDelivery')
+const { normalizeWebhookTargets } = require('../utils/clientWebhooks')
 
 function isExpired(expiresAt) {
   if (!expiresAt) return false
@@ -45,6 +47,103 @@ async function updateClient(clientId, patch) {
   if (error) throw error
   return data
 }
+
+async function authorizeWebhookSettings(req, res) {
+  await expireDueLicenses()
+  const token = extractToken(req)
+  if (!token) {
+    res.status(401).json({ ok: false, error: 'Inicia sesión con una licencia activa para configurar la conexión.' })
+    return null
+  }
+
+  await requireNonRevokedToken(token)
+  const client = await fetchClientByToken(token)
+  if (!client) {
+    res.status(401).json({ ok: false, error: 'La licencia no es válida.' })
+    return null
+  }
+  if (client.store_only || (client.role && client.role !== 'client')) {
+    res.status(403).json({ ok: false, error: 'Esta función requiere una licencia de automatización activa.' })
+    return null
+  }
+  if (!client.active || isExpired(client.expires_at)) {
+    res.status(403).json({ ok: false, error: 'Tu licencia no está activa o ha vencido.' })
+    return null
+  }
+
+  const requestDeviceId = String(req.headers['x-device-id'] || '').trim()
+  if (!client.device_id || !requestDeviceId || client.device_id !== requestDeviceId) {
+    res.status(403).json({ ok: false, error: 'Este dispositivo no coincide con el asociado a la licencia. Sincroniza la app y vuelve a intentarlo.' })
+    return null
+  }
+  return client
+}
+
+async function readWebhookSettings(clientId) {
+  const { data, error } = await supabase
+    .from('clients')
+    .select('id, webhook_url, webhook_url_2, webhook_url_3, webhook_secret, active, expires_at, role, store_only, device_id')
+    .eq('id', clientId)
+    .maybeSingle()
+  if (error) throw error
+  if (!data) return null
+  return ensureWebhookSecret(data)
+}
+
+function publicWebhookSettings(client) {
+  return {
+    webhook_url: client.webhook_url || null,
+    webhook_url_2: client.webhook_url_2 || null,
+    webhook_url_3: client.webhook_url_3 || null,
+    configured: Boolean(client.webhook_url || client.webhook_url_2 || client.webhook_url_3),
+    signing_secret: client.webhook_secret,
+  }
+}
+
+router.get('/webhooks', async (req, res) => {
+  try {
+    const client = await authorizeWebhookSettings(req, res)
+    if (!client) return
+    const settings = await readWebhookSettings(client.id)
+    if (!settings) return res.status(404).json({ ok: false, error: 'No se encontró la configuración de esta licencia.' })
+    res.set('Cache-Control', 'no-store')
+    return res.json({ ok: true, ...publicWebhookSettings(settings) })
+  } catch (error) {
+    if (error.code === 'TOKEN_REVOKED') return res.status(403).json({ ok: false, error: 'La licencia fue revocada.' })
+    console.error('Error en GET /api/auth/webhooks:', error)
+    return res.status(500).json({ ok: false, error: 'No se pudo cargar la configuración de conexión.' })
+  }
+})
+
+router.put('/webhooks', async (req, res) => {
+  try {
+    const client = await authorizeWebhookSettings(req, res)
+    if (!client) return
+    const current = await readWebhookSettings(client.id)
+    if (!current) return res.status(404).json({ ok: false, error: 'No se encontró la configuración de esta licencia.' })
+
+    const normalized = normalizeWebhookTargets(req.body || {}, current)
+    if (!normalized.ok) return res.status(400).json({ ok: false, error: normalized.error, field: normalized.field || null })
+
+    const { data: updated, error } = await supabase
+      .from('clients')
+      .update(normalized.patch)
+      .eq('id', client.id)
+      .eq('active', true)
+      .select('id, webhook_url, webhook_url_2, webhook_url_3, webhook_secret, active, expires_at, role, store_only, device_id')
+      .maybeSingle()
+    if (error) throw error
+    if (!updated) return res.status(403).json({ ok: false, error: 'La licencia dejó de estar activa. Vuelve a verificarla antes de guardar.' })
+
+    const secured = await ensureWebhookSecret(updated)
+    res.set('Cache-Control', 'no-store')
+    return res.json({ ok: true, ...publicWebhookSettings(secured), message: normalized.configured ? 'Conexión guardada.' : 'Conexión desactivada.' })
+  } catch (error) {
+    if (error.code === 'TOKEN_REVOKED') return res.status(403).json({ ok: false, error: 'La licencia fue revocada.' })
+    console.error('Error en PUT /api/auth/webhooks:', error)
+    return res.status(500).json({ ok: false, error: 'No se pudo guardar la configuración de conexión.' })
+  }
+})
 
 router.post('/verify', async (req, res) => {
   try {
