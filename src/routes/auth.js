@@ -12,6 +12,7 @@ const { requireNonRevokedToken } = require('../utils/tokenState')
 const { expireDueLicenses } = require('../utils/licenseExpiry')
 const { ensureWebhookSecret } = require('../utils/webhookDelivery')
 const { normalizeWebhookTargets } = require('../utils/clientWebhooks')
+const { publicWebhookDeliverySummary } = require('../utils/clientWebhookStatus')
 
 function isExpired(expiresAt) {
   if (!expiresAt) return false
@@ -138,6 +139,36 @@ function publicWebhookSettings(client) {
   }
 }
 
+router.get('/webhooks/deliveries', async (req, res) => {
+  try {
+    const client = await authorizeWebhookSettings(req, res)
+    if (!client) return
+
+    const { data, error } = await supabase
+      .from('webhook_deliveries')
+      .select('id, event_id, payload, status, attempts, next_attempt_at, last_error, response_status, created_at, delivered_at')
+      .eq('client_id', client.id)
+      .order('created_at', { ascending: false })
+      .limit(20)
+
+    if (error) {
+      // The client receives a safe message; database/schema details stay server-side.
+      console.error('No se pudo consultar el historial personal de webhooks:', error.code || error.message)
+      return res.status(503).json({ ok: false, error: 'El historial de entregas no está disponible en este momento.' })
+    }
+
+    res.set('Cache-Control', 'no-store')
+    return res.json({
+      ok: true,
+      deliveries: (data || []).map(publicWebhookDeliverySummary),
+    })
+  } catch (error) {
+    if (error.code === 'TOKEN_REVOKED') return res.status(403).json({ ok: false, error: 'La licencia fue revocada.' })
+    console.error('Error en GET /api/auth/webhooks/deliveries:', error.code || error.message)
+    return res.status(500).json({ ok: false, error: 'No se pudo consultar el historial de entregas.' })
+  }
+})
+
 router.get('/webhooks', async (req, res) => {
   try {
     const client = await authorizeWebhookSettings(req, res)
@@ -163,11 +194,20 @@ router.put('/webhooks', async (req, res) => {
     const normalized = normalizeWebhookTargets(req.body || {}, current)
     if (!normalized.ok) return res.status(400).json({ ok: false, error: normalized.error, field: normalized.field || null })
 
-    const { data: updated, error } = await supabase
+    // Re-check license/device at write time as well. This compare-and-set
+    // prevents a request authorized just before expiry or a device rebind from
+    // saving webhook settings after its authority changed.
+    let updateQuery = supabase
       .from('clients')
       .update(normalized.patch)
       .eq('id', client.id)
       .eq('active', true)
+      .eq('store_only', false)
+      .eq('device_id', client.device_id)
+    if (client.expires_at) updateQuery = updateQuery.gt('expires_at', new Date().toISOString())
+    else updateQuery = updateQuery.is('expires_at', null)
+
+    const { data: updated, error } = await updateQuery
       .select('id, webhook_url, webhook_url_2, webhook_url_3, webhook_secret, active, expires_at, role, store_only, device_id')
       .maybeSingle()
     if (error) throw error
