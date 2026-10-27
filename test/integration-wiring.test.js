@@ -101,3 +101,27 @@ test('licensed webhook configuration accepts active admin licenses and repairs a
   assert.match(onboarding, /\.eq\('role', 'client'\)\s*\.eq\('store_only', false\)\s*\.order\('created_at'/)
   assert.match(onboarding, /role: 'client',\s*store_only: false/)
 })
+
+
+test('licensed webhook delivery history is client-scoped and returns only a safe summary', () => {
+  const auth = read('src/routes/auth.js')
+  const helper = read('src/utils/clientWebhookStatus.js')
+  const androidPath = path.join(android, 'app/src/main/java/com/synthesisone/app/MainActivity.kt')
+  assert.match(auth, /router\.get\('\/webhooks\/deliveries'/)
+  assert.match(auth, /\.eq\('client_id', client\.id\)[\s\S]*?\.order\('created_at', \{ ascending: false \}\)[\s\S]*?\.limit\(20\)/)
+  assert.match(auth, /\.map\(publicWebhookDeliverySummary\)/)
+  assert.match(helper, /function publicWebhookDeliverySummary/)
+  assert.doesNotMatch(helper, /response_body\s*:/)
+  assert.doesNotMatch(helper, /webhook_url\s*:/)
+  if (!fs.existsSync(androidPath)) return t.skip('Android sources not mounted')
+  const main = fs.readFileSync(androidPath, 'utf8')
+  assert.match(main, /\/api\/auth\/webhooks\/deliveries/)
+  assert.match(main, /ACTUALIZAR ESTADO DE ENVÍOS/)
+})
+
+test('webhook configuration write re-checks active license, store-only flag, expiry and device binding at commit time', () => {
+  const auth = read('src/routes/auth.js')
+  assert.match(auth, /\.eq\('active', true\)[\s\S]*?\.eq\('store_only', false\)[\s\S]*?\.eq\('device_id', client\.device_id\)/)
+  assert.match(auth, /updateQuery = updateQuery\.gt\('expires_at', new Date\(\)\.toISOString\(\)\)/)
+  assert.match(auth, /updateQuery = updateQuery\.is\('expires_at', null\)/)
+})
