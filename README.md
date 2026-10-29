@@ -27,6 +27,10 @@ npm test
 npm start
 ```
 
+## Documentación para clientes
+
+- `docs/CLIENT_WEBHOOK_API.md`: contrato HTTP, eventos, payload, verificación de firmas, idempotencia y lista de preparación para producción.
+
 ## Variables de entorno
 
 Configúralas en Render/tu gestor de secretos; no las incluyas en Git, ZIP público ni APK. El archivo `.env` local está excluido del repositorio.

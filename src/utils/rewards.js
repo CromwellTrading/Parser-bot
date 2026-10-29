@@ -4,6 +4,7 @@ const crypto = require('crypto')
 const supabase = require('../supabase')
 const { WELCOME_DISCOUNT_TIERS, welcomePercent, roundedDiscount } = require('./rewardPricing')
 const { rewardsEnabled, emptyDiscountQuote, isRewardsSchemaUnavailable } = require('./rewardFeaturePolicy')
+const { REFERRAL_CODE_ENTRY_COUPON_PERCENT, REFERRAL_CODE_BATCH_COUPON_PERCENT, isReciprocalReferral, referralCodeEntryRewardPlan } = require('./referralCodeRewards')
 
 const WELCOME_WINDOW_MS = 24 * 60 * 60 * 1000
 const RESERVATION_MS = 35 * 60 * 1000
@@ -25,6 +26,7 @@ async function rewardsSchemaReady({ force = false } = {}) {
       supabase.from('reward_coupons').select('id', { head: true, count: 'exact' }).limit(1),
       supabase.from('reward_purchase_events').select('id,source,has_game_market,has_etecsa', { head: true, count: 'exact' }).limit(1),
       supabase.from('reward_campaigns').select('id', { head: true, count: 'exact' }).limit(1),
+      supabase.from('reward_referral_code_entries').select('id', { head: true, count: 'exact' }).limit(1),
       supabase.from('game_recharge_orders').select('reward_base_amount,reward_discount_percent,reward_discount_amount,reward_coupon_id,welcome_discount', { head: true, count: 'exact' }).limit(1),
       supabase.from('etecsa_orders').select('reward_base_amount,reward_discount_percent,reward_discount_amount,reward_coupon_id,welcome_discount', { head: true, count: 'exact' }).limit(1),
     ])
@@ -187,30 +189,126 @@ async function issueCoupon({ clientId, source, sourceKey, percent, minimumSubtot
   throw errorWithStatus('No se pudo emitir la recompensa.', 503, 'COUPON_ISSUE_FAILED')
 }
 
+async function issueReferralCodeEntryCoupons(clientId, entryCount) {
+  const plan = referralCodeEntryRewardPlan(entryCount)
+  const coupons = []
+  if (plan.firstCodeCouponEligible) {
+    coupons.push(await issueCoupon({
+      clientId, source: 'REFERRAL_CODE_ENTRY', sourceKey: 'first-code-entry',
+      percent: REFERRAL_CODE_ENTRY_COUPON_PERCENT,
+    }))
+  }
+  for (const threshold of plan.batchThresholds) {
+    coupons.push(await issueCoupon({
+      clientId, source: 'REFERRAL_CODE_BATCH', sourceKey: `codes-${threshold}`,
+      percent: REFERRAL_CODE_BATCH_COUPON_PERCENT,
+    }))
+  }
+  return { ...plan, coupons }
+}
+
 async function applyReferral(client, rawCode) {
   const code = cleanText(rawCode, 32).toUpperCase().replace(/[^A-Z0-9-]/g, '')
   if (!code) throw errorWithStatus('Introduce un código de referido.', 400, 'REFERRAL_CODE_REQUIRED')
   const profile = await ensureProfile(client)
-  if (profile.referred_by_client_id) throw errorWithStatus('Ya tienes un código de referido vinculado y no se puede cambiar.', 409, 'REFERRAL_ALREADY_BOUND')
-  if (profile.first_paid_purchase_at) throw errorWithStatus('El código debe vincularse antes de tu primera compra pagada.', 409, 'REFERRAL_TOO_LATE')
-  const { data: inviterProfile, error: inviterError } = await supabase.from('reward_profiles').select('client_id,referral_code,device_id')
+  if (profile.first_paid_purchase_at) throw errorWithStatus('Los códigos de referido adicionales deben añadirse antes de tu primera compra pagada.', 409, 'REFERRAL_TOO_LATE')
+
+  const { data: inviterProfile, error: inviterError } = await supabase.from('reward_profiles')
+    .select('client_id,referral_code,device_id,referred_by_client_id')
     .eq('referral_code', code).maybeSingle()
   if (inviterError) throw inviterError
   if (!inviterProfile) throw errorWithStatus('Ese código de referido no existe.', 404, 'REFERRAL_CODE_NOT_FOUND')
   if (String(inviterProfile.client_id) === String(client.id)) throw errorWithStatus('No puedes usar tu propio código de referido.', 409, 'REFERRAL_SELF_NOT_ALLOWED')
+  // A legacy primary referral link is already an entered code. Do not let a user
+  // re-enter that same code after the multi-code promotion is enabled.
+  if (profile.referred_by_client_id && String(profile.referred_by_client_id) === String(inviterProfile.client_id)) {
+    throw errorWithStatus('Ya habías utilizado este código de referido.', 409, 'REFERRAL_CODE_ALREADY_ADDED')
+  }
+
   const referredDevice = String(client.device_id || profile.device_id || '').trim()
   const inviterDevice = String(inviterProfile.device_id || '').trim()
   if (referredDevice && inviterDevice && referredDevice === inviterDevice) {
     throw errorWithStatus('El código debe proceder de otro dispositivo.', 409, 'REFERRAL_SAME_DEVICE')
   }
+
+  // Disallow reciprocal attribution: if the code owner has already entered this
+  // customer's code (as the primary code or an additional code), this direction is invalid.
+  const additionalReverse = await supabase.from('reward_referral_code_entries').select('id')
+    .eq('client_id', inviterProfile.client_id).eq('referrer_client_id', client.id).maybeSingle()
+  if (additionalReverse.error) throw additionalReverse.error
+  if (isReciprocalReferral({
+    codeOwnerPrimaryReferrerId: inviterProfile.referred_by_client_id,
+    codeOwnerHasEnteredEntrantCode: Boolean(additionalReverse.data),
+    entrantClientId: client.id,
+  })) {
+    throw errorWithStatus('No puedes añadir el código de alguien que ya utilizó el tuyo.', 409, 'REFERRAL_RECIPROCAL_NOT_ALLOWED')
+  }
+
   const now = new Date().toISOString()
-  const { data: updated, error } = await supabase.from('reward_profiles').update({
-    referred_by_client_id: inviterProfile.client_id, referred_by_code: inviterProfile.referral_code,
-    referral_bound_at: now, device_id: referredDevice || null, updated_at: now,
-  }).eq('client_id', client.id).is('referred_by_client_id', null).is('first_paid_purchase_at', null).select('*').maybeSingle()
-  if (error) throw error
-  if (!updated) throw errorWithStatus('No se pudo vincular el código. Es posible que ya se haya aplicado.', 409, 'REFERRAL_ALREADY_BOUND')
-  return { linked: true, referral_code: inviterProfile.referral_code }
+  const { data: entry, error: entryError } = await supabase.from('reward_referral_code_entries').insert({
+    client_id: client.id,
+    referrer_client_id: inviterProfile.client_id,
+    referral_code: inviterProfile.referral_code,
+    created_at: now,
+  }).select('id').single()
+  if (entryError?.code === '23505') {
+    throw errorWithStatus('Ya añadiste el código de esta persona. Cada código solo cuenta una vez.', 409, 'REFERRAL_CODE_ALREADY_ADDED')
+  }
+  if (entryError) throw entryError
+  if (!entry) throw errorWithStatus('No se pudo registrar el código de referido.', 503, 'REFERRAL_CODE_ENTRY_FAILED')
+
+  // Only the first accepted code determines the legacy referral attribution used by
+  // the existing paid-referral milestones. Additional codes count for the new coupon
+  // promotion but do not multiply one customer's paid-purchase referral credit.
+  let primaryLinked = Boolean(profile.referred_by_client_id)
+  if (!primaryLinked) {
+    const { data: updated, error } = await supabase.from('reward_profiles').update({
+      referred_by_client_id: inviterProfile.client_id,
+      referred_by_code: inviterProfile.referral_code,
+      referral_bound_at: now,
+      device_id: referredDevice || null,
+      updated_at: now,
+    }).eq('client_id', client.id).is('referred_by_client_id', null).is('first_paid_purchase_at', null).select('client_id').maybeSingle()
+    if (error) {
+      try { await supabase.from('reward_referral_code_entries').delete().eq('id', entry.id) } catch (_) { /* preserve original profile update error */ }
+      throw error
+    }
+    if (updated) {
+      primaryLinked = true
+    } else {
+      const latest = await getProfile(client.id)
+      if (!latest || latest.first_paid_purchase_at) {
+        try { await supabase.from('reward_referral_code_entries').delete().eq('id', entry.id) } catch (_) { /* cleanup is best-effort */ }
+        throw errorWithStatus('Los códigos de referido deben añadirse antes de tu primera compra pagada.', 409, 'REFERRAL_TOO_LATE')
+      }
+      if (!latest.referred_by_client_id) {
+        try { await supabase.from('reward_referral_code_entries').delete().eq('id', entry.id) } catch (_) { /* cleanup is best-effort */ }
+        throw errorWithStatus('No se pudo guardar el código de referido. Inténtalo de nuevo.', 409, 'REFERRAL_BIND_FAILED')
+      }
+    }
+  }
+
+  const { count, error: countError } = await supabase.from('reward_referral_code_entries')
+    .select('id', { head: true, count: 'exact' }).eq('client_id', client.id)
+  let rewardsPending = false
+  let entriesCount = Number(count || 0)
+  if (countError) {
+    rewardsPending = true
+    console.error(JSON.stringify({ event: 'REFERRAL_CODE_COUNT_FAILED', client_id: client.id, code: countError.code || null }))
+  } else {
+    try { await issueReferralCodeEntryCoupons(client.id, entriesCount) }
+    catch (couponError) {
+      rewardsPending = true
+      console.error(JSON.stringify({ event: 'REFERRAL_CODE_COUPON_ISSUE_FAILED', client_id: client.id, code: couponError.code || null }))
+    }
+  }
+  return {
+    accepted: true,
+    linked: primaryLinked || Boolean(profile.referred_by_client_id),
+    referral_code: inviterProfile.referral_code,
+    codes_entered_count: entriesCount,
+    reward_status_pending: rewardsPending,
+  }
 }
 
 async function getActiveCouponByCode(clientId, code) {
@@ -511,6 +609,18 @@ async function getDashboard(client, installedAt = null) {
   const { count: referralsRegisteredCount, error: registeredReferralError } = await supabase.from('reward_profiles')
     .select('client_id', { count: 'exact', head: true }).eq('referred_by_client_id', client.id)
   if (registeredReferralError) throw registeredReferralError
+
+  const { count: referralCodesEnteredCount, error: referralCodesCountError } = await supabase.from('reward_referral_code_entries')
+    .select('id', { head: true, count: 'exact' }).eq('client_id', client.id)
+  if (referralCodesCountError) throw referralCodesCountError
+  const codeEntriesCount = Number(referralCodesEnteredCount || 0)
+  // Re-issue any missing coupons after a transient database error. The unique
+  // (client, source, source_key) constraint makes this safe on every dashboard load.
+  await issueReferralCodeEntryCoupons(client.id, codeEntriesCount)
+  const { data: referralCodeHistory, error: referralCodeHistoryError } = await supabase.from('reward_referral_code_entries')
+    .select('referral_code,created_at').eq('client_id', client.id).order('created_at', { ascending: false }).limit(50)
+  if (referralCodeHistoryError) throw referralCodeHistoryError
+
   const couponResult = await supabase.from('reward_coupons').select('id,coupon_code,source,source_key,discount_percent,minimum_subtotal_cup,minimum_exclusive,status,issued_at,expires_at,used_at')
     .eq('client_id', client.id).order('issued_at', { ascending: false }).limit(1000)
   if (couponResult.error) throw couponResult.error
@@ -566,6 +676,11 @@ async function getDashboard(client, installedAt = null) {
     profile: {
       referral_code: profile.referral_code, referred_by: linkedReferral,
       referrals_count: Number(referralsCount || 0), referrals_registered_count: Number(referralsRegisteredCount || 0),
+      referral_code_entry_eligible: !profile.first_paid_purchase_at,
+      referral_codes_entered_count: codeEntriesCount,
+      referral_codes_progress_to_next_coupon: codeEntriesCount % 15,
+      referral_codes_until_next_coupon: 15 - (codeEntriesCount % 15),
+      referral_codes_history: (referralCodeHistory || []).map(entry => ({ code: entry.referral_code, entered_at: entry.created_at })),
     },
     welcome: {
       started_at: profile.welcome_started_at, ends_at: welcomeEndsAt, remaining_ms: remaining,
@@ -628,6 +743,6 @@ async function listCampaigns({ activeOnly = false } = {}) {
 
 module.exports = {
   WELCOME_WINDOW_MS, WELCOME_DISCOUNT_TIERS, welcomePercent, roundedDiscount, periodInfo, rewardsEnabled, rewardsSchemaReady,
-  ensureProfile, applyReferral, calculateDiscount, reserveDiscount, releaseDiscount,
+  ensureProfile, applyReferral, calculateDiscount, reserveDiscount, releaseDiscount, issueReferralCodeEntryCoupons,
   recordPaidPurchase, finalizePaidOrder, getDashboard, issueCoupon, createCampaign, listCampaigns,
 }

@@ -16,8 +16,8 @@ const GAME_BUCKET = 'so-game-thumbnails'
 const KYC_BUCKET = 'so-reseller-kyc'
 const MAX_IMAGE_BYTES = 1_500_000
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
-const THEMES = new Set(['violet', 'light', 'red', 'green', 'cyan', 'gold', 'ocean'])
-const LAYOUT_STYLES = new Set(['hybrid', 'professional', 'glass', 'minimal', 'aurora', 'arena', 'soft'])
+const THEMES = new Set(['violet', 'light', 'red', 'green', 'cyan', 'gold', 'ocean', 'amoled'])
+const LAYOUT_STYLES = new Set(['hybrid', 'professional', 'glass', 'minimal', 'aurora', 'arena', 'soft', 'imperial', 'fuego', 'voltaje', 'nebulosa', 'porcelana'])
 const RESELLER_STATUSES = new Set(['pending_review', 'changes_requested', 'approved_awaiting_deposit', 'active', 'rejected', 'suspended', 'expired'])
 
 function tokenFrom(req) {
