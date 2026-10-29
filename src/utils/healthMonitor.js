@@ -6,8 +6,8 @@ let started = false
 let running = false
 let databaseWasDown = false
 const intervalMs = (() => {
-  const n = Number(process.env.OPS_HEALTH_INTERVAL_MS || 120000)
-  return Number.isFinite(n) ? Math.min(15 * 60 * 1000, Math.max(60 * 1000, Math.floor(n))) : 120000
+  const n = Number(process.env.OPS_HEALTH_INTERVAL_MS || 300000)
+  return Number.isFinite(n) ? Math.min(15 * 60 * 1000, Math.max(5 * 60 * 1000, Math.floor(n))) : 300000
 })()
 
 async function notifyAdmins(text) {
@@ -60,6 +60,24 @@ async function monitoredCount(table, configure) {
 
 async function checkCondition({ fingerprint, component, severity, title, message, count, metadata = {} }) {
   if (count > 0) {
+    // Do not call record_service_incident on every polling pass for the same open
+    // incident. The RPC increments occurrence_count and forces status back to OPEN,
+    // which created noisy logs and could undo an administrator's acknowledgement.
+    const { data: existing, error } = await supabase.from('service_incidents')
+      .select('id,status,last_seen_at').eq('fingerprint', fingerprint).maybeSingle()
+    if (error) throw error
+    if (existing && existing.status !== 'RESOLVED') {
+      // Keep last_seen_at reasonably fresh without rewriting the row every 2 minutes.
+      const lastSeen = Date.parse(existing.last_seen_at || '')
+      if (!Number.isFinite(lastSeen) || Date.now() - lastSeen >= 15 * 60 * 1000) {
+        const now = new Date().toISOString()
+        const { error: touchError } = await supabase.from('service_incidents')
+          .update({ last_seen_at: now, updated_at: now })
+          .eq('id', existing.id).neq('status', 'RESOLVED')
+        if (touchError) throw touchError
+      }
+      return
+    }
     await recordIncident({ fingerprint, component, severity, title, message: `${message} Registros afectados: ${count}.`, metadata: { ...metadata, count } })
   } else {
     await resolveFingerprint(fingerprint)

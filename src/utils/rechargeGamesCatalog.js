@@ -1,10 +1,12 @@
 'use strict'
 
 const supabase = require('../supabase')
+const { rechargeGamesCatalogFingerprint } = require('./rechargeGamesCatalogFingerprint')
 const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
 const { normalizeMarketPricing, calculateOfferPrices } = require('./gamePricing')
 
 const PROVIDER = 'rechargegames'
+const CATALOG_SIGNATURE_SETTING_KEY = 'rechargegames_catalog_signature'
 const requestedRefreshInterval = Number(process.env.RECHARGEGAMES_CATALOG_REFRESH_MS || 3 * 60 * 60 * 1000)
 const CATALOG_REFRESH_MS = Math.max(5 * 60 * 1000, Number.isFinite(requestedRefreshInterval) && requestedRefreshInterval > 0 ? requestedRefreshInterval : 3 * 60 * 60 * 1000)
 let workerStarted = false
@@ -45,22 +47,66 @@ async function writeCatalogError(error) {
   })
 }
 
+async function readCatalogSignature() {
+  const { data, error } = await supabase.from('synthesisone_settings')
+    .select('value').eq('key', CATALOG_SIGNATURE_SETTING_KEY).maybeSingle()
+  if (error) throw error
+  const signature = data?.value && typeof data.value === 'object' ? data.value.sha256 : null
+  return typeof signature === 'string' ? signature : null
+}
+
+async function saveCatalogSignature(signature) {
+  const { error } = await supabase.from('synthesisone_settings').upsert({
+    key: CATALOG_SIGNATURE_SETTING_KEY,
+    value: { sha256: signature },
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'key' })
+  if (error) console.warn('[RechargeGames] No se pudo guardar la firma del catálogo; se repetirá la sincronización completa en la próxima actualización.')
+}
+
 async function refreshCatalog({ reason = 'scheduled' } = {}) {
   if (refreshInFlight) return refreshInFlight
   refreshInFlight = (async () => {
     const startedAt = new Date().toISOString()
     let targetStoreId = null
     let offerWriteStarted = false
+    let catalogWritePayloadBytes = 0
     try {
       const response = await rechargeGamesRequest('/v1/products', { query: { all: 'true' } })
       const catalog = normalizeCatalog(response.data)
       if (!catalog.products.length) {
         throw new RechargeGamesApiError('RechargeGames catalog did not contain any priced products', { status: 502, code: 'empty_catalog' })
       }
+      const pricing = await getPricingSettings()
       const storeId = await getPlatformStoreId()
       targetStoreId = storeId
-      const pricing = await getPricingSettings()
+      const signature = rechargeGamesCatalogFingerprint(catalog, pricing)
+      let previousSignature = null
+      try {
+        previousSignature = await readCatalogSignature()
+      } catch (signatureError) {
+        // Signature metadata is an optimization only. If it cannot be read, continue
+        // with the conservative full sync rather than failing catalog availability.
+        console.warn('[RechargeGames] No se pudo leer la firma del catálogo; se hará sincronización completa.')
+      }
       const now = new Date().toISOString()
+      const availableProducts = catalog.products.filter(product => !product.out_of_stock).length
+
+      // The provider catalog is large (11k+ products). If neither its relevant
+      // fields nor the configured conversion/margin/rounding changed, only refresh
+      // the small status row instead of rewriting every offer to Supabase.
+      if (previousSignature && previousSignature === signature) {
+        const state = {
+          id: 1, last_attempt_at: startedAt, last_success_at: now, last_error: null,
+          game_count: catalog.games.length, product_count: catalog.products.length,
+          available_product_count: availableProducts, updated_at: now,
+        }
+        const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
+        if (stateError) throw stateError
+        console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_UNCHANGED', reason, source_game_count: catalog.games.length, source_product_count: catalog.stats.source_product_count, product_count: catalog.products.length, provider_response_bytes: response.responseBytes || null, estimated_supabase_write_payload_bytes: 0, database_catalog_writes_skipped: true }))
+        return { ok: true, unchanged: true, games: catalog.games.length, source_products: catalog.stats.source_product_count, products: catalog.products.length, available_products: availableProducts, last_success_at: now }
+      }
+
       const gameIds = new Map()
       const existingGames = await readAllRows(() => supabase.from('game_market_games')
         .select('id, slug, thumbnail_path, thumbnail_url')
@@ -74,11 +120,11 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
       })
       const thumbnailBySlug = new Map(catalog.games.map((game, index) => [game.slug, thumbnailUrls[index]]))
 
-      // Create/update one game row per provider category. Existing manually uploaded images
-      // are preserved; provider/Wikimedia URLs are stored separately as a fallback thumbnail.
-      for (const game of catalog.games) {
+      // Bulk upsert all game rows together instead of one HTTP/database request per
+      // game. Keep manually uploaded images when the provider has no image for a game.
+      const gameRows = catalog.games.map(game => {
         const isGiftcard = game.kind === 'giftcard'
-        const gameRow = {
+        return {
           store_id: storeId,
           slug: game.slug,
           provider_game_slug: game.source_slug,
@@ -90,10 +136,14 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
           is_active: true,
           updated_at: now,
         }
+      })
+      for (let i = 0; i < gameRows.length; i += 500) {
+        const gameChunk = gameRows.slice(i, i + 500)
+        catalogWritePayloadBytes += Buffer.byteLength(JSON.stringify(gameChunk), 'utf8')
         const { data, error } = await supabase.from('game_market_games')
-          .upsert(gameRow, { onConflict: 'store_id,slug' }).select('id').single()
+          .upsert(gameChunk, { onConflict: 'store_id,slug' }).select('id,slug')
         if (error) throw error
-        gameIds.set(game.slug, data.id)
+        for (const row of data || []) gameIds.set(String(row.slug), row.id)
       }
 
       const offerRows = []
@@ -149,8 +199,9 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
         })
       }
 
-      for (let i = 0; i < offerRows.length; i += 100) {
-        const chunk = offerRows.slice(i, i + 100)
+      for (let i = 0; i < offerRows.length; i += 500) {
+        const chunk = offerRows.slice(i, i + 500)
+        catalogWritePayloadBytes += Buffer.byteLength(JSON.stringify(chunk), 'utf8')
         offerWriteStarted = true
         const { error } = await supabase.from('game_market_offers')
           .upsert(chunk, { onConflict: 'store_id,provider,provider_product_key' })
@@ -179,7 +230,6 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
         .eq('store_id', storeId).eq('provider', PROVIDER).eq('provider_last_seen_at', now).eq('provider_out_of_stock', false)
       if (availability.error) throw availability.error
 
-      const availableProducts = catalog.products.filter(product => !product.out_of_stock).length
       const state = {
         id: 1,
         last_attempt_at: startedAt,
@@ -192,7 +242,11 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
       }
       const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
       if (stateError) throw stateError
-      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
+      // Signature write is intentionally best-effort: failure only means the next
+      // refresh performs a full sync again, not that a successfully synced catalog
+      // should be hidden or treated as failed.
+      await saveCatalogSignature(signature)
+      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, provider_response_bytes: response.responseBytes || null, estimated_supabase_write_payload_bytes: catalogWritePayloadBytes, offer_upsert_batch_size: 500, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
       return { ok: true, games: catalog.games.length, source_groups: catalog.stats.source_group_count, source_products: catalog.stats.source_product_count, products: offerRows.length, available_products: availableProducts, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, last_success_at: now }
     } catch (error) {
       // If persistence began but the refresh did not commit, fail closed instead of leaving

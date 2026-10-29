@@ -43,6 +43,15 @@ test('health monitor alerts by Telegram once during a database outage and announ
   assert.match(monitor, /La conexión con Supabase volvió a responder/)
 })
 
+
+test('health monitor does not reopen the same active incident on every polling pass', () => {
+  const monitor = read(path.join(backend, 'src/utils/healthMonitor.js'))
+  assert.match(monitor, /OPS_HEALTH_INTERVAL_MS \|\| 300000/)
+  assert.match(monitor, /select\('id,status,last_seen_at'\)\.eq\('fingerprint', fingerprint\)/)
+  assert.match(monitor, /existing\.status !== 'RESOLVED'/)
+  assert.match(monitor, /Date\.now\(\) - lastSeen >= 15 \* 60 \* 1000/)
+})
+
 test('migration 019 deduplicates operational incidents and constrains announcement dates/severity', () => {
   const sql = read(path.join(backend, 'supabase/migrations/019_ops_incidents_announcements.sql'))
   assert.match(sql, /fingerprint text NOT NULL UNIQUE/)

@@ -63,10 +63,16 @@ test('wallet status refresh endpoint reconciles saved SMS and returns ticket plu
   assert.match(storeAccountRoute, /wallet: result\.wallet, refreshed: result\.refreshed/)
 })
 
-test('automatic SMS reconciliation skips empty workloads and scans paged records rather than only the newest 300', () => {
+test('automatic SMS reconciliation skips empty workloads and scopes SMS reads to clients with eligible tickets', () => {
   assert.match(reconcilerSource, /NO_RECONCILABLE_TICKETS/)
+  assert.match(reconcilerSource, /NO_RECONCILABLE_CLIENTS/)
   assert.match(reconcilerSource, /boundedIntegerEnv\('PAYMENT_SMS_RECONCILE_MAX_ROWS', 10_000, 500, 20_000\)/)
-  assert.match(reconcilerSource, /\.range\(offset, Math\.min\(offset \+ PAGE_SIZE - 1, MAX_SMS_ROWS - 1\)\)/)
+  assert.match(reconcilerSource, /select\('created_at,client_id'\)/)
+  assert.match(reconcilerSource, /rpc\('list_payment_reconciliation_sms'/)
+  assert.doesNotMatch(reconcilerSource, /supabase\.from\('sms_logs'\)[\s\S]{0,250}\.range\(/)
+  const scopeMigration = fs.readFileSync(path.join(__dirname, '../supabase/migrations/033_payment_sms_reconciliation_scope.sql'), 'utf8')
+  assert.match(scopeMigration, /s\.client_id = ANY\(COALESCE\(p_client_ids, ARRAY\[\]::uuid\[\]\)\)/)
+  assert.match(scopeMigration, /GRANT EXECUTE ON FUNCTION public\.list_payment_reconciliation_sms[\s\S]*TO service_role/)
 })
 
 test('Android shows a manual refresh button and requests the reconciliation endpoint', (t) => {

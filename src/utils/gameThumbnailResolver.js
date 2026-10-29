@@ -1,6 +1,8 @@
 'use strict'
 
 const LOOKUP_TIMEOUT_MS = 4500
+const POSITIVE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const NEGATIVE_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const MEMO = new Map()
 
 function safeHttpsUrl(value, { wikipediaOnly = false } = {}) {
@@ -59,7 +61,9 @@ async function lookupWikipediaThumbnail(name, fetchImpl = global.fetch) {
   const trimmedName = String(name || '').trim()
   if (!trimmedName || typeof fetchImpl !== 'function') return null
   const cacheKey = trimmedName.toLocaleLowerCase('en-US')
-  if (MEMO.has(cacheKey)) return MEMO.get(cacheKey)
+  const cached = MEMO.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) return cached.value
+  if (cached) MEMO.delete(cacheKey)
   let result = null
   try {
     const url = new URL('https://en.wikipedia.org/w/api.php')
@@ -83,7 +87,13 @@ async function lookupWikipediaThumbnail(name, fetchImpl = global.fetch) {
   } catch (_) {
     // Thumbnail resolution is best-effort and must never make the provider catalog fail.
   }
-  if (result) MEMO.set(cacheKey, result)
+  // Cache both successful and empty results. Without negative caching, every
+  // scheduled 3-hour catalog sync repeated the same Wikipedia search for games
+  // that have no suitable thumbnail.
+  MEMO.set(cacheKey, {
+    value: result,
+    expiresAt: Date.now() + (result ? POSITIVE_CACHE_TTL_MS : NEGATIVE_CACHE_TTL_MS),
+  })
   return result
 }
 

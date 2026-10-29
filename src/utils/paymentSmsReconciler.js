@@ -21,6 +21,7 @@ const LOOKBACK_HOURS = boundedIntegerEnv('PAYMENT_SMS_RECONCILE_LOOKBACK_HOURS',
 const INTERVAL_MS = boundedIntegerEnv('PAYMENT_SMS_RECONCILE_INTERVAL_MS', 90_000, 60_000, 24 * 60 * 60 * 1000)
 const MAX_SMS_ROWS = boundedIntegerEnv('PAYMENT_SMS_RECONCILE_MAX_ROWS', 10_000, 500, 20_000)
 const PAGE_SIZE = 500
+const MAX_TICKET_ROWS = 100_000
 
 async function reconcileRecentPaymentSms() {
   if (running) return { scanned: 0, matched: 0, skipped: true }
@@ -35,13 +36,24 @@ async function reconcileRecentPaymentSms() {
     // EXPIRED tickets stay eligible only when their bank transaction timestamp proves it
     // happened during the ticket window (enforced by each payment matcher).
     const cartAvailable = await getCartFeatureStatus().then(v => v.enabled).catch(() => false)
-    const [etecsaTickets, gameTickets, walletTickets, cartTickets] = await Promise.all([
-      supabase.from('etecsa_orders').select('created_at').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }).limit(1000),
-      supabase.from('game_recharge_orders').select('created_at').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }).limit(1000),
-      supabase.from('store_wallet_topups').select('created_at').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }).limit(1000),
-      ...(cartAvailable ? [supabase.from('store_cart_orders').select('created_at').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }).limit(1000)] : []),
+    // Gather every eligible ticket's owning client using a narrow projection. The SMS
+    // query must not download other clients' SMS merely because one client has a pending
+    // ticket. readAllRows avoids silently excluding clients after the common 1,000-row cap.
+    const ticketReads = await Promise.all([
+      readAllRows(() => supabase.from('etecsa_orders').select('created_at,client_id')
+        .in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }),
+      { pageSize: PAGE_SIZE, maxRows: MAX_TICKET_ROWS }),
+      readAllRows(() => supabase.from('game_recharge_orders').select('created_at,client_id')
+        .in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }),
+      { pageSize: PAGE_SIZE, maxRows: MAX_TICKET_ROWS }),
+      readAllRows(() => supabase.from('store_wallet_topups').select('created_at,client_id')
+        .in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }),
+      { pageSize: PAGE_SIZE, maxRows: MAX_TICKET_ROWS }),
+      ...(cartAvailable ? [readAllRows(() => supabase.from('store_cart_orders').select('created_at,client_id')
+        .in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', lookbackCutoff).order('created_at', { ascending: true }),
+      { pageSize: PAGE_SIZE, maxRows: MAX_TICKET_ROWS })] : []),
     ])
-    for (const result of [etecsaTickets, gameTickets, walletTickets, ...((cartAvailable && cartTickets) ? [cartTickets] : [])]) if (result.error) throw result.error
+    const [etecsaTickets, gameTickets, walletTickets, cartTickets] = ticketReads
     // Do not cap reviewed completed tickets at an arbitrary 100: a customer's successful
     // credit may need ledger repair after a past partial/manual operation.
     const reviewedCompletedWallet = await readAllRows(() => supabase.from('store_wallet_topups')
@@ -61,31 +73,29 @@ async function reconcileRecentPaymentSms() {
       if (error) console.error(JSON.stringify({ ts: new Date().toISOString(), event: 'PAYMENT_RECONCILE_COMPLETED_WALLET_REPAIR_FAILED', topup_id: topup.id, code: error.code || null, message: String(error.message || 'unknown').slice(0, 160) }))
       else console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'PAYMENT_RECONCILE_COMPLETED_WALLET_REPAIR_OK', topup_id: topup.id }))
     }
-    const tickets = [...(etecsaTickets.data || []), ...(gameTickets.data || []), ...(walletTickets.data || []), ...((cartAvailable && cartTickets) ? (cartTickets.data || []) : [])]
+    const tickets = [
+      ...(etecsaTickets || []), ...(gameTickets || []), ...(walletTickets || []),
+      ...(cartAvailable && cartTickets ? cartTickets : []),
+    ]
     if (!tickets.length) return { scanned: 0, matched: 0, skipped: true, reason: reviewedCompletedWallet.length ? 'REVIEWED_WALLET_RECONCILED' : 'NO_RECONCILABLE_TICKETS' }
+    const ticketClientIds = [...new Set(tickets.map(row => row.client_id).filter(Boolean).map(String))]
+    if (!ticketClientIds.length) return { scanned: 0, matched: 0, skipped: true, reason: 'NO_RECONCILABLE_CLIENTS' }
     const oldestTicketMs = Math.min(...tickets.map(row => Date.parse(row.created_at || '')).filter(Number.isFinite))
     const cutoffMs = Number.isFinite(oldestTicketMs) ? Math.max(lookbackCutoffMs, oldestTicketMs - 2 * 60 * 1000) : lookbackCutoffMs
     const cutoff = new Date(cutoffMs).toISOString()
 
-    // Page instead of silently trusting the common PostgREST 1,000-row limit.
-    // Order descending to retain the newest window if the explicit 10k safety cap is hit;
-    // process that retained set oldest-first below.
-    const rows = []
-    let rowCapReached = false
-    for (let offset = 0; offset < MAX_SMS_ROWS; offset += PAGE_SIZE) {
-      const { data, error } = await supabase.from('sms_logs')
-        .select('id,client_id,sender,body,received_at')
-        .gte('received_at', cutoff)
-        .order('received_at', { ascending: false })
-        .range(offset, Math.min(offset + PAGE_SIZE - 1, MAX_SMS_ROWS - 1))
-      if (error) throw error
-      const page = data || []
-      rows.push(...page)
-      if (page.length < PAGE_SIZE) break
-      if (offset + PAGE_SIZE >= MAX_SMS_ROWS) { rowCapReached = true; break }
-    }
-
-    const clientIds = [...new Set(rows.map(row => row.client_id).filter(Boolean))]
+    // Run the narrow SMS selection inside Postgres. The former global scan could download
+    // up to 10,000 SMS belonging to unrelated clients every 90 seconds while any ticket
+    // remained eligible. SQL applies client_id, time window, order and row cap server-side.
+    const { data: smsRows, error: smsError } = await supabase.rpc('list_payment_reconciliation_sms', {
+      p_client_ids: ticketClientIds,
+      p_received_after: cutoff,
+      p_limit: MAX_SMS_ROWS,
+    })
+    if (smsError) throw smsError
+    const rows = Array.isArray(smsRows) ? smsRows : []
+    const rowCapReached = rows.length >= MAX_SMS_ROWS
+    const clientIds = [...new Set(rows.map(row => row.client_id).filter(Boolean).map(String))]
     const clientsById = new Map()
     if (clientIds.length) {
       // Keep the database payload small. Split large .in() lists for predictable PostgREST URLs.

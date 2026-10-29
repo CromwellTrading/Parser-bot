@@ -124,3 +124,41 @@ El catálogo/órdenes usa los productos, regiones, precios y `product_key` devue
 - Provider statuses are `pending`, `delivered`, and `failed`. Pending orders are reconciled every 60 seconds; creation retries reuse the same `buyer_ref`. Webhooks use the provider's Standard Webhooks HMAC headers and raw request body.
 - Authenticated store clients can call `POST /api/game-recharges/region-check` with `{ game, uid, region }`. The backend calls the provider's documented keyless `GET /v1/region-check`, validates inputs and rate-limits checks. This verifies region for supported game IDs; it is not a server-ID directory.
 - Admin-only `GET /api/game-recharges/admin/provider-balance` reports the wholesale prepaid balance in USDT without returning the private provider ledger. Provider funding/deposits are separate from customer CUP Wallet operations.
+
+## Consolidación del backend — 29 de octubre de 2026
+
+Esta copia completa combina el backend aportado por el propietario con los cambios de continuidad y la optimización de tráfico. No contiene credenciales ni un archivo `.env` de producción.
+
+### Cambios conservados e integrados
+
+- **Códigos de referido y cupones:** mantiene `reward_referral_code_entries`, la lógica de `src/utils/referralCodeRewards.js`, y la validación/registro coordinado con `src/utils/rewards.js` y `src/routes/gameMarket.js`. Las entradas adicionales de códigos no se convierten por sí solas en referidos válidos para las misiones que requieren una primera compra pagada.
+- **Documentación API de webhook personal:** `docs/CLIENT_WEBHOOK_API.md` describe configuración y recepción de eventos sin exponer lógica interna del producto.
+- **Estilos y paletas visuales:** el backend permite ocho paletas y doce estilos conforme a la migración `032_multi_referral_codes_and_revamp_styles.sql`.
+- **Monitor operativo:** usa un intervalo predeterminado de cinco minutos y no vuelve a reabrir/escribir la misma incidencia activa en cada sondeo. La incidencia continúa visible hasta que la condición desaparece.
+- **Catálogo RechargeGames:** calcula una firma de catálogo/precios, omite el upsert masivo cuando no detecta cambios, agrupa escrituras y registra bytes estimados para comparar el consumo.
+- **Miniaturas:** guarda en memoria las resoluciones positivas durante siete días y los resultados vacíos durante 24 horas para no repetir búsquedas idénticas cada sincronización.
+- **Conciliación SMS:** pide al SQL únicamente mensajes recientes de clientes con tickets elegibles, en vez de descargar SMS de clientes ajenos a esos tickets.
+
+### Nueva migración para el alcance de conciliación
+
+Se añade `supabase/migrations/033_payment_sms_reconciliation_scope.sql`. La migración `032_multi_referral_codes_and_revamp_styles.sql` ya existe en este proyecto para otra función; **no sustituyas ni renombres la migración 032 existente**.
+
+Antes del despliegue, abre el proyecto Supabase que usa el servicio de Render y comprueba el estado de las migraciones. Ejecuta la migración 033 una sola vez si la función `public.list_payment_reconciliation_sms(uuid[], timestamptz, integer)` todavía no existe. La función está restringida a `service_role`; no elimina ni modifica datos existentes. No ejecutes SQL en un proyecto Supabase distinto al de producción.
+
+### Validación de esta copia
+
+- `npm test`: 198 tests, 187 aprobados, 0 fallidos y 11 omitidos por condiciones/áreas comprobadas en otro repositorio.
+- `node --check` ejecutado en todos los archivos JavaScript del proyecto: correcto.
+- No se ha hecho despliegue en Render ni se ha ejecutado una migración en la base real desde este entorno.
+- No se ha medido todavía el ahorro real en GB. Tras el despliegue, compara `Network Metrics` de Render y revisa `RECHARGEGAMES_CATALOG_UNCHANGED`, `provider_response_bytes`, `estimated_supabase_write_payload_bytes` y los contadores de la conciliación.
+- La incidencia `orders:transfer-refunds-pending` observada en los logs corresponde a un pedido real que requiere revisión. El parche no confirma pagos ni ejecuta reembolsos por el mero hecho de reducir tráfico.
+
+### Secuencia de publicación recomendada
+
+1. Haz copia de seguridad del repositorio y de la base de datos.
+2. Revisa el diff de esta copia contra el repositorio conectado a Render para conservar cualquier cambio que se haya hecho después de crear el ZIP subido.
+3. Comprueba que la migración 033 no esté ya desplegada y ejecútala en el Supabase correcto.
+4. Ejecuta `npm test` y confirma que la suite queda sin fallos.
+5. Despliega el backend y comprueba `/readyz`, logs y operaciones de pagos/refunds.
+6. Mide el tráfico durante 24–72 horas. No asumas una cifra de ahorro hasta comparar las métricas posteriores.
+

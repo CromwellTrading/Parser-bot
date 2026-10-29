@@ -60,7 +60,7 @@ async function rechargeGamesRequest(path, { method = 'GET', body = null, query =
     const message = String(providerError?.message || `RechargeGames returned HTTP ${response.status}`).slice(0, 500)
     throw new RechargeGamesApiError(message, { status: response.status, code, details: data })
   }
-  return { status: response.status, data, headers: response.headers }
+  return { status: response.status, data, headers: response.headers, responseBytes: Buffer.byteLength(raw, 'utf8') }
 }
 
 function isProviderNotConfigured(error) {

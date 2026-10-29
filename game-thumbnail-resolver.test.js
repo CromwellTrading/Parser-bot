@@ -23,3 +23,16 @@ test('finds and validates a Wikimedia thumbnail using an injected fetch function
   } } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
   assert.equal(await lookupWikipediaThumbnail('Unique Resolver Game', fetchImpl), 'https://upload.wikimedia.org/wikipedia/en/a/a7/cover.jpg')
 })
+
+
+test('caches unsuccessful thumbnail lookups so each catalog refresh does not repeat the same query', async () => {
+  let calls = 0
+  const fetchImpl = async () => {
+    calls += 1
+    return new Response(JSON.stringify({ query: { pages: {} } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  const name = `No Thumbnail Bandwidth Test ${Date.now()} ${Math.random()}`
+  assert.equal(await lookupWikipediaThumbnail(name, fetchImpl), null)
+  assert.equal(await lookupWikipediaThumbnail(name, fetchImpl), null)
+  assert.equal(calls, 1)
+})

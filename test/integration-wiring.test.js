@@ -103,7 +103,7 @@ test('licensed webhook configuration accepts active admin licenses and repairs a
 })
 
 
-test('licensed webhook delivery history is client-scoped and returns only a safe summary', () => {
+test('licensed webhook delivery history is client-scoped and returns only a safe summary', (t) => {
   const auth = read('src/routes/auth.js')
   const helper = read('src/utils/clientWebhookStatus.js')
   const androidPath = path.join(android, 'app/src/main/java/com/synthesisone/app/MainActivity.kt')
