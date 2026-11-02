@@ -1,3 +1,13 @@
-node_modules/
+.gradle/
+build/
+**/build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+*.apk
+*.aab
+*.jks
+*.keystore
 .env
-*.log
+.env.*

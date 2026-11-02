@@ -1,0 +1,104 @@
+name: Build APK Release
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Restaurar o generar el Wrapper JAR oficial
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/synthesisone-wrapper-bootstrap" gradle/wrapper
+          DIST_DIR="$HOME/.cache/synthesisone-wrapper-bootstrap/gradle-8.1.1"
+          if [[ ! -x "$DIST_DIR/bin/gradle" ]]; then
+            DIST_ZIP="$RUNNER_TEMP/gradle-8.1.1-bin.zip"
+            curl --retry 3 --retry-all-errors --fail --location --connect-timeout 10 --max-time 300 \
+              -o "$DIST_ZIP" https://services.gradle.org/distributions/gradle-8.1.1-bin.zip
+            echo 'e111cb9948407e26351227dabce49822fb88c37ee72f1d1582a69c68af2e702f  '"$DIST_ZIP" | sha256sum --check
+            unzip -q -o "$DIST_ZIP" -d "$HOME/.cache/synthesisone-wrapper-bootstrap"
+            rm -f "$DIST_ZIP"
+          fi
+          TMP_PROJECT="$RUNNER_TEMP/so-wrapper-bootstrap"
+          mkdir -p "$TMP_PROJECT"
+          printf "rootProject.name = 'synthesisone-wrapper-bootstrap'\n" > "$TMP_PROJECT/settings.gradle"
+          : > "$TMP_PROJECT/build.gradle"
+          "$DIST_DIR/bin/gradle" --no-daemon -p "$TMP_PROJECT" wrapper --gradle-version 8.1.1 --distribution-type bin
+          cp "$TMP_PROJECT/gradle/wrapper/gradle-wrapper.jar" gradle/wrapper/gradle-wrapper.jar
+          echo 'ed2c26eba7cfb93cc2b7785d05e534f07b5b48b5e7fc941921cd098628abca58  gradle/wrapper/gradle-wrapper.jar' | sha256sum --check
+          rm -rf "$TMP_PROJECT"
+
+      - name: Configure Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Dar permisos a gradlew
+        run: |
+          sed -i 's/\r//' gradlew
+          chmod +x gradlew
+
+      - name: Desencriptar firma release existente
+        env:
+          SYNTHESISONE_SIGNING_SECRET: ${{ secrets.SYNTHESISONE_SIGNING_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$SYNTHESISONE_SIGNING_SECRET" || {
+            echo "Falta el secret SYNTHESISONE_SIGNING_SECRET"; exit 1;
+          }
+          test -s .github/signing/synthesisone-release.jks.enc || {
+            echo "Falta .github/signing/synthesisone-release.jks.enc. No se generará ni rotará automáticamente la clave de firma."; exit 1;
+          }
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in .github/signing/synthesisone-release.jks.enc \
+            -out synthesisone-release.jks \
+            -pass env:SYNTHESISONE_SIGNING_SECRET
+          test -s synthesisone-release.jks
+          keytool -list -keystore synthesisone-release.jks -storepass "$SYNTHESISONE_SIGNING_SECRET" -alias synthesisone >/dev/null
+
+      - name: Compilar APK release firmada
+        run: ./gradlew clean assembleRelease
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          SYNTHESISONE_KEYSTORE_PATH: synthesisone-release.jks
+          SYNTHESISONE_STORE_PASSWORD: ${{ secrets.SYNTHESISONE_SIGNING_SECRET }}
+          SYNTHESISONE_KEY_ALIAS: synthesisone
+          SYNTHESISONE_KEY_PASSWORD: ${{ secrets.SYNTHESISONE_SIGNING_SECRET }}
+
+      - name: Verificar que la APK está firmada
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK" || { echo "ERROR: no se generó app-release.apk"; exit 1; }
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -path "*/apksigner" | sort -V | tail -n 1)"
+          test -n "$APKSIGNER" || { echo "ERROR: no se encontró apksigner"; exit 1; }
+          "$APKSIGNER" verify --verbose "$APK"
+          if [[ -f app/build/outputs/apk/release/app-release-unsigned.apk ]]; then
+            echo "ERROR: se generó también una APK unsigned; la build firmada no es válida."
+            exit 1
+          fi
+
+      - name: Subir APK release
+        uses: actions/upload-artifact@v4
+        with:
+          name: SynthesisOne-v1.5.${{ github.run_number }}-release
+          path: app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
+
+      - name: Limpiar firma privada del runner
+        if: always()
+        run: rm -f synthesisone-release.jks

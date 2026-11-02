@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Main screen theme is selected from the client's saved palette in MainActivity.onCreate. -->
+    <style name="SynthesisOneThemeDark" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorAccent">#8357FF</item>
+        <item name="android:colorAccent">#8357FF</item>
+        <item name="android:colorBackground">#101522</item>
+        <item name="colorBackgroundFloating">#101522</item>
+        <item name="android:windowBackground">#070A12</item>
+        <item name="android:statusBarColor">#070A12</item>
+        <item name="android:navigationBarColor">#070A12</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:textColorPrimary">#F3F5FF</item>
+        <item name="android:textColorSecondary">#A4ADC5</item>
+        <item name="colorControlNormal">#A4ADC5</item>
+        <item name="colorControlActivated">#8357FF</item>
+        <item name="alertDialogTheme">@style/SynthesisOneDialogDark</item>
+        <item name="android:alertDialogTheme">@style/SynthesisOneDialogDark</item>
+        <item name="android:datePickerDialogTheme">@style/SynthesisOneDialogDark</item>
+        <item name="android:timePickerDialogTheme">@style/SynthesisOneDialogDark</item>
+    </style>
+
+    <style name="SynthesisOneThemeRed" parent="SynthesisOneThemeDark">
+        <item name="colorAccent">#FF426D</item>
+        <item name="android:colorAccent">#FF426D</item>
+        <item name="alertDialogTheme">@style/SynthesisOneDialogRed</item>
+        <item name="android:alertDialogTheme">@style/SynthesisOneDialogRed</item>
+        <item name="android:datePickerDialogTheme">@style/SynthesisOneDialogRed</item>
+        <item name="android:timePickerDialogTheme">@style/SynthesisOneDialogRed</item>
+    </style>
+
+    <style name="SynthesisOneThemeGreen" parent="SynthesisOneThemeDark">
+        <item name="colorAccent">#25B981</item>
+        <item name="android:colorAccent">#25B981</item>
+        <item name="alertDialogTheme">@style/SynthesisOneDialogGreen</item>
+        <item name="android:alertDialogTheme">@style/SynthesisOneDialogGreen</item>
+        <item name="android:datePickerDialogTheme">@style/SynthesisOneDialogGreen</item>
+        <item name="android:timePickerDialogTheme">@style/SynthesisOneDialogGreen</item>
+    </style>
+
+    <style name="SynthesisOneThemeCyan" parent="SynthesisOneThemeDark">
+        <item name="colorAccent">#19BFD1</item>
+        <item name="android:colorAccent">#19BFD1</item>
+        <item name="alertDialogTheme">@style/SynthesisOneDialogCyan</item>
+        <item name="android:alertDialogTheme">@style/SynthesisOneDialogCyan</item>
+        <item name="android:datePickerDialogTheme">@style/SynthesisOneDialogCyan</item>
+        <item name="android:timePickerDialogTheme">@style/SynthesisOneDialogCyan</item>
+    </style>
+
+
+    <style name="SynthesisOneThemeGold" parent="SynthesisOneThemeDark">
+        <item name="colorAccent">#E8AC3B</item>
+        <item name="android:colorAccent">#E8AC3B</item>
+        <item name="alertDialogTheme">@style/SynthesisOneDialogGold</item>
+        <item name="android:alertDialogTheme">@style/SynthesisOneDialogGold</item>
+        <item name="android:datePickerDialogTheme">@style/SynthesisOneDialogGold</item>
+        <item name="android:timePickerDialogTheme">@style/SynthesisOneDialogGold</item>
+    </style>
+    <style name="SynthesisOneThemeOcean" parent="SynthesisOneThemeDark">
+        <item name="colorAccent">#2587E8</item>
+        <item name="android:colorAccent">#2587E8</item>
+        <item name="alertDialogTheme">@style/SynthesisOneDialogOcean</item>
+        <item name="android:alertDialogTheme">@style/SynthesisOneDialogOcean</item>
+        <item name="android:datePickerDialogTheme">@style/SynthesisOneDialogOcean</item>
+        <item name="android:timePickerDialogTheme">@style/SynthesisOneDialogOcean</item>
+    </style>
+
+    <style name="SynthesisOneThemeLight" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="colorAccent">#6543D6</item>
+        <item name="android:colorAccent">#6543D6</item>
+        <item name="android:colorBackground">#FFFFFF</item>
+        <item name="colorBackgroundFloating">#FFFFFF</item>
+        <item name="android:windowBackground">#F3F5FB</item>
+        <item name="android:statusBarColor">#F3F5FB</item>
+        <item name="android:navigationBarColor">#F3F5FB</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:textColorPrimary">#172033</item>
+        <item name="android:textColorSecondary">#566178</item>
+        <item name="colorControlNormal">#566178</item>
+        <item name="colorControlActivated">#6543D6</item>
+        <item name="alertDialogTheme">@style/SynthesisOneDialogLight</item>
+        <item name="android:alertDialogTheme">@style/SynthesisOneDialogLight</item>
+        <item name="android:datePickerDialogTheme">@style/SynthesisOneDialogLight</item>
+        <item name="android:timePickerDialogTheme">@style/SynthesisOneDialogLight</item>
+    </style>
+
+    <style name="SynthesisOneDialogDark" parent="Theme.AppCompat.Dialog.Alert">
+        <item name="colorAccent">#8357FF</item>
+        <item name="android:colorAccent">#8357FF</item>
+        <item name="android:colorBackground">#101522</item>
+        <item name="colorBackgroundFloating">#101522</item>
+        <item name="android:windowBackground">#101522</item>
+        <item name="android:textColorPrimary">#F3F5FF</item>
+        <item name="android:textColorSecondary">#A4ADC5</item>
+    </style>
+    <style name="SynthesisOneDialogRed" parent="SynthesisOneDialogDark">
+        <item name="colorAccent">#FF426D</item><item name="android:colorAccent">#FF426D</item>
+    </style>
+    <style name="SynthesisOneDialogGreen" parent="SynthesisOneDialogDark">
+        <item name="colorAccent">#25B981</item><item name="android:colorAccent">#25B981</item>
+    </style>
+    <style name="SynthesisOneDialogCyan" parent="SynthesisOneDialogDark">
+        <item name="colorAccent">#19BFD1</item><item name="android:colorAccent">#19BFD1</item>
+    </style>
+    <style name="SynthesisOneDialogGold" parent="SynthesisOneDialogDark">
+        <item name="colorAccent">#E8AC3B</item>
+        <item name="android:colorAccent">#E8AC3B</item>
+    </style>
+    <style name="SynthesisOneDialogOcean" parent="SynthesisOneDialogDark">
+        <item name="colorAccent">#2587E8</item>
+        <item name="android:colorAccent">#2587E8</item>
+    </style>
+    <style name="SynthesisOneDialogLight" parent="Theme.AppCompat.Light.Dialog.Alert">
+        <item name="colorAccent">#6543D6</item>
+        <item name="android:colorAccent">#6543D6</item>
+        <item name="android:colorBackground">#FFFFFF</item>
+        <item name="colorBackgroundFloating">#FFFFFF</item>
+        <item name="android:windowBackground">#FFFFFF</item>
+        <item name="android:textColorPrimary">#172033</item>
+        <item name="android:textColorSecondary">#566178</item>
+    </style>
+
+    <style name="SynthesisOneDialogAnimation">
+        <item name="android:windowEnterAnimation">@anim/so_dialog_enter</item>
+        <item name="android:windowExitAnimation">@anim/so_dialog_exit</item>
+    </style>
+</resources>
