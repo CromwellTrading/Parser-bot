@@ -4,7 +4,8 @@ const crypto = require('crypto')
 const supabase = require('../supabase')
 const { getLicenseConfig } = require('./onboarding')
 const { getPaymentConfig } = require('./paymentDestinations')
-const { safeCustomerText } = require('./customerMessages')
+const { safeCustomerText, safeAutomationMessage } = require('./customerMessages')
+const { getAutomationAvailability } = require('./systemSettings')
 const { normalizePhone, parseSms } = require('./parser')
 const { readAllRows } = require('./supabasePagination')
 const { normalizePayerPhone, isConfiguredPaymentReceiver } = require('./etecsaPaymentMatching')
@@ -247,6 +248,14 @@ async function assertNoActiveCheckout(clientId) {
 }
 
 async function createTopup(client, body) {
+  // A Wallet deposit is an external transfer, regardless of currency. Re-check
+  // availability on the server immediately before creating a payment ticket.
+  // This intentionally does not affect purchases funded by an existing Wallet balance.
+  const automation = await getAutomationAvailability()
+  if (!automation.enabled) {
+    throw fail(safeAutomationMessage(automation.message), 503, 'AUTOMATION_UNAVAILABLE')
+  }
+
   const currency = String(body?.currency || (body?.amount_saldo !== undefined ? 'SALDO' : 'CUP')).trim().toUpperCase()
   if (!['CUP', 'SALDO'].includes(currency)) throw fail('Selecciona CUP o Saldo Móvil.', 400, 'INVALID_TOPUP_CURRENCY')
   const rawAmount = currency === 'SALDO' ? (body?.amount_saldo ?? body?.amount) : (body?.amount_cup ?? body?.amount)

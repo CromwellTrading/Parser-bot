@@ -1,0 +1,90 @@
+'use strict'
+
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+
+const root = path.resolve(__dirname, '..')
+const androidPath = path.resolve(root, '../SMS-relay-main/app/src/main/java/com/synthesisone/app/MainActivity.kt')
+const read = (file) => fs.readFileSync(path.join(root, file), 'utf8')
+
+test('Wallet external top-ups fail closed when automated transfer handling is disabled', () => {
+  const source = read('src/utils/storeWallet.js')
+  const start = source.indexOf('async function createTopup(')
+  const end = source.indexOf('\nasync function getTopup(', start)
+  assert.ok(start >= 0 && end > start)
+  const createTopup = source.slice(start, end)
+  assert.match(createTopup, /getAutomationAvailability\(\)/)
+  assert.match(createTopup, /if \(!automation\.enabled\)[\s\S]*?AUTOMATION_UNAVAILABLE/)
+  assert.ok(createTopup.indexOf('getAutomationAvailability()') < createTopup.indexOf("supabase.from('store_wallet_topups').insert"))
+})
+
+test('public checkout destination response includes safe, authoritative automation status', () => {
+  const source = read('src/routes/system.js')
+  const start = source.indexOf("router.get('/payment-destinations'")
+  const end = source.indexOf("router.get('/payment-destinations/mine'", start)
+  const route = source.slice(start, end)
+  assert.match(route, /automation_enabled: automation\.enabled/)
+  assert.match(route, /automation_message: safeAutomationMessage\(automation\.message\)/)
+  assert.match(route, /const destinations = automation\.enabled \? await getPaymentDestinations\(\) : \[\]/)
+})
+
+test('RLS hardening covers every non-extension public table and future objects while retaining service_role', () => {
+  const sql = read('supabase/migrations/035_public_schema_backend_only_rls.sql')
+  assert.match(sql, /c\.relkind IN \('r', 'p', 'v', 'm', 'f'\)/)
+  assert.match(sql, /ALTER TABLE public\.%I ENABLE ROW LEVEL SECURITY/)
+  assert.match(sql, /ALTER TABLE public\.%I FORCE ROW LEVEL SECURITY/)
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON TABLE public\.%I FROM anon/)
+  assert.match(sql, /REVOKE ALL PRIVILEGES ON TABLE public\.%I FROM authenticated/)
+  assert.match(sql, /GRANT ALL PRIVILEGES ON TABLE public\.%I TO service_role/)
+  assert.match(sql, /GRANT ALL PRIVILEGES ON SEQUENCE public\.%I TO service_role/)
+  assert.match(sql, /GRANT EXECUTE ON FUNCTION public\.%I\(%s\) TO service_role/)
+  assert.match(sql, /p\.prokind = 'p'/)
+  assert.match(sql, /GRANT EXECUTE ON PROCEDURE public\.%I\(%s\) TO service_role/)
+  assert.match(sql, /ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public/)
+  assert.match(sql, /Storage policies\/buckets are intentionally/)
+})
+
+test('Android proactive warnings offer the user WhatsApp support and fail closed when availability is unknown', (t) => {
+  if (!fs.existsSync(androidPath)) return t.skip('Android source project not mounted')
+  const source = fs.readFileSync(androidPath, 'utf8')
+  assert.match(source, /showAssistantProactiveAlert\(/)
+  assert.match(source, /PREF_SO_ASSISTANT_FLOATING/)
+  assert.match(source, /https:\/\/wa\.me\/\$SO_SUPPORT_WHATSAPP/)
+  assert.match(source, /No pudimos comprobar que las transferencias estén habilitadas/)
+  assert.match(source, /ensureAutomationAvailableForTransfer \{ beginWalletTopupForm\(currency\) \}/)
+  assert.match(source, /AUTOMATION_UNAVAILABLE/)
+})
+
+test('Mobile Legends advisor only compares available offers with a parseable diamond quantity', (t) => {
+  if (!fs.existsSync(androidPath)) return t.skip('Android source project not mounted')
+  const source = fs.readFileSync(androidPath, 'utf8')
+  assert.match(source, /mobileLegendsDiamondCount\(offer: GameOfferItem\)/)
+  assert.match(source, /diamonds\?\|diamantes\?/)
+  assert.match(source, /SO ASSISTANT · COMPARADOR DE DIAMANTES/)
+  assert.match(source, /offersForRegion/)
+  assert.match(source, /MEJOR VALOR/)
+})
+
+test('assistant can guide customers through Settings to the SO Reseller card', (t) => {
+  if (!fs.existsSync(androidPath)) return t.skip('Android source project not mounted')
+  const source = fs.readFileSync(androidPath, 'utf8')
+  assert.match(source, /startResellerNavigationGuide\(\)/)
+  assert.match(source, /showDashboard\(guidedSettings = true\)/)
+  assert.match(source, /showConfig\(guideToReseller = true\)/)
+  assert.match(source, /pulseAssistantGuideTarget\(resellerCard\)/)
+})
+
+test('Android adds first-visit guidance, contextual rewards/wallet advice and a support summary without voice permissions', (t) => {
+  if (!fs.existsSync(androidPath)) return t.skip('Android source project not mounted')
+  const source = fs.readFileSync(androidPath, 'utf8')
+  assert.match(source, /scheduleFirstVisitAssistantTutor\(\)/)
+  assert.match(source, /showAssistantContextualTip\(section\)/)
+  assert.match(source, /buildRewardsAssistantAdvice\(data\)/)
+  assert.match(source, /Tu oferta de bienvenida está por terminar/)
+  assert.match(source, /PREPARAR RESUMEN PARA SOPORTE/)
+  assert.match(source, /SO Assistant recomienda no realizar compras ni nuevos depósitos/)
+  assert.match(source, /showAssistantQuickTour\(\)/)
+  assert.doesNotMatch(source, /RECORD_AUDIO|SpeechRecognizer|TextToSpeech|MediaRecorder/)
+})

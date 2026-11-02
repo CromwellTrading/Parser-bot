@@ -86,6 +86,8 @@ En particular:
 
 Las migraciones 021–024 forman parte del código, **pero no se han aplicado automáticamente a tu base de datos** desde este entorno. Ejecutarlas requiere acceso al proyecto real. Comprueba qué falta en el proyecto Supabase conectado a Render y aplica solo las pendientes, en orden. Haz respaldo antes de aplicar SQL en producción y confirma cada resultado sin ignorar errores intermedios.
 
+La migración adicional `035_public_schema_backend_only_rls.sql` amplía la protección a todos los objetos de aplicación existentes en `public` (tablas/particiones, vistas, secuencias y rutinas), niega privilegios de cliente y mantiene el acceso del backend `service_role`. Es una migración distinta de 021 y debe revisarse y ejecutarse después de un backup, solo tras verificar que no hay lectores legítimos que usen `anon` o `authenticated` directamente. Consulta `docs/SECURITY_RLS_HARDENING.md`: explica la verificación posterior, el límite de los privilegios por defecto y la obligación de activar RLS explícitamente en cada tabla futura con `ENABLE` y `FORCE ROW LEVEL SECURITY`.
+
 ## Wallet CUP + Saldo Móvil
 
 - `GET /api/store/wallet` devuelve `balance_cup`, `balance_saldo`, totales independientes y el estado de integridad de ambos libros.
@@ -162,3 +164,33 @@ Antes del despliegue, abre el proyecto Supabase que usa el servicio de Render y 
 5. Despliega el backend y comprueba `/readyz`, logs y operaciones de pagos/refunds.
 6. Mide el tráfico durante 24–72 horas. No asumas una cifra de ahorro hasta comparar las métricas posteriores.
 
+
+
+## SO Assistant — soporte conversacional con OpenRouter
+
+- `GET /api/assistant/config` y `POST /api/assistant/chat` están protegidos por sesión de cliente.
+- El ID del modelo no está fijado en el código: se configura mediante `OPENROUTER_MODEL`; la clave privada se configura mediante `OPENROUTER_API_KEY`, solo en Render.
+- El asistente puede explicar funciones y consultar un resumen limitado de la propia cuenta del cliente cuando la pregunta trata sobre pedidos, Wallet, licencias o cupones. No recibe SMS, tarjetas, teléfonos, tokens, secretos ni códigos de entrega.
+- Las conversaciones no se guardan en Supabase. Solo se guarda el contador diario de preguntas en `ai_assistant_usage`.
+- La migración adicional es `supabase/migrations/034_ai_assistant_usage.sql`; ejecutarla una sola vez en el mismo Supabase de producción antes de habilitar el asistente.
+- El límite predeterminado es 25 preguntas diarias por cliente y cinco por minuto. Puede ajustarse mediante `AI_ASSISTANT_DAILY_LIMIT`.
+- Por defecto se exige ZDR y `data_collection=deny` al enrutar por OpenRouter. Si el modelo elegido no tiene un proveedor compatible con estas condiciones, no se enviará la solicitud por una ruta menos protectora. Revisa `docs/AI_ASSISTANT_OPENROUTER.md` antes de cambiarlo.
+
+
+## SO Assistant (OpenRouter)
+
+- Configura `OPENROUTER_API_KEY` y `OPENROUTER_MODEL` exclusivamente como variables privadas de Render; el ID del modelo lo elige el propietario.
+- Ejecuta `supabase/migrations/034_ai_assistant_usage.sql` antes de habilitar el endpoint.
+- Límites predeterminados: `AI_ASSISTANT_DAILY_LIMIT=25` por cliente y `AI_ASSISTANT_GLOBAL_DAILY_LIMIT=40` para todo SynthesisOne por día UTC. Ambos son configurables.
+- Se requiere ZDR y `data_collection=deny` por solicitud de forma predeterminada.
+- La IA es de orientación/lectura; no puede aprobar pagos, alterar balances, ejecutar reembolsos ni liberar productos.
+- Consulta `docs/AI_ASSISTANT_OPENROUTER.md` para instalación y privacidad.
+
+
+## SO Assistant 2.1 — capa proactiva
+
+La actualización incorpora seguimiento de pedidos, avisos de pago/Wallet, alertas de cupones y misiones, progreso de referidos, aviso de expiración de bienvenida y un diagnóstico administrativo de solo lectura. Las rutas `GET /api/assistant/insights` y `GET /api/assistant/admin/insights` están en `src/routes/assistant.js`; ambas requieren sesión válida y la segunda valida `role=admin` en servidor. Las consultas son limitadas y no dependen de OpenRouter.
+
+La parte Android añade tutor inicial, consejos contextuales, guía visual a SO Reseller, resumen de cuenta para soporte, comparador de Mobile Legends, avisos flotantes y consejos de seguridad Wallet. **No se incorpora voz.**
+
+Antes de producción, sigue `docs/SO_ASSISTANT_2_1_PRODUCTION.md` y `docs/SECURITY_RLS_HARDENING.md`. La migración RLS 035 es manual y debe aplicarse solo tras backup y revisión de integraciones que puedan usar acceso directo a Supabase.

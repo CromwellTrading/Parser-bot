@@ -57,7 +57,14 @@ router.get('/payment-destinations', async (_req, res) => {
     const automation = await getAutomationAvailability()
     const destinations = automation.enabled ? await getPaymentDestinations() : []
     res.set('Cache-Control', 'no-store')
-    return res.json({ ok: true, available: destinations.length > 0, destinations })
+    return res.json({
+      ok: true,
+      available: automation.enabled && destinations.length > 0,
+      automation_enabled: automation.enabled,
+      automation_message: safeAutomationMessage(automation.message),
+      updated_at: automation.updated_at || null,
+      destinations,
+    })
   } catch (error) {
     console.error('No se pudieron cargar las cuentas de transferencia:', error.code || error.message)
     return res.status(503).json({ ok: false, error: 'No se pudieron cargar las cuentas de transferencia.' })
