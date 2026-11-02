@@ -17,7 +17,7 @@ function assistantConfigured(env = process.env) {
 function assistantUsageLimits(env = process.env) {
   const dailyLimit = Math.max(1, Math.min(200, Number.parseInt(env.AI_ASSISTANT_DAILY_LIMIT || '25', 10) || 25))
   const globalDailyLimit = Math.max(1, Math.min(10000, Number.parseInt(env.AI_ASSISTANT_GLOBAL_DAILY_LIMIT || '40', 10) || 40))
-  const maxTokens = Math.max(128, Math.min(1200, Number.parseInt(env.OPENROUTER_MAX_TOKENS || '700', 10) || 700))
+  const maxTokens = Math.max(128, Math.min(4096, Number.parseInt(env.OPENROUTER_MAX_TOKENS || '700', 10) || 700))
   const requireZdr = !['false', '0', 'off', 'no'].includes(String(env.OPENROUTER_REQUIRE_ZDR || 'true').trim().toLowerCase())
   return { dailyLimit, globalDailyLimit, maxTokens, requireZdr }
 }

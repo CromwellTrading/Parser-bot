@@ -31,7 +31,7 @@ No se incluye ningún ID de modelo predeterminado. Si el modelo que elijas no ti
 
 - El backend limita cada cliente a 25 consultas diarias y toda la aplicación a 40 consultas diarias de forma predeterminada. Ambos límites son configurables.
 - Añade también un límite de crédito/gasto a la clave de OpenRouter desde su panel, si tu tipo de cuenta ofrece esa opción. No dependas únicamente del límite diario de la aplicación.
-- El máximo de respuesta predeterminado es 700 tokens para acotar el coste.
+- El máximo predeterminado es 700 tokens; el backend acepta valores configurados entre 128 y 4096 tokens.
 - El contador se consume antes de llamar al modelo; un error del proveedor también puede consumir un intento para evitar reintentos ilimitados.
 
 ## Privacidad y permisos

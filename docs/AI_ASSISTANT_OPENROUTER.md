@@ -9,7 +9,7 @@
 | `AI_ASSISTANT_ENABLED` | No | `true` para habilitar o `false` para deshabilitar. Por defecto se habilita cuando existen clave y modelo. |
 | `AI_ASSISTANT_DAILY_LIMIT` | No | Preguntas máximas por cliente y día UTC. Predeterminado: `25`; permitido: 1–200. |
 | `AI_ASSISTANT_GLOBAL_DAILY_LIMIT` | No | Tope para todos los clientes combinados por día UTC. Predeterminado: `40`; permitido: 1–10.000. |
-| `OPENROUTER_MAX_TOKENS` | No | Máximo de tokens de salida por respuesta. Predeterminado: `700`; permitido: 128–1200. |
+| `OPENROUTER_MAX_TOKENS` | No | Máximo de tokens de salida por respuesta. Predeterminado: `700`; permitido: 128–4096. |
 | `OPENROUTER_REQUIRE_ZDR` | No | Predeterminado `true`: solo endpoints con Zero Data Retention y `data_collection=deny`. Para quitar esta protección, configurar `false` deliberadamente después de revisar las políticas del proveedor elegido. |
 | `OPENROUTER_APP_NAME` | No | Nombre enviado a OpenRouter para identificar la aplicación. Predeterminado: `SynthesisOne SO`. |
 | `OPENROUTER_SITE_URL` | No | URL pública del sitio de la app, si existe. Se envía como `HTTP-Referer`. |

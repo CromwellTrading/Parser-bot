@@ -51,9 +51,11 @@ test('OpenRouter text parser supports plain and segmented message content', () =
 })
 
 
-test('assistant usage limits have conservative per-client and global defaults and clamp overrides', () => {
+test('assistant usage limits support larger production overrides with safe hard caps', () => {
   assert.deepEqual(assistantUsageLimits({}), { dailyLimit: 25, globalDailyLimit: 40, maxTokens: 700, requireZdr: true })
   assert.deepEqual(assistantUsageLimits({ AI_ASSISTANT_DAILY_LIMIT: '500', AI_ASSISTANT_GLOBAL_DAILY_LIMIT: '15000', OPENROUTER_MAX_TOKENS: '20', OPENROUTER_REQUIRE_ZDR: 'false' }), { dailyLimit: 200, globalDailyLimit: 10000, maxTokens: 128, requireZdr: false })
+  assert.deepEqual(assistantUsageLimits({ AI_ASSISTANT_DAILY_LIMIT: '125', AI_ASSISTANT_GLOBAL_DAILY_LIMIT: '200', OPENROUTER_MAX_TOKENS: '2100' }), { dailyLimit: 125, globalDailyLimit: 200, maxTokens: 2100, requireZdr: true })
+  assert.equal(assistantUsageLimits({ OPENROUTER_MAX_TOKENS: '9000' }).maxTokens, 4096)
 })
 
 
