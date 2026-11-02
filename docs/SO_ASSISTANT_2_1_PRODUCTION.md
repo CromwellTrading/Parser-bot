@@ -20,7 +20,7 @@ Esta entrega continúa sobre el proyecto 2.0 e incorpora la capa proactiva del a
 - La IA no acredita saldo, no autoriza transferencias, no modifica pedidos, no activa automatizaciones, no emite reembolsos y no aprueba solicitudes.
 - Los cálculos, reglas de cupones, precios, cantidades y decisiones de disponibilidad permanecen en la lógica determinista existente.
 - Los diagnósticos administrativos se basan en métricas agregadas. Si parte de las métricas no puede consultarse, el resultado se marca como parcial y no debe interpretarse como un estado sano.
-- Las notificaciones proactivas no llaman a OpenRouter ni consumen la cuota diaria del chat. El chat sigue requiriendo `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` y los límites ya documentados en `docs/AI_ASSISTANT_OPENROUTER.md`.
+- Las intervenciones espontáneas de personalidad se generan localmente desde un conjunto limitado de frases y no consumen solicitudes de GroqCloud. El chat usa `GROQ_API_KEY`, `GROQ_MODEL_PRIMARY` y `GROQ_MODEL_FALLBACKS`; consulta `docs/AI_ASSISTANT_GROQ.md`.
 - Las lecturas proactivas de cliente están acotadas: hasta 20 pedidos Game Market, 20 ETECSA, 15 tickets Wallet, 10 cupones recientes y conteos por `count/head` para referidos.
 
 ## Cambios de API
@@ -36,7 +36,7 @@ El cliente consulta insights cada 180 segundos con conexión y sesión activa. S
 
 1. Descargar y conservar una copia del backend y Android actualmente desplegados.
 2. Crear y verificar un backup restaurable de Supabase antes de tocar migraciones.
-3. Confirmar que la migración `034_ai_assistant_usage.sql` ya se ejecutó una sola vez, si el chat OpenRouter ya está habilitado. No duplicarla.
+3. Confirmar que la migración `034_ai_assistant_usage.sql` ya se ejecutó una sola vez, si el chat GroqCloud ya está habilitado. No duplicarla.
 4. Revisar `docs/SECURITY_RLS_HARDENING.md`. La migración `035_public_schema_backend_only_rls.sql` debe ejecutarse manualmente y solo si todas las integraciones existentes acceden a las tablas por backend/service role. No se ejecuta automáticamente desde la APK ni desde Render.
 5. Desplegar el backend 2.1 en Render, conservando las variables productivas actuales (especialmente URL/clave Supabase, tokens de proveedores, webhook y bot). No rotar ni copiar secretos como parte de este cambio.
 6. Probar `/healthz`, `/readyz`, login, `/api/assistant/config`, `/api/assistant/insights` con una sesión de cliente y `/api/assistant/admin/insights` con una cuenta administradora. Una cuenta cliente normal debe recibir `403` en la ruta administrativa.

@@ -8,12 +8,13 @@ const { rewardsEnabled, rewardsSchemaReady } = require('../utils/rewards')
 const opsDashboard = require('../utils/opsDashboard')
 const { getAutomationAvailability } = require('../utils/systemSettings')
 const {
-  assistantConfigured, assistantUsageLimits, normalizeMessages, buildSystemPrompt, loadRelevantKnowledge, needsAccountContext,
-  safeOrderStatus, safeCouponStatus, shortTicket, extractAssistantText, buildCustomerInsights, buildAdminInsights,
+  assistantProviderConfig, assistantConfigured, assistantUsageLimits, normalizeMessages, buildSystemPrompt, loadRelevantKnowledge, needsAccountContext,
+  safeOrderStatus, safeCouponStatus, shortTicket, extractAssistantPayload, buildCustomerInsights, buildAdminInsights,
 } = require('../utils/assistantService')
 
 const router = express.Router()
 const minuteRequests = new Map()
+let providerModelCursor = 0
 
 function extractToken(req) {
   const header = String(req.headers.authorization || '')
@@ -310,7 +311,7 @@ router.get('/config', requireClient, async (req, res) => {
       console.error(JSON.stringify({ event: 'AI_ASSISTANT_READINESS_FAILED', code: readiness.error.code || 'unknown' }))
     }
   }
-  return res.set('Cache-Control', 'no-store').json({ ok: true, enabled, message })
+  return res.set('Cache-Control', 'no-store').json({ ok: true, enabled, message, provider: 'GroqCloud', persona: 'SO Assistant', avatar_enabled: true })
 })
 
 router.post('/chat', requireClient, async (req, res) => {
@@ -325,7 +326,7 @@ router.post('/chat', requireClient, async (req, res) => {
     return res.status(429).json({ ok: false, code: 'AI_RATE_LIMIT', error: 'Has enviado varias preguntas seguidas. Espera un minuto e inténtalo de nuevo.' })
   }
 
-  const { dailyLimit, globalDailyLimit, maxTokens, requireZdr } = configValues()
+  const { dailyLimit, globalDailyLimit, maxTokens } = configValues()
   const quota = await supabase.rpc('consume_ai_assistant_request', {
     p_client_id: clientId,
     p_daily_limit: dailyLimit,
@@ -348,62 +349,112 @@ router.post('/chat', requireClient, async (req, res) => {
       { role: 'system', content: buildSystemPrompt(accountContext, knowledgeText) },
       ...normalized.messages,
     ]
-    const payload = {
-      model: String(process.env.OPENROUTER_MODEL).trim(),
-      messages,
-      max_tokens: maxTokens,
-      temperature: 0.35,
-      ...(requireZdr ? { provider: { zdr: true, data_collection: 'deny' } } : {}),
-    }
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 35_000)
-    timeout.unref?.()
-    let response
-    let data
-    let providerCode = null
-    try {
-      const headers = {
-        Authorization: `Bearer ${String(process.env.OPENROUTER_API_KEY).trim()}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'X-OpenRouter-Title': String(process.env.OPENROUTER_APP_NAME || 'SynthesisOne SO').slice(0, 80),
-      }
-      const siteUrl = String(process.env.OPENROUTER_SITE_URL || '').trim()
-      if (siteUrl) headers['HTTP-Referer'] = siteUrl
-      response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST', headers, body: JSON.stringify(payload), signal: controller.signal,
-      })
-      if (response.ok) data = await response.json()
-      else {
+    const provider = assistantProviderConfig(process.env)
+    const spontaneousMode = req.body?.mode === 'spontaneous'
+    // Ambient messages are intentionally short and single-model: they are optional,
+    // metered, and must fall back quickly instead of delaying the dashboard.
+    const modelOrder = spontaneousMode
+      ? [provider.models[providerModelCursor % Math.max(1, provider.models.length)]]
+      : (provider.models.length > 1
+        ? provider.models.map((_, index) => provider.models[(providerModelCursor + index) % provider.models.length])
+        : provider.models)
+    providerModelCursor = (providerModelCursor + 1) % Math.max(1, provider.models.length)
+
+    let data = null
+    let response = null
+    let selectedModel = ''
+    let lastStatus = 0
+    let lastProviderCode = null
+    let lastWasTimeout = false
+
+    // Distribute requests across the configured free models. If a model is
+    // rate-limited or temporarily unavailable, try the remaining models.
+    for (const model of modelOrder) {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), spontaneousMode ? 7_000 : 18_000)
+      timeout.unref?.()
+      try {
+        response = await fetch(`${provider.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${provider.apiKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            max_completion_tokens: spontaneousMode ? Math.min(maxTokens, 220) : maxTokens,
+            temperature: spontaneousMode ? 0.95 : 0.82,
+            response_format: { type: 'json_object' },
+            stream: false,
+          }),
+          signal: controller.signal,
+        })
+        if (response.ok) {
+          data = await response.json()
+          selectedModel = model
+          break
+        }
+        lastStatus = response.status
         try {
           const failure = await response.json()
-          providerCode = failure?.error?.code || failure?.error?.type || null
-        } catch (_) {}
+          lastProviderCode = failure?.error?.code || failure?.error?.type || null
+        } catch (_) { lastProviderCode = null }
+        // Invalid credentials/configuration are not fixed by trying another model.
+        if ([401, 403].includes(response.status)) break
+        // Retry on provider/model capacity failures or temporary server errors.
+        if (![400, 404, 408, 409, 429, 500, 502, 503, 504].includes(response.status)) break
+      } catch (error) {
+        lastWasTimeout = error?.name === 'AbortError'
+        lastStatus = 0
+        lastProviderCode = error?.code || null
+      } finally {
+        clearTimeout(timeout)
       }
-    } finally {
-      clearTimeout(timeout)
     }
-    if (!response.ok) {
-      console.warn(JSON.stringify({ event: 'AI_ASSISTANT_PROVIDER_ERROR', status: response.status, code: String(providerCode || '').slice(0, 80) || null }))
-      if (response.status === 429) return res.status(503).json({ ok: false, code: 'AI_PROVIDER_BUSY', error: 'El asistente está ocupado en este momento. Inténtalo de nuevo en un momento.' })
-      if (response.status === 402) return res.status(503).json({ ok: false, code: 'AI_PROVIDER_CREDITS', error: 'El asistente no está disponible temporalmente. Contacta con soporte.' })
-      if (response.status === 404 && requireZdr) return res.status(503).json({ ok: false, code: 'AI_MODEL_PRIVACY_UNAVAILABLE', error: 'El modelo configurado no tiene ahora un proveedor compatible con la protección de privacidad. Contacta con soporte.' })
-      return res.status(502).json({ ok: false, code: 'AI_PROVIDER_ERROR', error: 'No se pudo obtener una respuesta del asistente. Inténtalo más tarde.' })
+
+    if (!data) {
+      console.warn(JSON.stringify({
+        event: 'AI_ASSISTANT_PROVIDER_EXHAUSTED',
+        provider: 'groq', status: lastStatus || null,
+        code: String(lastProviderCode || '').slice(0, 80) || null,
+        models_attempted: modelOrder.length,
+      }))
+      if ([401, 403].includes(lastStatus)) {
+        return res.status(503).json({ ok: false, code: 'AI_PROVIDER_AUTH', error: 'La conexión del asistente necesita revisión. Contacta con soporte.' })
+      }
+      if (lastStatus === 429 || [404, 408, 409, 500, 502, 503, 504].includes(lastStatus)) {
+        return res.status(503).json({ ok: false, code: 'AI_PROVIDER_BUSY', error: 'Los modelos están ocupados por ahora. Inténtalo de nuevo en un momento.' })
+      }
+      return res.status(502).json({ ok: false, code: lastWasTimeout ? 'AI_PROVIDER_TIMEOUT' : 'AI_PROVIDER_UNAVAILABLE', error: lastWasTimeout ? 'El asistente está tardando demasiado. Inténtalo otra vez.' : 'No se pudo conectar con el asistente. Comprueba tu conexión e inténtalo de nuevo.' })
     }
-    const reply = extractAssistantText(data)
+
+    const assistantOutput = extractAssistantPayload(data)
+    const reply = assistantOutput.reply
     if (!reply) {
-      console.warn(JSON.stringify({ event: 'AI_ASSISTANT_EMPTY_RESPONSE', model: String(process.env.OPENROUTER_MODEL).slice(0, 100) }))
+      console.warn(JSON.stringify({ event: 'AI_ASSISTANT_EMPTY_RESPONSE', provider: 'groq', model: selectedModel }))
       return res.status(502).json({ ok: false, code: 'AI_EMPTY_RESPONSE', error: 'El asistente no pudo generar una respuesta. Inténtalo otra vez.' })
     }
     const usage = data?.usage || {}
     console.log(JSON.stringify({
       event: 'AI_ASSISTANT_REQUEST_COMPLETED', client_id: clientId,
-      model: String(process.env.OPENROUTER_MODEL).slice(0, 100),
+      provider: 'groq', model: selectedModel,
       prompt_tokens: Number(usage.prompt_tokens) || 0,
       completion_tokens: Number(usage.completion_tokens) || 0,
       request_id: String(data?.id || '').slice(0, 100) || null,
     }))
-    return res.set('Cache-Control', 'no-store').json({ ok: true, reply, remaining_today: Math.max(0, dailyLimit - Number(quotaRow.used || 0)) })
+    return res.set('Cache-Control', 'no-store').json({
+      ok: true,
+      reply,
+      emotion: assistantOutput.emotion,
+      gesture: assistantOutput.gesture,
+      mood_text: assistantOutput.mood_text,
+      provider: 'GroqCloud',
+      model: selectedModel,
+      spontaneous: spontaneousMode,
+      remaining_today: Math.max(0, dailyLimit - Number(quotaRow.used || 0)),
+    })
   } catch (error) {
     const timeout = error?.name === 'AbortError'
     console.warn(JSON.stringify({ event: 'AI_ASSISTANT_REQUEST_FAILED', reason: timeout ? 'timeout' : (error?.code || 'network_error') }))

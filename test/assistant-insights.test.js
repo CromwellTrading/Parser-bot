@@ -85,7 +85,7 @@ test('assistant account summaries request only the authenticated account context
   assert.equal(needsAccountContext('Hazme un resumen de mi cuenta'), true)
   const prompt = buildSystemPrompt({ wallet: { cup: 10 } })
   assert.match(prompt, /No recomiendes transferir fuera de un ticket válido/)
-  assert.match(prompt, /resume únicamente los pedidos, cupones y balances/)
+  assert.match(prompt, /resume únicamente pedidos, cupones y balances/)
 })
 
 test('assistant insights endpoints require an authenticated client, and admin insights enforce admin role server-side', () => {

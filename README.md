@@ -149,7 +149,7 @@ Antes del despliegue, abre el proyecto Supabase que usa el servicio de Render y 
 
 ### Validación de esta copia
 
-- `npm test`: 198 tests, 187 aprobados, 0 fallidos y 11 omitidos por condiciones/áreas comprobadas en otro repositorio.
+- Verificación de esta revisión: `npm test` ejecutado tras los cambios del asistente; el resultado final se registra en la entrega. El entorno no incluye Android SDK ni el JAR del Gradle Wrapper.
 - `node --check` ejecutado en todos los archivos JavaScript del proyecto: correcto.
 - No se ha hecho despliegue en Render ni se ha ejecutado una migración en la base real desde este entorno.
 - No se ha medido todavía el ahorro real en GB. Tras el despliegue, compara `Network Metrics` de Render y revisa `RECHARGEGAMES_CATALOG_UNCHANGED`, `provider_response_bytes`, `estimated_supabase_write_payload_bytes` y los contadores de la conciliación.
@@ -166,30 +166,24 @@ Antes del despliegue, abre el proyecto Supabase que usa el servicio de Render y 
 
 
 
-## SO Assistant — soporte conversacional con OpenRouter
+## SO Assistant 2.2 — GroqCloud + avatar con personalidad
 
 - `GET /api/assistant/config` y `POST /api/assistant/chat` están protegidos por sesión de cliente.
-- El ID del modelo no está fijado en el código: se configura mediante `OPENROUTER_MODEL`; la clave privada se configura mediante `OPENROUTER_API_KEY`, solo en Render.
-- El asistente puede explicar funciones y consultar un resumen limitado de la propia cuenta del cliente cuando la pregunta trata sobre pedidos, Wallet, licencias o cupones. No recibe SMS, tarjetas, teléfonos, tokens, secretos ni códigos de entrega.
-- Las conversaciones no se guardan en Supabase. Solo se guarda el contador diario de preguntas en `ai_assistant_usage`.
-- La migración adicional es `supabase/migrations/034_ai_assistant_usage.sql`; ejecutarla una sola vez en el mismo Supabase de producción antes de habilitar el asistente.
-- El límite predeterminado es 25 preguntas diarias por cliente y cinco por minuto. Puede ajustarse mediante `AI_ASSISTANT_DAILY_LIMIT`.
-- Por defecto se exige ZDR y `data_collection=deny` al enrutar por OpenRouter. Si el modelo elegido no tiene un proveedor compatible con estas condiciones, no se enviará la solicitud por una ruta menos protectora. Revisa `docs/AI_ASSISTANT_OPENROUTER.md` antes de cambiarlo.
-
-
-## SO Assistant (OpenRouter)
-
-- Configura `OPENROUTER_API_KEY` y `OPENROUTER_MODEL` exclusivamente como variables privadas de Render; el ID del modelo lo elige el propietario.
-- Ejecuta `supabase/migrations/034_ai_assistant_usage.sql` antes de habilitar el endpoint.
-- Límites predeterminados: `AI_ASSISTANT_DAILY_LIMIT=25` por cliente y `AI_ASSISTANT_GLOBAL_DAILY_LIMIT=40` para todo SynthesisOne por día UTC. Ambos son configurables.
-- Se requiere ZDR y `data_collection=deny` por solicitud de forma predeterminada.
-- La IA es de orientación/lectura; no puede aprobar pagos, alterar balances, ejecutar reembolsos ni liberar productos.
-- Consulta `docs/AI_ASSISTANT_OPENROUTER.md` para instalación y privacidad.
+- La IA usa GroqCloud mediante `GROQ_API_KEY`, `GROQ_MODEL_PRIMARY` y `GROQ_MODEL_FALLBACKS`, exclusivamente en Render.
+- El backend rota entre modelos gratuitos configurados y prueba los restantes cuando hay límite o indisponibilidad temporal.
+- Cada respuesta mantiene `reply` para compatibilidad e incluye `emotion`, `gesture`, `mood_text`, `provider` y `model`. Si el proveedor devuelve texto simple, se acepta con emoción neutral.
+- El prompt define una personalidad expresiva y gestos, sin permitir que el asistente invente estados, solicite credenciales o ejecute acciones financieras.
+- Android muestra el avatar en la cabecera, las burbujas del chat, avisos flotantes y el acceso rápido.
+- La intervención espontánea es opcional y limitada a una solicitud generada al día por cliente en Inicio; no envía contexto de cuenta, consume una consulta si Groq responde y utiliza una frase local de respaldo cuando la API está ocupada. Se puede desactivar en Ajustes.
+- Las conversaciones no se guardan en Supabase. Solo se almacena el contador diario de consultas en `ai_assistant_usage`.
+- La migración de cuotas es `supabase/migrations/034_ai_assistant_usage.sql`; debe estar aplicada antes de habilitar el chat. No se requiere una migración adicional para el avatar ni la personalidad.
+- Los límites internos por cliente y globales no amplían las cuotas externas de GroqCloud; revisa `docs/AI_ASSISTANT_GROQ.md` y la consola del proveedor.
+- Consulta `docs/AI_ASSISTANT_GROQ.md` para configuración y despliegue.
 
 
 ## SO Assistant 2.1 — capa proactiva
 
-La actualización incorpora seguimiento de pedidos, avisos de pago/Wallet, alertas de cupones y misiones, progreso de referidos, aviso de expiración de bienvenida y un diagnóstico administrativo de solo lectura. Las rutas `GET /api/assistant/insights` y `GET /api/assistant/admin/insights` están en `src/routes/assistant.js`; ambas requieren sesión válida y la segunda valida `role=admin` en servidor. Las consultas son limitadas y no dependen de OpenRouter.
+La actualización incorpora seguimiento de pedidos, avisos de pago/Wallet, alertas de cupones y misiones, progreso de referidos, aviso de expiración de bienvenida y un diagnóstico administrativo de solo lectura. Las rutas `GET /api/assistant/insights` y `GET /api/assistant/admin/insights` están en `src/routes/assistant.js`; ambas requieren sesión válida y la segunda valida `role=admin` en servidor. Las consultas son limitadas y no dependen de GroqCloud.
 
 La parte Android añade tutor inicial, consejos contextuales, guía visual a SO Reseller, resumen de cuenta para soporte, comparador de Mobile Legends, avisos flotantes y consejos de seguridad Wallet. **No se incorpora voz.**
 
