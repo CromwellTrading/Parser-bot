@@ -166,24 +166,20 @@ Antes del despliegue, abre el proyecto Supabase que usa el servicio de Render y 
 
 
 
-## SO Assistant 2.2 — GroqCloud + avatar con personalidad
+## SO Assistant 2.2.1 — Cloudflare Workers AI
 
-- `GET /api/assistant/config` y `POST /api/assistant/chat` están protegidos por sesión de cliente.
-- La IA usa GroqCloud mediante `GROQ_API_KEY`, `GROQ_MODEL_PRIMARY` y `GROQ_MODEL_FALLBACKS`, exclusivamente en Render.
-- El backend rota entre modelos gratuitos configurados y prueba los restantes cuando hay límite o indisponibilidad temporal.
-- Cada respuesta mantiene `reply` para compatibilidad e incluye `emotion`, `gesture`, `mood_text`, `provider` y `model`. Si el proveedor devuelve texto simple, se acepta con emoción neutral.
-- El prompt define una personalidad expresiva y gestos, sin permitir que el asistente invente estados, solicite credenciales o ejecute acciones financieras.
-- Android muestra el avatar en la cabecera, las burbujas del chat, avisos flotantes y el acceso rápido.
-- La intervención espontánea es opcional y limitada a una solicitud generada al día por cliente en Inicio; no envía contexto de cuenta, consume una consulta si Groq responde y utiliza una frase local de respaldo cuando la API está ocupada. Se puede desactivar en Ajustes.
-- Las conversaciones no se guardan en Supabase. Solo se almacena el contador diario de consultas en `ai_assistant_usage`.
-- La migración de cuotas es `supabase/migrations/034_ai_assistant_usage.sql`; debe estar aplicada antes de habilitar el chat. No se requiere una migración adicional para el avatar ni la personalidad.
-- Los límites internos por cliente y globales no amplían las cuotas externas de GroqCloud; revisa `docs/AI_ASSISTANT_GROQ.md` y la consola del proveedor.
-- Consulta `docs/AI_ASSISTANT_GROQ.md` para configuración y despliegue.
-
+- El backend utiliza Cloudflare Workers AI mediante el endpoint oficial OpenAI-compatible `/ai/v1/chat/completions`.
+- Modelo predeterminado: `@cf/qwen/qwen3-30b-a3b-fp8`. La credencial y el identificador de cuenta permanecen exclusivamente en Render.
+- Variables obligatorias: `CLOUDFLARE_API_TOKEN` y `CLOUDFLARE_ACCOUNT_ID`; modelo configurable con `CLOUDFLARE_MODEL`.
+- Límites internos por defecto: 80 solicitudes diarias por cliente, 300 globales y 650 tokens máximos de salida. Ajustar el límite global según el consumo real de Neurons de Cloudflare.
+- La respuesta mantiene `reply`, `emotion`, `gesture` y `mood_text`. Se solicita JSON en el prompt y el parser elimina bloques de razonamiento y tolera respuestas de texto cuando el modelo no devuelve JSON válido.
+- Android 2.2 ya consume `/api/assistant/chat` y muestra avatar, emoción y gesto; no requiere cambios para sustituir el proveedor. Una instalación anterior a Android 2.2 sí necesitará actualizarse para disponer de esa interfaz.
+- No se añade migración SQL: se conserva el control de uso existente de `034_ai_assistant_usage.sql`.
+- Consulta `docs/AI_ASSISTANT_CLOUDFLARE.md` antes de desplegar.
 
 ## SO Assistant 2.1 — capa proactiva
 
-La actualización incorpora seguimiento de pedidos, avisos de pago/Wallet, alertas de cupones y misiones, progreso de referidos, aviso de expiración de bienvenida y un diagnóstico administrativo de solo lectura. Las rutas `GET /api/assistant/insights` y `GET /api/assistant/admin/insights` están en `src/routes/assistant.js`; ambas requieren sesión válida y la segunda valida `role=admin` en servidor. Las consultas son limitadas y no dependen de GroqCloud.
+La actualización incorpora seguimiento de pedidos, avisos de pago/Wallet, alertas de cupones y misiones, progreso de referidos, aviso de expiración de bienvenida y un diagnóstico administrativo de solo lectura. Las rutas `GET /api/assistant/insights` y `GET /api/assistant/admin/insights` están en `src/routes/assistant.js`; ambas requieren sesión válida y la segunda valida `role=admin` en servidor. Las consultas son limitadas y no dependen del proveedor de IA.
 
 La parte Android añade tutor inicial, consejos contextuales, guía visual a SO Reseller, resumen de cuenta para soporte, comparador de Mobile Legends, avisos flotantes y consejos de seguridad Wallet. **No se incorpora voz.**
 

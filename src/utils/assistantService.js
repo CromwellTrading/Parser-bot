@@ -9,17 +9,20 @@ const MAX_MESSAGE_CHARS = 1400
 const MAX_TOTAL_CHARS = 5500
 
 function assistantProviderConfig(env = process.env) {
-  const baseUrl = String(env.GROQ_API_BASE_URL || 'https://api.groq.com/openai/v1').trim().replace(/\/+$/, '')
-  const primary = String(env.GROQ_MODEL_PRIMARY || env.GROQ_MODEL || 'openai/gpt-oss-120b').trim()
-  const configuredFallbacks = String(env.GROQ_MODEL_FALLBACKS || 'qwen/qwen3.8-27b,openai/gpt-oss-20b')
-    .split(',').map(model => model.trim()).filter(Boolean)
-  const models = [...new Set([primary, ...configuredFallbacks].filter(Boolean))].slice(0, 5)
-  const fallbacksEnabled = !['false', '0', 'off', 'no'].includes(String(env.GROQ_FALLBACKS_ENABLED ?? 'true').trim().toLowerCase())
+  const accountId = String(env.CLOUDFLARE_ACCOUNT_ID || '').trim()
+  const apiKey = String(env.CLOUDFLARE_API_TOKEN || '').trim()
+  const model = String(env.CLOUDFLARE_MODEL || '@cf/qwen/qwen3-30b-a3b-fp8').trim()
+  const accountIdValid = /^[a-f0-9]{32}$/i.test(accountId)
+  const modelValid = /^@cf\/[a-z0-9._-]+\/[a-z0-9._-]+$/i.test(model)
+  const baseUrl = accountIdValid
+    ? `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1`
+    : ''
   return {
-    provider: 'groq',
+    provider: 'cloudflare-workers-ai',
     baseUrl,
-    apiKey: String(env.GROQ_API_KEY || '').trim(),
-    models: fallbacksEnabled ? models : models.slice(0, 1),
+    apiKey,
+    accountId,
+    models: modelValid ? [model] : [],
   }
 }
 
@@ -27,13 +30,13 @@ function assistantConfigured(env = process.env) {
   const explicitlyDisabled = String(env.AI_ASSISTANT_ENABLED || '').trim().toLowerCase()
   if (['false', '0', 'off', 'no'].includes(explicitlyDisabled)) return false
   const provider = assistantProviderConfig(env)
-  return Boolean(provider.apiKey && provider.models.length && provider.baseUrl.startsWith('https://'))
+  return Boolean(provider.apiKey && /^[a-f0-9]{32}$/i.test(provider.accountId) && provider.models.length && provider.baseUrl.startsWith('https://'))
 }
 
 function assistantUsageLimits(env = process.env) {
   const dailyLimit = Math.max(1, Math.min(200, Number.parseInt(env.AI_ASSISTANT_DAILY_LIMIT || '80', 10) || 80))
-  const globalDailyLimit = Math.max(1, Math.min(10000, Number.parseInt(env.AI_ASSISTANT_GLOBAL_DAILY_LIMIT || '600', 10) || 600))
-  const maxTokens = Math.max(128, Math.min(4096, Number.parseInt(env.AI_ASSISTANT_MAX_TOKENS || env.GROQ_MAX_COMPLETION_TOKENS || '1400', 10) || 1400))
+  const globalDailyLimit = Math.max(1, Math.min(10000, Number.parseInt(env.AI_ASSISTANT_GLOBAL_DAILY_LIMIT || '300', 10) || 300))
+  const maxTokens = Math.max(128, Math.min(4096, Number.parseInt(env.AI_ASSISTANT_MAX_TOKENS || '650', 10) || 650))
   return { dailyLimit, globalDailyLimit, maxTokens }
 }
 
@@ -51,19 +54,26 @@ function parseAssistantOutput(rawContent) {
     playful: 'Pícara', empathetic: 'Comprensiva', surprised: 'Sorprendida', shy: 'Tímida', proud: 'Orgullosa',
     sleepy: 'Relajada', determined: 'Decidida', sassy: 'Traviesa',
   }
-  const candidate = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
-  try {
-    const parsed = JSON.parse(candidate)
-    const reply = String(parsed.reply || parsed.message || '').trim()
-    if (reply) {
-      const emotion = allowedEmotions.has(String(parsed.emotion || '').toLowerCase()) ? String(parsed.emotion).toLowerCase() : 'neutral'
-      const gesture = allowedGestures.has(String(parsed.gesture || '').toLowerCase()) ? String(parsed.gesture).toLowerCase() : 'neutral'
-      return { reply: reply.slice(0, 5000), emotion, gesture, mood_text: moodLabels[emotion] }
+  const withoutReasoning = content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  const candidate = withoutReasoning.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
+  const candidates = [candidate]
+  const firstBrace = candidate.indexOf('{')
+  const lastBrace = candidate.lastIndexOf('}')
+  if (firstBrace >= 0 && lastBrace > firstBrace) candidates.push(candidate.slice(firstBrace, lastBrace + 1))
+  for (const jsonCandidate of candidates) {
+    try {
+      const parsed = JSON.parse(jsonCandidate)
+      const reply = String(parsed.reply || parsed.message || '').trim()
+      if (reply) {
+        const emotion = allowedEmotions.has(String(parsed.emotion || '').toLowerCase()) ? String(parsed.emotion).toLowerCase() : 'neutral'
+        const gesture = allowedGestures.has(String(parsed.gesture || '').toLowerCase()) ? String(parsed.gesture).toLowerCase() : 'neutral'
+        return { reply: reply.slice(0, 5000), emotion, gesture, mood_text: moodLabels[emotion] }
+      }
+    } catch (_) {
+      // Some model responses include a short preamble or return plain text.
     }
-  } catch (_) {
-    // Backward compatible fallback: some model variants may return plain text.
   }
-  return { reply: content.slice(0, 5000), emotion: 'neutral', gesture: 'neutral', mood_text: moodLabels.neutral }
+  return { reply: candidate.slice(0, 5000), emotion: 'neutral', gesture: 'neutral', mood_text: moodLabels.neutral }
 }
 
 function normalizeMessages(input) {

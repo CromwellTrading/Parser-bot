@@ -9,15 +9,18 @@ const {
   safeOrderStatus, safeCouponStatus, shortTicket, extractAssistantText, extractAssistantPayload,
 } = require('../src/utils/assistantService')
 
-test('Groq assistant is enabled only with a key and one or more configured models', () => {
-  assert.equal(assistantConfigured({ GROQ_API_KEY: 'key' }), true)
-  assert.equal(assistantConfigured({ GROQ_API_KEY: 'key', GROQ_MODEL_PRIMARY: 'openai/gpt-oss-120b' }), true)
-  assert.equal(assistantConfigured({ GROQ_API_KEY: 'key', GROQ_FALLBACKS_ENABLED: 'false' }), true)
-  assert.equal(assistantConfigured({ GROQ_API_KEY: 'key', AI_ASSISTANT_ENABLED: 'false' }), false)
-  assert.equal(assistantConfigured({ OPENROUTER_API_KEY: 'key', OPENROUTER_MODEL: 'provider/model' }), false)
-  const config = assistantProviderConfig({ GROQ_API_KEY: 'key', GROQ_MODEL_PRIMARY: 'model/a', GROQ_MODEL_FALLBACKS: 'model/b,model/c,model/b' })
-  assert.deepEqual(config.models, ['model/a', 'model/b', 'model/c'])
-  assert.equal(config.baseUrl, 'https://api.groq.com/openai/v1')
+test('Cloudflare Workers AI is enabled only with a token, valid account ID and model', () => {
+  const accountId = '7ba4f709737e4b343513e82767c712ac'
+  assert.equal(assistantConfigured({ CLOUDFLARE_API_TOKEN: 'token', CLOUDFLARE_ACCOUNT_ID: accountId }), true)
+  assert.equal(assistantConfigured({ CLOUDFLARE_API_TOKEN: 'token', CLOUDFLARE_ACCOUNT_ID: accountId, CLOUDFLARE_MODEL: '@cf/qwen/qwen3-30b-a3b-fp8' }), true)
+  assert.equal(assistantConfigured({ CLOUDFLARE_API_TOKEN: 'token', CLOUDFLARE_ACCOUNT_ID: 'invalid' }), false)
+  assert.equal(assistantConfigured({ CLOUDFLARE_API_TOKEN: 'token', CLOUDFLARE_ACCOUNT_ID: accountId, CLOUDFLARE_MODEL: 'openai/gpt-oss-120b' }), false)
+  assert.equal(assistantConfigured({ CLOUDFLARE_API_TOKEN: 'token', CLOUDFLARE_ACCOUNT_ID: accountId, AI_ASSISTANT_ENABLED: 'false' }), false)
+  assert.equal(assistantConfigured({ GROQ_API_KEY: 'old-key' }), false)
+  const config = assistantProviderConfig({ CLOUDFLARE_API_TOKEN: 'token', CLOUDFLARE_ACCOUNT_ID: accountId, CLOUDFLARE_MODEL: '@cf/qwen/qwen3-30b-a3b-fp8' })
+  assert.deepEqual(config.models, ['@cf/qwen/qwen3-30b-a3b-fp8'])
+  assert.equal(config.baseUrl, `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1`)
+  assert.equal(config.provider, 'cloudflare-workers-ai')
 })
 
 test('conversation validator only accepts bounded user/assistant history ending with user', () => {
@@ -53,8 +56,10 @@ test('private database states are converted into customer-safe wording', () => {
   assert.equal(shortTicket('GM', '12345678-aaaa-bbbb-cccc-ddddeeeeffff'), 'GM-12345678')
 })
 
-test('Groq response parser supports structured personality and legacy plain-text content', () => {
+test('Cloudflare Qwen response parser supports structured personality and legacy plain-text content', () => {
   assert.equal(extractAssistantText({ choices: [{ message: { content: '  Hola  ' } }] }), 'Hola')
+  const withThink = extractAssistantPayload({ choices: [{ message: { content: '<think>Reasoning hidden</think>\n{\"reply\":\"¡Vaya!\",\"emotion\":\"amused\",\"gesture\":\"wink\"}' } }] })
+  assert.deepEqual(withThink, { reply: '¡Vaya!', emotion: 'amused', gesture: 'wink', mood_text: 'Divertida' })
   assert.equal(extractAssistantText({ choices: [{ message: { content: [{ text: 'Hola' }, { text: 'mundo' }] } }] }), 'Hola\nmundo')
   assert.equal(extractAssistantText({ choices: [{ message: { content: null } }] }), '')
   const output = extractAssistantPayload({ choices: [{ message: { content: JSON.stringify({ reply: 'Qué gusto verte.', emotion: 'playful', gesture: 'wink', mood_text: 'Pícara' }) } }] })
@@ -68,8 +73,8 @@ test('Groq response parser supports structured personality and legacy plain-text
 })
 
 
-test('assistant usage limits provide larger safe Groq defaults and hard caps', () => {
-  assert.deepEqual(assistantUsageLimits({}), { dailyLimit: 80, globalDailyLimit: 600, maxTokens: 1400 })
+test('assistant usage limits use Cloudflare-safe daily defaults and hard caps', () => {
+  assert.deepEqual(assistantUsageLimits({}), { dailyLimit: 80, globalDailyLimit: 300, maxTokens: 650 })
   assert.deepEqual(assistantUsageLimits({ AI_ASSISTANT_DAILY_LIMIT: '500', AI_ASSISTANT_GLOBAL_DAILY_LIMIT: '15000', AI_ASSISTANT_MAX_TOKENS: '20' }), { dailyLimit: 200, globalDailyLimit: 10000, maxTokens: 128 })
   assert.deepEqual(assistantUsageLimits({ AI_ASSISTANT_DAILY_LIMIT: '125', AI_ASSISTANT_GLOBAL_DAILY_LIMIT: '600', AI_ASSISTANT_MAX_TOKENS: '2100' }), { dailyLimit: 125, globalDailyLimit: 600, maxTokens: 2100 })
   assert.equal(assistantUsageLimits({ AI_ASSISTANT_MAX_TOKENS: '9000' }).maxTokens, 4096)
@@ -92,4 +97,14 @@ test('webhook questions receive the customer-facing API guide, unrelated questio
   const guide = loadRelevantKnowledge('¿Cómo verifico la firma HMAC del webhook?')
   assert.match(guide, /X-Webhook-Signature-V2/)
   assert.match(buildSystemPrompt(null, guide), /DOCUMENTACIÓN AUTORIZADA PARA ESTA CONSULTA/)
+})
+
+
+test('assistant route uses Cloudflare OpenAI-compatible endpoint and max_tokens', () => {
+  const route = fs.readFileSync(path.join(__dirname, '../src/routes/assistant.js'), 'utf8')
+  assert.match(route, /\$\{provider\.baseUrl\}\/chat\/completions/)
+  assert.match(route, /max_tokens: spontaneousMode \? Math\.min\(maxTokens, 220\) : maxTokens/)
+  assert.doesNotMatch(route, /max_completion_tokens/)
+  assert.doesNotMatch(route, /response_format: \{ type: 'json_object' \}/)
+  assert.match(route, /AI_EXTERNAL_DAILY_LIMIT/)
 })

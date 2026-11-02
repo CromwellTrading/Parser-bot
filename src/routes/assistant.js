@@ -14,7 +14,6 @@ const {
 
 const router = express.Router()
 const minuteRequests = new Map()
-let providerModelCursor = 0
 
 function extractToken(req) {
   const header = String(req.headers.authorization || '')
@@ -311,7 +310,7 @@ router.get('/config', requireClient, async (req, res) => {
       console.error(JSON.stringify({ event: 'AI_ASSISTANT_READINESS_FAILED', code: readiness.error.code || 'unknown' }))
     }
   }
-  return res.set('Cache-Control', 'no-store').json({ ok: true, enabled, message, provider: 'GroqCloud', persona: 'SO Assistant', avatar_enabled: true })
+  return res.set('Cache-Control', 'no-store').json({ ok: true, enabled, message, provider: 'SynthesisOne AI', persona: 'SO Assistant', avatar_enabled: true })
 })
 
 router.post('/chat', requireClient, async (req, res) => {
@@ -351,14 +350,9 @@ router.post('/chat', requireClient, async (req, res) => {
     ]
     const provider = assistantProviderConfig(process.env)
     const spontaneousMode = req.body?.mode === 'spontaneous'
-    // Ambient messages are intentionally short and single-model: they are optional,
-    // metered, and must fall back quickly instead of delaying the dashboard.
-    const modelOrder = spontaneousMode
-      ? [provider.models[providerModelCursor % Math.max(1, provider.models.length)]]
-      : (provider.models.length > 1
-        ? provider.models.map((_, index) => provider.models[(providerModelCursor + index) % provider.models.length])
-        : provider.models)
-    providerModelCursor = (providerModelCursor + 1) % Math.max(1, provider.models.length)
+    // The initial Cloudflare deployment intentionally uses one model only.
+    // Spontaneous messages remain short, metered and time-bounded.
+    const modelOrder = spontaneousMode ? provider.models.slice(0, 1) : provider.models
 
     let data = null
     let response = null
@@ -367,8 +361,7 @@ router.post('/chat', requireClient, async (req, res) => {
     let lastProviderCode = null
     let lastWasTimeout = false
 
-    // Distribute requests across the configured free models. If a model is
-    // rate-limited or temporarily unavailable, try the remaining models.
+    // Attempt only configured Workers AI models. The initial configuration uses one model.
     for (const model of modelOrder) {
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), spontaneousMode ? 7_000 : 18_000)
@@ -384,9 +377,10 @@ router.post('/chat', requireClient, async (req, res) => {
           body: JSON.stringify({
             model,
             messages,
-            max_completion_tokens: spontaneousMode ? Math.min(maxTokens, 220) : maxTokens,
+            max_tokens: spontaneousMode ? Math.min(maxTokens, 220) : maxTokens,
             temperature: spontaneousMode ? 0.95 : 0.82,
-            response_format: { type: 'json_object' },
+            // Qwen3 on Workers AI is not currently listed among the models with guaranteed JSON Mode.
+            // The system prompt requests JSON; the server parser safely handles plain-text fallback.
             stream: false,
           }),
           signal: controller.signal,
@@ -399,7 +393,7 @@ router.post('/chat', requireClient, async (req, res) => {
         lastStatus = response.status
         try {
           const failure = await response.json()
-          lastProviderCode = failure?.error?.code || failure?.error?.type || null
+          lastProviderCode = failure?.error?.code || failure?.error?.type || failure?.errors?.[0]?.code || null
         } catch (_) { lastProviderCode = null }
         // Invalid credentials/configuration are not fixed by trying another model.
         if ([401, 403].includes(response.status)) break
@@ -417,12 +411,15 @@ router.post('/chat', requireClient, async (req, res) => {
     if (!data) {
       console.warn(JSON.stringify({
         event: 'AI_ASSISTANT_PROVIDER_EXHAUSTED',
-        provider: 'groq', status: lastStatus || null,
+        provider: provider.provider, status: lastStatus || null,
         code: String(lastProviderCode || '').slice(0, 80) || null,
         models_attempted: modelOrder.length,
       }))
       if ([401, 403].includes(lastStatus)) {
         return res.status(503).json({ ok: false, code: 'AI_PROVIDER_AUTH', error: 'La conexión del asistente necesita revisión. Contacta con soporte.' })
+      }
+      if (lastStatus === 429 && String(lastProviderCode) === '3036') {
+        return res.status(429).json({ ok: false, code: 'AI_EXTERNAL_DAILY_LIMIT', error: 'El asistente alcanzó su capacidad diaria. Podrás volver a utilizarlo cuando se renueve el límite.' })
       }
       if (lastStatus === 429 || [404, 408, 409, 500, 502, 503, 504].includes(lastStatus)) {
         return res.status(503).json({ ok: false, code: 'AI_PROVIDER_BUSY', error: 'Los modelos están ocupados por ahora. Inténtalo de nuevo en un momento.' })
@@ -433,13 +430,13 @@ router.post('/chat', requireClient, async (req, res) => {
     const assistantOutput = extractAssistantPayload(data)
     const reply = assistantOutput.reply
     if (!reply) {
-      console.warn(JSON.stringify({ event: 'AI_ASSISTANT_EMPTY_RESPONSE', provider: 'groq', model: selectedModel }))
+      console.warn(JSON.stringify({ event: 'AI_ASSISTANT_EMPTY_RESPONSE', provider: provider.provider, model: selectedModel }))
       return res.status(502).json({ ok: false, code: 'AI_EMPTY_RESPONSE', error: 'El asistente no pudo generar una respuesta. Inténtalo otra vez.' })
     }
     const usage = data?.usage || {}
     console.log(JSON.stringify({
       event: 'AI_ASSISTANT_REQUEST_COMPLETED', client_id: clientId,
-      provider: 'groq', model: selectedModel,
+      provider: provider.provider, model: selectedModel,
       prompt_tokens: Number(usage.prompt_tokens) || 0,
       completion_tokens: Number(usage.completion_tokens) || 0,
       request_id: String(data?.id || '').slice(0, 100) || null,
@@ -450,8 +447,8 @@ router.post('/chat', requireClient, async (req, res) => {
       emotion: assistantOutput.emotion,
       gesture: assistantOutput.gesture,
       mood_text: assistantOutput.mood_text,
-      provider: 'GroqCloud',
-      model: selectedModel,
+      provider: 'SynthesisOne AI',
+      model: 'SO Assistant',
       spontaneous: spontaneousMode,
       remaining_today: Math.max(0, dailyLimit - Number(quotaRow.used || 0)),
     })
