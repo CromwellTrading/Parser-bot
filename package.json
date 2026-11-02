@@ -1,6 +1,6 @@
 {
   "name": "synthesisone-backend",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Backend para SynthesisOne - SMS relay para Transfermóvil",
   "main": "src/index.js",
   "scripts": {

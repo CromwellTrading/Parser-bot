@@ -57,7 +57,7 @@ Configúralas en Render/tu gestor de secretos; no las incluyas en Git, ZIP públ
 - `RECHARGEGAMES_API_KEY`: clave real de reseller; sin ella no hay actualización ni compra real.
 - `RECHARGEGAMES_WEBHOOK_SECRET`: secreto configurado en el panel del proveedor.
 - Webhook del backend: `https://TU_HOST/api/game-recharges/webhook`.
-- Supabase debe tener los precios `game_market_pricing:normal` y `game_market_pricing:reseller`. La migración 023 copia la regla ya persistida de `game_market_pricing:synthesisone` si faltan las dos claves; no inventa otra tasa. Después deben revisarse ambas tasas desde la administración. El catálogo muestra CUP y Saldo Móvil como precios distintos. Transfermóvil directo solo cobra CUP; Wallet permite elegir por separado `price_cup` (Wallet CUP) o `price_saldo` (Wallet Saldo Móvil), sin conversión entre libros.
+- Supabase debe tener los precios `game_market_pricing:normal` y `game_market_pricing:reseller`. La migración 023 copia la regla ya persistida de `game_market_pricing:synthesisone` si faltan las dos claves; no inventa otra tasa. Después deben revisarse ambas tasas desde la administración. El catálogo muestra CUP y Saldo Móvil como precios distintos. Transfermóvil directo solo cobra CUP; desde la versión 2.2.2, CUBACEL permite pagar directamente una oferta individual en Saldo Móvil sin pasar por Wallet. Wallet sigue permitiendo elegir por separado `price_cup` (Wallet CUP) o `price_saldo` (Wallet Saldo Móvil), sin conversión entre libros.
 
 **Administración/seguridad adicional**
 
@@ -166,7 +166,13 @@ Antes del despliegue, abre el proyecto Supabase que usa el servicio de Render y 
 
 
 
-## SO Assistant 2.2.1 — Cloudflare Workers AI
+## Game Market 2.2.2 — pago directo con Saldo Móvil
+
+La versión 2.2.2 añade una vía CUBACEL para pagar una oferta individual de Game Market directamente con Saldo Móvil, sin depositar ni descontar fondos de Wallet. El backend exige que el pagador coincida con el teléfono registrado del cliente, que el receptor configurado esté supervisado por SMS Relay y que el SMS coincida en importe, teléfonos, red y ventana del ticket. La conciliación impide cruzar este pago con Transfermóvil CUP o con una recarga de Wallet ambigua.
+
+Antes del despliegue, ejecuta `supabase/migrations/036_gamemarket_direct_cubacel_payments.sql` después de realizar un respaldo y confirma que `STORE_WALLET_SALDO_RECEIVER_PHONE` y `RECHARGEGAMES_API_KEY` están configuradas en Render. El checkout externo se cierra si falta la clave del proveedor de entrega. Consulta `ACTUALIZACION_2.2.2_PAGO_DIRECTO_SALDO.md` para el orden de publicación y las limitaciones.
+
+## SO Assistant 2.2.2 — Cloudflare Workers AI
 
 - El backend utiliza Cloudflare Workers AI mediante el endpoint oficial OpenAI-compatible `/ai/v1/chat/completions`.
 - Modelo predeterminado: `@cf/qwen/qwen3-30b-a3b-fp8`. La credencial y el identificador de cuenta permanecen exclusivamente en Render.
@@ -174,8 +180,8 @@ Antes del despliegue, abre el proyecto Supabase que usa el servicio de Render y 
 - Límites internos por defecto: 80 solicitudes diarias por cliente, 300 globales y 650 tokens máximos de salida. Ajustar el límite global según el consumo real de Neurons de Cloudflare.
 - La respuesta mantiene `reply`, `emotion`, `gesture` y `mood_text`. Se solicita JSON en el prompt y el parser elimina bloques de razonamiento y tolera respuestas de texto cuando el modelo no devuelve JSON válido.
 - Android 2.2 ya consume `/api/assistant/chat` y muestra avatar, emoción y gesto; no requiere cambios para sustituir el proveedor. Una instalación anterior a Android 2.2 sí necesitará actualizarse para disponer de esa interfaz.
-- No se añade migración SQL: se conserva el control de uso existente de `034_ai_assistant_usage.sql`.
-- Consulta `docs/AI_ASSISTANT_CLOUDFLARE.md` antes de desplegar.
+- El cambio de proveedor de IA conserva el control de uso de `034_ai_assistant_usage.sql`. La migración `036_gamemarket_direct_cubacel_payments.sql` corresponde al nuevo pago directo de Game Market con Saldo Móvil; no es necesaria para Cloudflare por sí solo.
+- Consulta `docs/AI_ASSISTANT_CLOUDFLARE.md` y `ACTUALIZACION_2.2.2_PAGO_DIRECTO_SALDO.md` antes de desplegar.
 
 ## SO Assistant 2.1 — capa proactiva
 

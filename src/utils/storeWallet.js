@@ -11,6 +11,7 @@ const { readAllRows } = require('./supabasePagination')
 const { normalizePayerPhone, isConfiguredPaymentReceiver } = require('./etecsaPaymentMatching')
 const { assertNoWaitingCart } = require('./cartFeaturePolicy')
 const { evaluateOfficialStorePayment, evaluateWalletTopupPayment, evaluateSaldoWalletTransfer, isPotentialWalletTopupPayment } = require('./walletPaymentMatching')
+const { evaluateGameRechargePayment } = require('./gameRechargePaymentMatching')
 const { claimPaymentTransaction } = require('./paymentTransactionClaims')
 const { bot, ADMINS } = require('../telegram')
 
@@ -524,10 +525,10 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
     return null
   }
   const { topup, evaluation } = matches[0]
-  // CUP/Transfermóvil receipts are globally compared against ETECSA/Game Market
-  // tickets. CUBACEL balance transfers are a different rail and cannot settle those.
+  // Compare the same payment rail against other official store tickets. CUP uses
+  // Transfermóvil (ETECSA + Game Market); Saldo Móvil uses CUBACEL (Game Market).
   const currency = String(topup.currency || 'CUP').toUpperCase()
-  if (currency === 'CUP') {
+  if (currency === 'CUP' || currency === 'SALDO') {
     const cutoff = new Date(Date.now() - PAYMENT_RECONCILE_LOOKBACK_MS).toISOString()
     const [etecsaRows, gameRows] = await Promise.all([
       readAllRows(() => supabase.from('etecsa_orders').select('*').in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', cutoff).order('created_at', { ascending: false }), { pageSize: 500, maxRows: 100_000 }),
@@ -537,8 +538,11 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
       ? isConfiguredPaymentReceiver(client, row)
       : String(row.client_id) === String(client.id)
     const overlap = [
-      ...etecsaRows.filter(row => inTransferScope(row) && !(row.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateOfficialStorePayment(parsed, row, receivedAt).matched),
-      ...gameRows.filter(row => inTransferScope(row) && !(row.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateOfficialStorePayment(parsed, row, receivedAt).matched),
+      ...(currency === 'CUP' ? etecsaRows.filter(row => inTransferScope(row) && !(row.status === 'EXPIRED' && !parsed?.transaction_at) && evaluateOfficialStorePayment(parsed, row, receivedAt).matched) : []),
+      ...gameRows.filter(row => inTransferScope(row) && !(row.status === 'EXPIRED' && !parsed?.transaction_at) &&
+        (currency === 'SALDO'
+          ? evaluateGameRechargePayment(parsed, row, client, receivedAt).matched
+          : evaluateOfficialStorePayment(parsed, row, receivedAt).matched)),
     ]
     if (overlap.length) {
       console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'WALLET', overlapping_official_order_count: overlap.length, topup_id: topup.id, sms_log_id: smsLogId || null }))
@@ -732,7 +736,7 @@ async function getStoreStatusSnapshot(clientId) {
   for (const row of games.data || []) if (!cartChildOrderIds.has(String(row.id))) entries.push({
     id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
     source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}`,
-    amount: Number(row.payment_amount), currency: String(row.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP', status: row.wallet_refunded_at ? 'REFUNDED' : row.status,
+    amount: Number(row.payment_amount), currency: ['WALLET', 'CUBACEL'].includes(String(row.payment_source || 'TRANSFERMOVIL').toUpperCase()) && String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP', status: row.wallet_refunded_at ? 'REFUNDED' : row.status,
     message: shortFailure(row.wallet_refunded_at ? 'REFUNDED' : row.status, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at,
     paid_at: row.paid_at, completed_at: row.completed_at, payment_source: row.payment_source || 'TRANSFERMOVIL', wallet_refunded_at: row.wallet_refunded_at || null,
     provider_delivery: row.provider_delivery || null, provider_status: row.provider_status || null, delivery_note: safeCustomerText(row.provider_delivery_note, row.status === 'COMPLETED' ? 'Entrega confirmada.' : null, 300),
@@ -800,7 +804,7 @@ async function getStoreHistory(clientId) {
     entries.push({
       id: row.id, ticket_id: row.id, receipt_code: `SO-GM-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`,
       source: 'GAMEMARKET', title: `${row.game_name} · ${row.offer_title}${row.price_basis === 'SALDO' ? ' · tarifa Saldo Móvil' : ''}`,
-      amount: Number(row.payment_amount), currency: String(row.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP', price_basis: row.price_basis || 'CUP', status: effectiveStatus,
+      amount: Number(row.payment_amount), currency: ['WALLET', 'CUBACEL'].includes(String(row.payment_source || 'TRANSFERMOVIL').toUpperCase()) && String(row.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP', price_basis: row.price_basis || 'CUP', status: effectiveStatus,
       message: shortFailure(effectiveStatus, row.failure_reason), created_at: row.created_at, updated_at: row.updated_at, paid_at: row.paid_at, completed_at: row.completed_at,
       payment_source: row.payment_source || 'TRANSFERMOVIL', wallet_refunded_at: row.wallet_refunded_at || null,
       provider_delivery: row.provider_delivery || null, provider_status: row.provider_status || null, delivery_note: safeCustomerText(row.provider_delivery_note, effectiveStatus === 'COMPLETED' ? 'Entrega confirmada.' : null, 300),

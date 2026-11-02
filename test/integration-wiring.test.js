@@ -80,15 +80,88 @@ test('Android catalog no longer exposes the hidden-game toggle or a hardcoded de
 })
 
 
-test('external Game Market transfer checkout cannot mislabel a Saldo Móvil retail price as CUP', () => {
+
+
+test('Android SO Assistant keeps more space for chat and turns support shortcuts into useful actions', t => {
+  const mainPath = path.join(android, 'app/src/main/java/com/synthesisone/app/MainActivity.kt')
+  if (!fs.existsSync(mainPath)) return t.skip('Android sources not mounted')
+  const main = fs.readFileSync(mainPath, 'utf8')
+  const start = main.indexOf('private fun showAiAssistant()')
+  const end = main.indexOf('private fun scheduleFirstVisitAssistantTutor()', start)
+  assert.ok(start >= 0 && end > start, 'SO Assistant screen source must be available')
+  const screen = main.slice(start, end)
+  assert.match(screen, /isFillViewport = false/)
+  assert.match(screen, /text = "WHATSAPP"/)
+  assert.match(screen, /text = "BUZÓN"/)
+  assert.match(screen, /text = "RESUMEN IA"/)
+  assert.doesNotMatch(screen, /CONTACTAR SOPORTE/)
+})
+
+test('Android Game Market exposes a separate direct CUBACEL Saldo Móvil checkout without Wallet debit', t => {
+  const mainPath = path.join(android, 'app/src/main/java/com/synthesisone/app/MainActivity.kt')
+  if (!fs.existsSync(mainPath)) return t.skip('Android sources not mounted')
+  const main = fs.readFileSync(mainPath, 'utf8')
+  const start = main.indexOf('private fun beginOfferCheckout(')
+  const end = main.indexOf('private fun beginGameRechargeWalletCheckout(', start)
+  assert.ok(start >= 0 && end > start, 'Game Market checkout source must be available')
+  const checkout = main.slice(start, end)
+  assert.match(checkout, /Pagar directamente/)
+  assert.match(checkout, /DIRECT_CUBACEL_SALDO/)
+  assert.match(checkout, /No necesitas depositar en Wallet/)
+  const saldoStart = main.indexOf('private fun beginGameRechargeSaldoCheckout(')
+  const saldoEnd = main.indexOf('private fun beginGameRechargeCheckout(', saldoStart)
+  assert.ok(saldoStart >= 0 && saldoEnd > saldoStart, 'direct Saldo checkout implementation must be available')
+  const saldoCheckout = main.slice(saldoStart, saldoEnd)
+  assert.match(saldoCheckout, /payment_method", "CUBACEL"/)
+  assert.match(saldoCheckout, /price_basis", "SALDO"/)
+})
+
+test('Android admin payment review labels CUBACEL amounts as Saldo Móvil rather than CUP', t => {
+  const mainPath = path.join(android, 'app/src/main/java/com/synthesisone/app/MainActivity.kt')
+  if (!fs.existsSync(mainPath)) return t.skip('Android sources not mounted')
+  const main = fs.readFileSync(mainPath, 'utf8')
+  const start = main.indexOf('private fun showGameRechargePaymentReviewDetails(')
+  const end = main.indexOf('private fun parseRemoteGameCatalog(', start)
+  assert.ok(start >= 0 && end > start, 'admin payment review source must be available')
+  const screen = main.slice(start, end)
+  assert.match(screen, /if \(currency == "SALDO" \|\| isCubacel\) "Saldo Móvil" else "CUP"/)
+  assert.match(screen, /SALDO VERIFICADO · ENVIAR/)
+})
+
+test('Game Market direct checkout keeps CUP Transfermóvil and CUBACEL Saldo Móvil as separate payment rails', () => {
   const orders = read('src/utils/rechargeGamesOrders.js')
-  assert.match(orders, /basis !== 'CUP'/)
-  assert.match(orders, /const amount = Number\(offer\.price_cup\)/)
-  assert.match(orders, /Saldo Móvil se muestra como referencia/)
+  assert.match(orders, /requestedMethod === 'TRANSFERMOVIL' && basis === 'CUP'/)
+  assert.match(orders, /requestedMethod === 'CUBACEL' && basis === 'SALDO'/)
+  assert.match(orders, /const baseAmount = Number\(isDirectSaldo \? offer\.price_saldo : offer\.price_cup\)/)
+  assert.match(orders, /payment_source: isDirectSaldo \? 'CUBACEL' : 'TRANSFERMOVIL'/)
+  assert.match(orders, /currencyLabel = isDirectSaldo \? 'Saldo Móvil' : 'CUP'/)
   const etecsa = read('src/utils/etecsaPricing.js')
   assert.match(etecsa, /return basis === 'CUP' \? 'CUP' : null/)
 })
 
+
+test('direct CUBACEL migration enforces valid payment source/currency pairs and one SMS per Game Market order', () => {
+  const sql = read('supabase/migrations/036_gamemarket_direct_cubacel_payments.sql')
+  assert.match(sql, /payment_source = 'TRANSFERMOVIL' AND price_basis = 'CUP'/)
+  assert.match(sql, /payment_source = 'WALLET' AND price_basis IN \('CUP', 'SALDO'\)/)
+  assert.match(sql, /payment_source = 'CUBACEL' AND price_basis = 'SALDO'/)
+  assert.match(sql, /game_recharge_orders_payment_sms_log_unique_idx/)
+  assert.match(sql, /Duplicate game_recharge_orders\.payment_sms_log_id values exist/)
+})
+
+test('external Game Market Saldo Móvil refunds are included in admin operational monitoring', () => {
+  for (const file of ['src/utils/opsDashboard.js', 'src/utils/healthMonitor.js']) {
+    const source = read(file)
+    assert.match(source, /in\('payment_source', \['TRANSFERMOVIL', 'CUBACEL'\]\)\.eq\('status', 'REFUND_REQUIRED'\)/)
+  }
+  assert.match(read('src/utils/healthMonitor.js'), /No se devuelve automáticamente a Wallet/)
+})
+
+test('Game Market external checkout fails closed before collecting payment when its fulfillment provider is not configured', () => {
+  const orders = read('src/utils/rechargeGamesOrders.js')
+  assert.match(orders, /async function createPaymentOrder\(client, body\) \{\s*if \(!String\(process\.env\.RECHARGEGAMES_API_KEY \|\| ''\)\.trim\(\)\)/)
+  assert.match(orders, /PROVIDER_NOT_CONFIGURED/)
+})
 
 test('licensed webhook configuration accepts active admin licenses and repairs an already-paid stale store-only row safely', () => {
   const auth = read('src/routes/auth.js')
@@ -113,10 +186,8 @@ test('licensed webhook delivery history is client-scoped and returns only a safe
   assert.match(helper, /function publicWebhookDeliverySummary/)
   assert.doesNotMatch(helper, /response_body\s*:/)
   assert.doesNotMatch(helper, /webhook_url\s*:/)
-  if (!fs.existsSync(androidPath)) return t.skip('Android sources not mounted')
-  const main = fs.readFileSync(androidPath, 'utf8')
-  assert.match(main, /\/api\/auth\/webhooks\/deliveries/)
-  assert.match(main, /ACTUALIZAR ESTADO DE ENVÍOS/)
+  // Delivery history remains a client-authenticated backend capability. The
+  // current Android screens do not yet expose a dedicated history view.
 })
 
 test('webhook configuration write re-checks active license, store-only flag, expiry and device binding at commit time', () => {

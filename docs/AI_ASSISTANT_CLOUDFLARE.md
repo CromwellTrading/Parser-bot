@@ -1,4 +1,4 @@
-# SO Assistant 2.2.1 — Cloudflare Workers AI
+# SynthesisOne 2.2.2 — Cloudflare Workers AI y despliegue seguro
 
 ## Integración
 
@@ -34,16 +34,17 @@ Los límites internos son controles de SynthesisOne y no amplían los límites d
 
 No para el cambio de proveedor si los clientes ya usan Android 2.2. Esa versión consume las mismas rutas `/api/assistant/config` y `/api/assistant/chat`, y ya procesa `reply`, `emotion`, `gesture` y `mood_text`. La credencial de Cloudflare nunca se envía a Android. Si los clientes todavía usan una versión anterior sin el chat/avatar 2.2, necesitarán la actualización Android correspondiente por sus funciones de interfaz, no por el cambio de proveedor.
 
-## Despliegue seguro
+## Despliegue seguro de la versión 2.2.2
 
-1. Revocar el token filtrado y crear otro token de Workers AI.
-2. En Render, añadir `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_MODEL`, `AI_ASSISTANT_ENABLED` y los límites internos indicados arriba.
-3. Retirar las variables `GROQ_*` antiguas cuando el backend nuevo esté desplegado y probado. No borrar otras variables de Render.
-4. Desplegar el backend 2.2.1 primero. No se requiere una migración SQL nueva; se mantiene la migración `034_ai_assistant_usage.sql`.
-5. Con una sesión real de prueba, consultar `GET /api/assistant/config` y probar `POST /api/assistant/chat`. Verificar que la respuesta incluya `reply`, `emotion`, `gesture` y `mood_text`.
-6. Comprobar logs, límites, respuestas 401/403/429 y la operación normal de login, pagos, Wallet, ETECSA y Game Market. La actualización del asistente no debe modificar esos flujos.
-7. Publicar Android solo si hace falta llevar a los usuarios una versión anterior a 2.2.
+1. Revocar el token que se compartió en una conversación y crear uno nuevo con permisos mínimos de Workers AI.
+2. En Render, añadir `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_MODEL`, `AI_ASSISTANT_ENABLED` y los límites internos indicados arriba. No sobrescribir el resto del entorno.
+3. Retirar las variables `GROQ_*` solo después de confirmar que el backend nuevo responde correctamente. No borrar otras variables de Render.
+4. Hacer respaldo reciente de Supabase. Para el cambio de proveedor de IA se conserva `034_ai_assistant_usage.sql`; **la migración nueva `036_gamemarket_direct_cubacel_payments.sql` es necesaria por el pago directo de Game Market con Saldo Móvil**, no por Cloudflare.
+5. Antes de publicar el backend 2.2.2, comprobar que `RECHARGEGAMES_API_KEY` y `STORE_WALLET_SALDO_RECEIVER_PHONE` ya están configuradas en Render. Aplicar la migración 036 desde el proyecto Supabase correcto y confirmar que termina sin errores. Si informa de SMS duplicados, detenerse y revisar esos registros; no borrar datos automáticamente.
+6. Desplegar el backend 2.2.2. Con una sesión real de prueba, consultar `GET /api/assistant/config` y probar `POST /api/assistant/chat`. Verificar que la respuesta incluya `reply`, `emotion`, `gesture` y `mood_text`.
+7. Probar con una cuenta controlada una oferta individual con Saldo Móvil, comprobando que solo se liquide con un SMS CUBACEL exacto y que no se genere un movimiento de Wallet. Comprobar también Transfermóvil CUP, Wallet CUP/SALDO y las operaciones normales de login, ETECSA, licencias y webhooks.
+8. Publicar la nueva APK 2.2.2 para llevar a los usuarios el chat compacto y la nueva opción de pago directo. Android no necesita credenciales de Cloudflare.
 
 ## Límites de validación de esta entrega
 
-Las pruebas automatizadas verifican configuración, construcción de endpoint, límites y parsing sin llamar al proveedor real. Una llamada real a Cloudflare requiere el token nuevo y debe realizarse después del despliegue en Render; no se declara verificada en este paquete.
+Las pruebas automatizadas verifican configuración, construcción de endpoint, límites y parsing sin llamar al proveedor real. Una llamada real a Cloudflare requiere el token nuevo y debe realizarse después del despliegue en Render; no se declara verificada en este paquete. La suite no sustituye una transacción CUBACEL real ni la prueba del proveedor RechargeGames. La migración 036 tampoco se ha aplicado a producción desde este entorno.

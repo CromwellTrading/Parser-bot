@@ -57,7 +57,7 @@ async function requireClient(req, res, next) {
     if (!token) return res.status(401).json({ error: 'Se requiere una licencia válida.' })
     await requireNonRevokedToken(token)
     const { data: client, error } = await supabase.from('clients')
-      .select('id, token, active, role, expires_at, device_id, store_only')
+      .select('id, token, active, role, expires_at, device_id, store_only, phone_number')
       .eq('token', token).maybeSingle()
     if (error) throw error
     if (!client) return res.status(401).json({ error: 'La sesión no es válida.' })

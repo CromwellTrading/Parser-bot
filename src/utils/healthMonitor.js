@@ -125,11 +125,11 @@ async function runHealthCheck() {
       count: walletRefundsPending,
     })
 
-    const transferRefundsPending = await monitoredCount('game_recharge_orders', q => q.eq('payment_source', 'TRANSFERMOVIL').eq('status', 'REFUND_REQUIRED'))
+    const transferRefundsPending = await monitoredCount('game_recharge_orders', q => q.in('payment_source', ['TRANSFERMOVIL', 'CUBACEL']).eq('status', 'REFUND_REQUIRED'))
     await checkCondition({
       fingerprint: 'orders:transfer-refunds-pending', component: 'game-market', severity: 'ERROR',
-      title: 'Hay pedidos pagados por Transfermóvil que requieren resolución',
-      message: 'El proveedor marcó una entrega fallida de un pedido pagado por transferencia. Esto no se puede devolver automáticamente a Wallet: revisa la operación y contacta al cliente para resolver el pago.',
+      title: 'Hay pedidos pagados por transferencia o Saldo Móvil que requieren resolución',
+      message: 'El proveedor marcó una entrega fallida de un pedido pagado externamente (Transfermóvil o Saldo Móvil). No se devuelve automáticamente a Wallet: revisa la operación y contacta al cliente para resolver el pago.',
       count: transferRefundsPending,
     })
 

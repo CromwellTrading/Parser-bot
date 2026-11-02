@@ -83,7 +83,7 @@ test('Android adds first-visit guidance, contextual rewards/wallet advice and a 
   assert.match(source, /showAssistantContextualTip\(section\)/)
   assert.match(source, /buildRewardsAssistantAdvice\(data\)/)
   assert.match(source, /Tu oferta de bienvenida está por terminar/)
-  assert.match(source, /PREPARAR RESUMEN PARA SOPORTE/)
+  assert.match(source, /RESUMEN IA/)
   assert.match(source, /SO Assistant recomienda no realizar compras ni nuevos depósitos/)
   assert.match(source, /showAssistantQuickTour\(\)/)
   assert.doesNotMatch(source, /RECORD_AUDIO|SpeechRecognizer|TextToSpeech|MediaRecorder/)

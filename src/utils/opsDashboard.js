@@ -44,7 +44,7 @@ async function getOpsSummary() {
     ['wallet_review', () => countRows('store_wallet_topups', q => q.not('payment_review_at', 'is', null))],
     ['wallet_overdue', () => countRows('store_wallet_topups', q => q.eq('status', 'WAITING_PAYMENT').lt('payment_deadline_at', cutoffOverdue))],
     ['wallet_refunds_pending', () => countRows('game_recharge_orders', q => q.eq('payment_source', 'WALLET').eq('status', 'REFUND_REQUIRED').is('wallet_refunded_at', null))],
-    ['transfer_refunds_pending', () => countRows('game_recharge_orders', q => q.eq('payment_source', 'TRANSFERMOVIL').eq('status', 'REFUND_REQUIRED'))],
+    ['transfer_refunds_pending', () => countRows('game_recharge_orders', q => q.in('payment_source', ['TRANSFERMOVIL', 'CUBACEL']).eq('status', 'REFUND_REQUIRED'))],
     ['etecsa_stuck', () => countRows('etecsa_orders', q => q.in('status', ['PROCESSING', 'SUBMITTING_TO_SOKY', 'SUBMITTING_TO_PROVIDER']).lt('updated_at', cutoffStale))],
     ['game_stuck', () => countRows('game_recharge_orders', q => q.in('status', ['PROCESSING', 'SUBMITTING_TO_PROVIDER', 'SUBMITTING_TO_SOKY']).lt('updated_at', cutoffStale))],
     ['webhook_failures', () => countRows('webhook_event_logs', q => q.in('status', ['FAILED', 'EXCEPTION', 'BLOCKED']).gte('created_at', new Date(Date.now() - 30 * 60 * 1000).toISOString()))],

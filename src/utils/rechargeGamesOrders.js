@@ -11,6 +11,7 @@ const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
 const { normalizePayerPhone, isConfiguredPaymentReceiver } = require('./etecsaPaymentMatching')
 const { evaluateOfficialStorePayment } = require('./walletPaymentMatching')
+const { evaluateGameRechargePayment } = require('./gameRechargePaymentMatching')
 const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
 const { buildRechargeGamesOrderPayload } = require('./rechargeGamesOrderPayload')
 const { getPlatformStoreId } = require('./rechargeGamesCatalog')
@@ -62,7 +63,7 @@ function publicOrder(order) {
     discount_percent: Number(order.reward_discount_percent || 0),
     discount_amount: Number(order.reward_discount_amount || 0),
     welcome_discount: order.welcome_discount === true,
-    currency: String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' && String(order.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP',
+    currency: ['WALLET', 'CUBACEL'].includes(String(order.payment_source || 'TRANSFERMOVIL').toUpperCase()) && String(order.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'SALDO' : 'CUP',
     payer_phone: order.payer_phone,
     player_id: order.player_id || null,
     server_id: order.server_id || null,
@@ -86,11 +87,20 @@ function publicOrder(order) {
       String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() !== 'WALLET') {
     result.destination_card = order.destination_card || null
     result.confirmation_phone = order.confirmation_phone || null
-    result.payment = {
-      method: 'TRANSFERMOVIL',
-      card: order.destination_card || null,
-      confirmation_phone: order.confirmation_phone || null,
-      currency: 'CUP',
+    if (String(order.payment_source || '').toUpperCase() === 'CUBACEL') {
+      result.payment = {
+        method: 'CUBACEL',
+        receiver_phone: order.confirmation_phone || null,
+        confirmation_phone: order.confirmation_phone || null,
+        currency: 'SALDO',
+      }
+    } else {
+      result.payment = {
+        method: 'TRANSFERMOVIL',
+        card: order.destination_card || null,
+        confirmation_phone: order.confirmation_phone || null,
+        currency: 'CUP',
+      }
     }
   }
   return result
@@ -190,22 +200,62 @@ async function getProviderOffer(offerId) {
 }
 
 async function createPaymentOrder(client, body) {
+  if (!String(process.env.RECHARGEGAMES_API_KEY || '').trim()) {
+    throw errorWithStatus('Las compras automáticas de Game Market están temporalmente no disponibles. Inténtalo más tarde.', 503, 'PROVIDER_NOT_CONFIGURED')
+  }
   const automation = await getAutomationAvailability()
   if (!automation.enabled) throw errorWithStatus(safeAutomationMessage(automation.message), 503, 'AUTOMATION_UNAVAILABLE')
-  let paymentConfig
-  try { paymentConfig = await getPaymentConfig(getLicenseConfig(), body?.payment_destination_id) }
-  catch (error) { throw errorWithStatus(error.message || 'No hay una cuenta de transferencia activa.', error.status || 503, error.code || 'PAYMENT_CONFIG_MISSING') }
-  if (!paymentConfig.configured || paymentConfig.currency !== 'CUP' ||
-      !String(paymentConfig.paymentCard || '').trim() || !String(paymentConfig.paymentPhone || '').trim()) {
-    throw errorWithStatus('La transferencia no está configurada completamente. No se creó ningún ticket; inténtalo más tarde.', 503, 'PAYMENT_CONFIG_MISSING')
+
+  const requestedMethod = String(body?.payment_method || 'TRANSFERMOVIL').trim().toUpperCase()
+  const basis = String(body?.price_basis || '').trim().toUpperCase()
+  const isDirectSaldo = requestedMethod === 'CUBACEL' && basis === 'SALDO'
+  const isCupTransfer = requestedMethod === 'TRANSFERMOVIL' && basis === 'CUP'
+  if (!isDirectSaldo && !isCupTransfer) {
+    throw errorWithStatus('El método de pago no corresponde a la moneda seleccionada. Elige Transfermóvil para CUP o Saldo Móvil directo para SALDO.', 400, 'PAYMENT_METHOD_CURRENCY_MISMATCH')
+  }
+
+  let paymentConfig = null
+  let confirmationPhone = null
+  let destinationCard = null
+  if (isCupTransfer) {
+    try { paymentConfig = await getPaymentConfig(getLicenseConfig(), body?.payment_destination_id) }
+    catch (error) { throw errorWithStatus(error.message || 'No hay una cuenta de transferencia activa.', error.status || 503, error.code || 'PAYMENT_CONFIG_MISSING') }
+    if (!paymentConfig.configured || paymentConfig.currency !== 'CUP' ||
+        !String(paymentConfig.paymentCard || '').trim() || !String(paymentConfig.paymentPhone || '').trim()) {
+      throw errorWithStatus('La transferencia no está configurada completamente. No se creó ningún ticket; inténtalo más tarde.', 503, 'PAYMENT_CONFIG_MISSING')
+    }
+    confirmationPhone = paymentConfig.paymentPhone
+    destinationCard = paymentConfig.paymentCard
+  } else {
+    // Direct Saldo Móvil purchases use the already monitored CUBACEL receiver
+    // configured for Wallet Saldo deposits. This does not create Wallet funds.
+    confirmationPhone = normalizePayerPhone(process.env.STORE_WALLET_SALDO_RECEIVER_PHONE || '').replace(/\D/g, '')
+    if (!/^5\d{7}$/.test(confirmationPhone || '')) {
+      throw errorWithStatus('El pago directo con Saldo Móvil no está disponible en este momento. Inténtalo más tarde.', 503, 'SALDO_MOBILE_RECEIVER_NOT_CONFIGURED')
+    }
+    const exactReceiver = await supabase.from('clients').select('id,phone_number').eq('phone_number', confirmationPhone).limit(50)
+    if (exactReceiver.error) throw exactReceiver.error
+    let receiverRows = (exactReceiver.data || []).filter(row => normalizePayerPhone(row.phone_number) === confirmationPhone)
+    if (!receiverRows.length) {
+      const allPhones = await readAllRows(() => supabase.from('clients').select('id,phone_number').order('id', { ascending: true }), { pageSize: 500, maxRows: 100_000 })
+      receiverRows = allPhones.filter(row => normalizePayerPhone(row.phone_number) === confirmationPhone)
+    }
+    if (!receiverRows.length) {
+      throw errorWithStatus('El número receptor de Saldo Móvil no está supervisado por el sistema. No se creó ningún ticket.', 503, 'SALDO_MOBILE_RECEIVER_NOT_MONITORED')
+    }
   }
 
   await assertNoOtherWaitingCheckout(client.id)
   const offerId = cleanText(body?.offer_id, 100)
-  const basis = String(body?.price_basis || '').trim().toUpperCase()
   const payerPhone = normalizePayerPhone(body?.payer_phone)
-  if (!offerId || basis !== 'CUP') throw errorWithStatus('Selecciona un paquete con precio CUP. Saldo Móvil se muestra como referencia, pero no es un importe de transferencia válido.', 400, 'INVALID_OFFER_SELECTION')
+  if (!offerId) throw errorWithStatus('Selecciona una oferta válida.', 400, 'INVALID_OFFER_SELECTION')
   if (!/^5\d{7}$/.test(payerPhone)) throw errorWithStatus('Introduce el móvil cubano desde el que realizarás la transferencia.', 400, 'INVALID_PAYER_PHONE')
+  if (isDirectSaldo) {
+    const registeredPhone = normalizePayerPhone(client?.phone_number)
+    if (!registeredPhone || registeredPhone !== payerPhone) {
+      throw errorWithStatus('Para pagar directamente con Saldo Móvil, el número pagador debe coincidir con el teléfono registrado y supervisado por la aplicación.', 403, 'SALDO_PAYER_PHONE_NOT_REGISTERED')
+    }
+  }
 
   const offer = await getProviderOffer(offerId)
   const playerId = cleanText(body?.player_id, 200) || null
@@ -216,10 +266,17 @@ async function createPaymentOrder(client, body) {
   if (offer.provider_delivery === 'player_id' && /mobile[-_ ]?legends/i.test(String(offer.provider_game_slug || '')) && !serverId) {
     throw errorWithStatus('Introduce también el ID del servidor antes de crear el ticket.', 400, 'SERVER_ID_REQUIRED')
   }
-  const amount = Number(offer.price_cup)
-  const baseAmount = amount
-  if (!Number.isSafeInteger(amount) || amount <= 0) throw errorWithStatus('El precio seleccionado no es válido. Actualiza el catálogo e inténtalo de nuevo.', 409, 'INVALID_LOCAL_PRICE')
-  const discount = await calculateDiscount(client, { amount: baseAmount, currency: basis, couponCode: body?.coupon_code, source: 'GAME_MARKET' })
+  const baseAmount = Number(isDirectSaldo ? offer.price_saldo : offer.price_cup)
+  if (!Number.isSafeInteger(baseAmount) || baseAmount <= 0) {
+    throw errorWithStatus(`Esta oferta no tiene un precio pagable en ${isDirectSaldo ? 'Saldo Móvil' : 'CUP'}.`, 409, 'INVALID_LOCAL_PRICE')
+  }
+  // Rewards explicitly exclude Saldo Móvil, so this returns an undiscounted quote.
+  const discount = await calculateDiscount(client, {
+    amount: baseAmount,
+    currency: basis,
+    couponCode: isDirectSaldo ? '' : body?.coupon_code,
+    source: 'GAME_MARKET',
+  })
   const finalAmount = discount.finalAmount
   const providerMeta = offer.package_data?.rechargegames || {}
   const providerCost = Number(providerMeta.provider_price_usdt ?? offer.base_cost_usd)
@@ -242,6 +299,7 @@ async function createPaymentOrder(client, body) {
     provider_delivery: offer.provider_delivery || providerMeta.delivery,
     provider_kind: providerMeta.provider_kind || 'topup',
     provider_cost_usdt: providerCost,
+    payment_source: isDirectSaldo ? 'CUBACEL' : 'TRANSFERMOVIL',
     price_basis: basis,
     payment_amount: finalAmount,
     ...(discount.featureEnabled ? {
@@ -252,8 +310,8 @@ async function createPaymentOrder(client, body) {
     payer_phone: payerPhone,
     player_id: playerId,
     server_id: serverId,
-    destination_card: paymentConfig.paymentCard,
-    confirmation_phone: paymentConfig.paymentPhone,
+    destination_card: destinationCard,
+    confirmation_phone: confirmationPhone,
     status: 'WAITING_PAYMENT',
     buyer_ref: `SO-${id}`,
     created_at: createdAt.toISOString(),
@@ -275,8 +333,12 @@ async function createPaymentOrder(client, body) {
     throw errorWithStatus('El cupón acaba de utilizarse en otra compra. Actualiza tus cupones e inténtalo de nuevo.', 409, 'COUPON_RESERVATION_FAILED')
   }
   const publicData = publicOrder(order)
-  notifyAdmins(`🎮 Ticket de juego creado · ${publicData.ticket}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nImporte: ${finalAmount} CUP (${basis})${discount.discountAmount ? `\nDescuento: ${discount.discountPercent}% (-${discount.discountAmount} CUP)` : ''}\nTarjeta destino: ${order.destination_card}\nTeléfono a confirmar: ${order.confirmation_phone}\nPagador: ${payerPhone}\nEstado: esperando pago`).catch(() => {})
-  console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_ORDER_CREATED', order_id: order.id, client_id: client.id, provider_product_key_hash: crypto.createHash('sha256').update(order.provider_product_key).digest('hex').slice(0, 16), amount: finalAmount, basis }))
+  const currencyLabel = isDirectSaldo ? 'Saldo Móvil' : 'CUP'
+  const paymentDestination = isDirectSaldo
+    ? `Receptor CUBACEL: ${confirmationPhone}`
+    : `Tarjeta destino: ${destinationCard}\nTeléfono a confirmar: ${confirmationPhone}`
+  notifyAdmins(`🎮 Ticket de juego creado · ${publicData.ticket}\nJuego: ${order.game_name}\nPaquete: ${order.offer_title}\nImporte: ${finalAmount} ${currencyLabel}${discount.discountAmount ? `\nDescuento: ${discount.discountPercent}% (-${discount.discountAmount} CUP)` : ''}\n${paymentDestination}\nPagador: ${payerPhone}\nEstado: esperando pago`).catch(() => {})
+  console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_ORDER_CREATED', order_id: order.id, client_id: client.id, payment_source: payload.payment_source, provider_product_key_hash: crypto.createHash('sha256').update(order.provider_product_key).digest('hex').slice(0, 16), amount: finalAmount, basis }))
   return publicData
 }
 
@@ -682,7 +744,7 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
       matchDiagnostics.push({ ticket: makeTicket(candidate.id), status: candidate.status, reasons: ['EXPIRED_WITHOUT_BANK_TIMESTAMP'] })
       continue
     }
-    const result = evaluateOfficialStorePayment(parsed, candidate, receivedAt)
+    const result = evaluateGameRechargePayment(parsed, candidate, client, receivedAt)
     if (result.matched) matchedCandidates.push({ order: candidate, evaluation: result })
     else matchDiagnostics.push({ ticket: makeTicket(candidate.id), status: candidate.status, reasons: result.reasons || [] })
     const potentiallyRelevant = ['AMOUNT_MISMATCH', 'DESTINATION_CARD_MISMATCH', 'PAYER_PHONE_MISMATCH', 'PAYER_PHONE_NOT_IN_SMS', 'PAYMENT_OUTSIDE_WINDOW']
@@ -710,13 +772,14 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   }
   const { order: selected, evaluation } = matchedCandidates[0]
 
-  if (isDestinationReceipt) {
-    const walletMatches = await findMatchingTopups({ client, parsed, receivedAt })
-    if (walletMatches.length) {
-      console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', wallet_ticket_count: walletMatches.length }))
-      return null
-    }
+  const walletMatches = await findMatchingTopups({ client, parsed, receivedAt })
+  if (walletMatches.length) {
+    console.warn(JSON.stringify({ ts: nowIso(), event: 'PAYMENT_MATCH_AMBIGUOUS', source: 'RECHARGEGAMES', direction, wallet_ticket_count: walletMatches.length }))
+    return null
+  }
 
+  const isCubacel = String(parsed?.network || '').toUpperCase() === 'CUBACEL'
+  if (isDestinationReceipt && !isCubacel) {
     const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString()
     const etecsaCandidates = await readAllRows(() => supabase.from('etecsa_orders').select('*')
       .in('status', ['WAITING_PAYMENT', 'EXPIRED']).gte('created_at', cutoff).order('created_at', { ascending: false }),
@@ -764,7 +827,8 @@ async function processIncomingTransfer({ client, parsed, receivedAt, smsLogId })
   if (!updated) return null
   await finalizePaidOrder(client, { source: 'GAME_MARKET', order: updated })
   console.log(JSON.stringify({ ts: nowIso(), event: 'GAME_RECHARGE_PAYMENT_MATCHED', order_id: updated.id, client_id: client.id, transaction_id: updated.payment_transaction_id || null, status: updated.status }))
-  notifyAdmins(`✅ Pago recibido para recarga de juego · ${makeTicket(updated.id)}\nJuego: ${updated.game_name}\nPaquete: ${updated.offer_title}\nImporte: ${updated.payment_amount} CUP\nPagador: ${updated.payer_phone}\n${nextStatus === 'SUBMITTING_TO_PROVIDER' ? 'Enviando el pedido al proveedor.' : 'Faltan datos del jugador; el cliente debe completarlos.'}`).catch(() => {})
+  const paidCurrency = String(updated.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'Saldo Móvil' : 'CUP'
+  notifyAdmins(`✅ Pago recibido para recarga de juego · ${makeTicket(updated.id)}\nJuego: ${updated.game_name}\nPaquete: ${updated.offer_title}\nImporte: ${updated.payment_amount} ${paidCurrency}\nMétodo: ${String(updated.payment_source || 'TRANSFERMOVIL').toUpperCase()}\nPagador: ${updated.payer_phone}\n${nextStatus === 'SUBMITTING_TO_PROVIDER' ? 'Enviando el pedido al proveedor.' : 'Faltan datos del jugador; el cliente debe completarlos.'}`).catch(() => {})
   if (nextStatus === 'SUBMITTING_TO_PROVIDER') {
     const submitted = await submitProviderOrder(updated.id, { playerId: updated.player_id, serverId: updated.server_id })
     return { order_id: updated.id, status: submitted.status, ticket: makeTicket(updated.id) }
@@ -811,10 +875,14 @@ async function listAdminPaymentReviewOrders({ limit = 60 } = {}) {
       // instructions while an order is waiting for payment.
       destination_card: order.destination_card || null,
       confirmation_phone: order.confirmation_phone || null,
-      payment: String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' ? null : {
-        method: 'TRANSFERMOVIL', card: order.destination_card || null,
-        confirmation_phone: order.confirmation_phone || null, currency: 'CUP',
-      },
+      payment: String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'WALLET' ? null :
+        String(order.payment_source || 'TRANSFERMOVIL').toUpperCase() === 'CUBACEL' ? {
+          method: 'CUBACEL', receiver_phone: order.confirmation_phone || null,
+          confirmation_phone: order.confirmation_phone || null, currency: 'SALDO',
+        } : {
+          method: 'TRANSFERMOVIL', card: order.destination_card || null,
+          confirmation_phone: order.confirmation_phone || null, currency: 'CUP',
+        },
       client_id: order.client_id, review_kind,
       manual_payment_confirmed_at: order.payment_manual_confirmed_at || null,
     }))
@@ -956,7 +1024,7 @@ async function confirmPaymentManually(adminClient, orderId, { confirmation = fal
   // Reuse its original buyer_ref so provider retries are idempotent.
   const paidAt = order.paid_at || nowIso()
   const { data: updated, error: updateError } = await supabase.from('game_recharge_orders').update({
-    status: 'SUBMITTING_TO_PROVIDER', payment_source: 'TRANSFERMOVIL', paid_at: paidAt, completed_at: null,
+    status: 'SUBMITTING_TO_PROVIDER', payment_source: order.payment_source || 'TRANSFERMOVIL', paid_at: paidAt, completed_at: null,
     payment_manual_confirmed_at: nowIso(), payment_manual_confirmed_by: String(adminClient.id || ''),
     payment_manual_confirmation_note: cleanText(note || 'Pago verificado manualmente desde administración.', 300),
     failure_reason: null, provider_failure_reason: null, updated_at: nowIso(),
@@ -971,7 +1039,7 @@ async function confirmPaymentManually(adminClient, orderId, { confirmation = fal
   // Manual settlements count as paid too. Resolve the original order owner inside
   // finalizePaidOrder; rewards failure is intentionally non-fatal to fulfilment.
   await finalizePaidOrder({ id: null }, { source: 'GAME_MARKET', order: updated })
-  notifyAdmins(`🛠️ Pago verificado manualmente · ${makeTicket(updated.id)}\nJuego: ${updated.game_name}\nPaquete: ${updated.offer_title}\nImporte: ${updated.payment_amount} CUP\nAdministrador: ${String(adminClient.id || 'admin')}`).catch(() => {})
+  notifyAdmins(`🛠️ Pago verificado manualmente · ${makeTicket(updated.id)}\nJuego: ${updated.game_name}\nPaquete: ${updated.offer_title}\nImporte: ${updated.payment_amount} ${String(updated.price_basis || 'CUP').toUpperCase() === 'SALDO' ? 'Saldo Móvil' : 'CUP'}\nAdministrador: ${String(adminClient.id || 'admin')}`).catch(() => {})
   const submitted = await submitProviderOrder(updated.id, { playerId: updated.player_id, serverId: updated.server_id })
   return { order: submitted, resumed: ['SUBMITTING_TO_PROVIDER', 'PROCESSING', 'FULFILLMENT_REVIEW', 'PAID', 'COMPLETED'].includes(status) }
 }
@@ -1193,6 +1261,7 @@ function startRechargeGamesOrderWorker() {
 module.exports = {
   getCheckoutConfig,
   createPaymentOrder,
+  evaluateGameRechargePayment,
   getRecentOrders,
   getOwnedOrder,
   cancelPaymentOrder,
