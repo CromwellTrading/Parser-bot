@@ -6,7 +6,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const {
   assistantProviderConfig, assistantConfigured, assistantUsageLimits, normalizeMessages, buildSystemPrompt, loadRelevantKnowledge, needsAccountContext,
-  safeOrderStatus, safeCouponStatus, shortTicket, extractAssistantText, extractAssistantPayload,
+  safeOrderStatus, safeCouponStatus, shortTicket, extractAssistantText, extractAssistantPayload, enforceStoreOnlyCommerceReply,
 } = require('../src/utils/assistantService')
 
 test('Cloudflare Workers AI is enabled only with a token, valid account ID and model', () => {
@@ -34,13 +34,17 @@ test('conversation validator only accepts bounded user/assistant history ending 
 test('system prompt sets strict support-only boundaries and does not grant actions', () => {
   const prompt = buildSystemPrompt({ licencia: 'Activa' })
   assert.match(prompt, /No inventes precios/)
-  assert.match(prompt, /No afirmes que has realizado pagos/)
+  assert.match(prompt, /No afirmes que has ejecutado pagos/)
   assert.match(prompt, /No reveles proveedores internos/)
   assert.match(prompt, /IDENTIDAD: Eres SO Assistant/)
-  assert.match(prompt, /LIBERTAD EXPRESIVA/)
-  assert.match(prompt, /ESPONTANEIDAD/)
-  assert.match(prompt, /timidez juguetona/)
-  assert.match(prompt, /FORMATO DE RESPUESTA: Devuelve exclusivamente un objeto JSON válido/)
+  assert.match(prompt, /VOZ NATURAL/)
+  assert.match(prompt, /EMOCIÓN Y AVATAR/)
+  assert.match(prompt, /emperatriz digital/)
+  assert.match(prompt, /Juegos.*Game Market/)
+  assert.match(prompt, /No enseñes al cliente cómo se realizan técnicamente las recargas/)
+  assert.match(prompt, /No menciones Steam, Epic Games, GOG/)
+  assert.match(prompt, /PROHIBIDO Markdown/)
+  assert.match(prompt, /FORMATO TÉCNICO OBLIGATORIO: Devuelve exclusivamente un objeto JSON válido/)
   assert.match(prompt, /Activa/)
 })
 
@@ -70,8 +74,54 @@ test('Cloudflare Qwen response parser supports structured personality and legacy
   const invalid = extractAssistantPayload({ choices: [{ message: { content: JSON.stringify({ reply: 'Alerta.', emotion: 'unsafe', gesture: 'invalid' }) } }] })
   assert.equal(invalid.emotion, 'neutral')
   assert.equal(invalid.gesture, 'neutral')
+
+  const malformedLabels = extractAssistantPayload({ choices: [{ message: { content: [
+    '**reply**: ¡Vaya, qué forma tan original de preguntar! Puedo ayudarte con eso desde SynthesisOne.',
+    '**emotion**: sassy',
+    '**gesture**: wink',
+    '**mood_text**: Juguetona pero clara.'
+  ].join('\n') } }] })
+  assert.deepEqual(malformedLabels, {
+    reply: '¡Vaya, qué forma tan original de preguntar! Puedo ayudarte con eso desde SynthesisOne.',
+    emotion: 'sassy', gesture: 'wink', mood_text: 'Traviesa'
+  })
+
+  const plainMarkdown = extractAssistantPayload({ choices: [{ message: { content: '**Claro**. Entra en *Juegos* y abre `Game Market`.' } }] })
+  assert.equal(plainMarkdown.reply, 'Claro. Entra en Juegos y abre Game Market.')
+  assert.doesNotMatch(plainMarkdown.reply, /[\*_`]/)
+
+  const metadataOnly = extractAssistantPayload({ choices: [{ message: { content: 'Tu oferta está disponible.\n**emotion**: happy\n**gesture**: smile\n**mood_text**: Alegre' } }] })
+  assert.equal(metadataOnly.reply, 'Tu oferta está disponible.')
 })
 
+
+test('commerce guard redirects external shops and payment methods back to SynthesisOne', () => {
+  const blockedExternal = enforceStoreOnlyCommerceReply({
+    reply: 'Puedes comparar las ofertas en Steam o en https://example.com.',
+    emotion: 'playful', gesture: 'wink', mood_text: 'Pícara',
+  }, 'Ayúdame a encontrar ofertas de Free Fire')
+  assert.match(blockedExternal.reply, /Juegos → Game Market/)
+  assert.doesNotMatch(blockedExternal.reply, /Steam|example\.com|https?:/i)
+  assert.equal(blockedExternal.emotion, 'confident')
+
+  const blockedPayment = enforceStoreOnlyCommerceReply({
+    reply: 'Debes comprar USDT y pagar mediante una billetera externa.',
+    emotion: 'neutral', gesture: 'neutral', mood_text: 'Disponible',
+  }, '¿Cómo recargo diamantes para Free Fire?')
+  assert.match(blockedPayment.reply, /indicaciones que muestra SynthesisOne/)
+  assert.doesNotMatch(blockedPayment.reply, /USDT|billetera externa/i)
+
+  const naturalGuidance = enforceStoreOnlyCommerceReply({
+    reply: 'Entra en Juegos y abre Game Market para buscar Free Fire.',
+    emotion: 'confident', gesture: 'nod', mood_text: 'Segura',
+  }, '¿Dónde encuentro ofertas de Free Fire?')
+  assert.match(naturalGuidance.reply, /Game Market/)
+
+  const unrelated = enforceStoreOnlyCommerceReply({
+    reply: 'Steam es una plataforma de juegos.', emotion: 'neutral', gesture: 'neutral', mood_text: 'Disponible',
+  }, '¿Qué es Steam?')
+  assert.equal(unrelated.reply, 'Para consultar las opciones disponibles de ese juego, entra en Juegos → Game Market y busca el título en el catálogo. Abre la oferta que te interese y revisa las indicaciones que muestra SynthesisOne. Si no aparece la información que necesitas, contacta con soporte desde la app.')
+})
 
 test('assistant usage limits use Cloudflare-safe daily defaults and hard caps', () => {
   assert.deepEqual(assistantUsageLimits({}), { dailyLimit: 80, globalDailyLimit: 300, maxTokens: 650 })
