@@ -9,7 +9,7 @@ const opsDashboard = require('../utils/opsDashboard')
 const { getAutomationAvailability } = require('../utils/systemSettings')
 const {
   assistantProviderConfig, assistantConfigured, assistantUsageLimits, normalizeMessages, buildSystemPrompt, loadRelevantKnowledge, needsAccountContext,
-  safeOrderStatus, safeCouponStatus, shortTicket, extractAssistantPayload, enforceStoreOnlyCommerceReply, buildCustomerInsights, buildAdminInsights,
+  safeOrderStatus, safeCouponStatus, shortTicket, extractAssistantPayload, buildCustomerInsights, buildAdminInsights,
 } = require('../utils/assistantService')
 
 const router = express.Router()
@@ -378,7 +378,7 @@ router.post('/chat', requireClient, async (req, res) => {
             model,
             messages,
             max_tokens: spontaneousMode ? Math.min(maxTokens, 220) : maxTokens,
-            temperature: spontaneousMode ? 0.85 : 0.65,
+            temperature: spontaneousMode ? 0.95 : 0.82,
             // Qwen3 on Workers AI is not currently listed among the models with guaranteed JSON Mode.
             // The system prompt requests JSON; the server parser safely handles plain-text fallback.
             stream: false,
@@ -427,7 +427,7 @@ router.post('/chat', requireClient, async (req, res) => {
       return res.status(502).json({ ok: false, code: lastWasTimeout ? 'AI_PROVIDER_TIMEOUT' : 'AI_PROVIDER_UNAVAILABLE', error: lastWasTimeout ? 'El asistente está tardando demasiado. Inténtalo otra vez.' : 'No se pudo conectar con el asistente. Comprueba tu conexión e inténtalo de nuevo.' })
     }
 
-    const assistantOutput = enforceStoreOnlyCommerceReply(extractAssistantPayload(data), userMessage)
+    const assistantOutput = extractAssistantPayload(data)
     const reply = assistantOutput.reply
     if (!reply) {
       console.warn(JSON.stringify({ event: 'AI_ASSISTANT_EMPTY_RESPONSE', provider: provider.provider, model: selectedModel }))

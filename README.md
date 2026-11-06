@@ -190,3 +190,18 @@ La actualización incorpora seguimiento de pedidos, avisos de pago/Wallet, alert
 La parte Android añade tutor inicial, consejos contextuales, guía visual a SO Reseller, resumen de cuenta para soporte, comparador de Mobile Legends, avisos flotantes y consejos de seguridad Wallet. **No se incorpora voz.**
 
 Antes de producción, sigue `docs/SO_ASSISTANT_2_1_PRODUCTION.md` y `docs/SECURITY_RLS_HARDENING.md`. La migración RLS 035 es manual y debe aplicarse solo tras backup y revisión de integraciones que puedan usar acceso directo a Supabase.
+
+## Release 2.2.3 — corrección de regiones y SO Assistant
+
+La versión 2.2.3 corrige dos regresiones de interfaz e integración detectadas en pruebas de uso:
+
+- Los botones rápidos de SO Assistant fijan relleno vertical cero y altura mínima explícita para que las etiquetas no queden recortadas en pantallas Android estrechas.
+- La verificación regional y los pedidos de RechargeGames convierten los slugs del catálogo (`latam`, `brazil`, `europe`) a valores canónicos de API (`LATAM`, `Brazil`, `EU`) sin alterar el `product_key` exacto.
+- Un UID no encontrado por el verificador deja de bloquear silenciosamente la compra. Un mismatch confirmado requiere confirmación explícita antes de continuar.
+
+No se añade migración SQL para estos cambios. Ejecuta `npm test`; la prueba completa también comprueba el archivo Android cuando el repositorio móvil está disponible junto al backend.
+
+
+## Release 2.2.4 — SO Assistant conversacional
+
+Esta actualización mejora el tono conversacional y la capacidad de cálculo orientativo de SO Assistant. El máximo de salida predeterminado es ahora 1400 tokens (configurable mediante `AI_ASSISTANT_MAX_TOKENS`, con un límite superior de 4096). No incorpora un nuevo proveedor de recargas o reventa y no cambia los flujos de compra, Wallet, autenticación ni licencias. Consulta `docs/RELEASE_2.2.4.md`.

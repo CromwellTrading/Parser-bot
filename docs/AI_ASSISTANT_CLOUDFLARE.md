@@ -18,7 +18,7 @@ Modelo predeterminado: `@cf/qwen/qwen3-30b-a3b-fp8`. La petición usa `max_token
 | `AI_ASSISTANT_ENABLED` | `true` |
 | `AI_ASSISTANT_DAILY_LIMIT` | `80` (máximo interno por cliente) |
 | `AI_ASSISTANT_GLOBAL_DAILY_LIMIT` | `300` (protección global inicial) |
-| `AI_ASSISTANT_MAX_TOKENS` | `650` (máximo de salida por respuesta) |
+| `AI_ASSISTANT_MAX_TOKENS` | `1400` (máximo de salida por respuesta; ajustable hasta 4096) |
 
 Los límites internos son controles de SynthesisOne y no amplían los límites de Neurons de Cloudflare. La cuota gratuita publicada de Workers AI es de 10.000 Neurons por día. El número de conversaciones que permite depende de los tokens reales de entrada y salida; debe vigilarse en el panel de Cloudflare.
 

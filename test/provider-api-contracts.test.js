@@ -26,7 +26,7 @@ test('RechargeGames request sends exact product key, stable buyer ref, region an
   assert.equal(body.product_key, 'topup/free-fire/latam/100 Diamonds')
   assert.equal(body.product, '100 Diamonds')
   assert.equal(body.buyer_ref, 'SO-123')
-  assert.equal(body.region, 'latam')
+  assert.equal(body.region, 'LATAM')
   assert.equal(body.player_id, '51234567')
   assert.equal(body.server_id, '1234')
   assert.equal(body.quantity, 1)
@@ -36,11 +36,20 @@ test('RechargeGames request sends exact product key, stable buyer ref, region an
 
 test('RechargeGames region falls back to provider slug and is omitted when unknown', () => {
   const fromSlug = buildRechargeGamesOrderPayload({ provider_product_key: 'x', provider_product_name: 'X', buyer_ref: 'SO-1', provider_region_slug: 'brazil' })
-  assert.equal(fromSlug.region, 'brazil')
+  assert.equal(fromSlug.region, 'Brazil')
   const noRegion = buildRechargeGamesOrderPayload({ provider_product_key: 'x', provider_product_name: 'X', buyer_ref: 'SO-1' })
   assert.equal(Object.hasOwn(noRegion, 'region'), false)
 })
 
+
+test('uses canonical provider region values while preserving the exact lowercase product key', () => {
+  const { canonicalRechargeGamesRegion } = require('../src/utils/rechargeGamesRegions')
+  assert.equal(canonicalRechargeGamesRegion('latam'), 'LATAM')
+  assert.equal(canonicalRechargeGamesRegion('brazil'), 'Brazil')
+  assert.equal(canonicalRechargeGamesRegion('europe'), 'EU')
+  assert.equal(canonicalRechargeGamesRegion('Latin America (LATAM)'), 'LATAM')
+  assert.equal(canonicalRechargeGamesRegion('sg-my-kh-first-recharge-bonus'), 'SG/MY/KH First Recharge Bonus')
+})
 
 test('rejects a provider product key beyond the OpenAPI maxLength without altering it', () => {
   assert.throws(() => buildRechargeGamesOrderPayload({

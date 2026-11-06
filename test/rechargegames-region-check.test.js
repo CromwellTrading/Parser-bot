@@ -22,12 +22,22 @@ test('region-check calls documented public endpoint without reseller key and nor
       return new Response(JSON.stringify({ result: 'OK', region: 'brazil' }), { status: 200 })
     },
   })
-  assert.equal(seenUrl, 'https://api.rechargegame.games/v1/region-check?game=free-fire&uid=51234567&region=brazil')
+  assert.equal(seenUrl, 'https://api.rechargegame.games/v1/region-check?game=free-fire&uid=51234567&region=Brazil')
   assert.equal(seenOptions.method, 'GET')
   assert.equal(seenOptions.headers['X-API-Key'], undefined)
   assert.equal(result.result, 'OK')
   assert.equal(result.supported, true)
   assert.equal(result.actual_region, 'brazil')
+})
+
+test('region-check sends the canonical LATAM value when the catalog supplies a lowercase slug or display label', async () => {
+  resetRegionCheckRateLimits()
+  let seenUrl = ''
+  await checkPlayerRegion({
+    game: 'free-fire', uid: '51234567', region: 'Latin America (LATAM)', clientId: 'client-latam',
+    fetchImpl: async url => { seenUrl = String(url); return new Response(JSON.stringify({ result: 'OK', real_region: 'LATAM' }), { status: 200 }) },
+  })
+  assert.equal(new URL(seenUrl).searchParams.get('region'), 'LATAM')
 })
 
 test('region-check reports the provider actual region and unsupported games without blocking the result', async () => {

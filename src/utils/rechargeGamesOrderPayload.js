@@ -1,5 +1,7 @@
 'use strict'
 
+const { canonicalRechargeGamesRegion } = require('./rechargeGamesRegions')
+
 function safeText(value, max) {
   return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max)
 }
@@ -17,11 +19,13 @@ function buildRechargeGamesOrderPayload(order, { playerId = null, serverId = nul
     error.code = 'INVALID_PROVIDER_PRODUCT_KEY'
     throw error
   }
-  // The canonical region is already the third path component in product_key.
-  // Send that exact provider slug rather than a display label such as "Europe (EU)".
+  // product_key keeps the source slug (e.g. /latam/), while API `region` uses
+  // canonical values documented by the provider (e.g. LATAM, Brazil, EU).
   const keyParts = productKey.split('/')
   const regionFromKey = keyParts.length >= 4 ? keyParts[2] : ''
-  const region = safeText(regionFromKey || order?.provider_region_slug || order?.provider_region_name, 100)
+  const region = safeText(canonicalRechargeGamesRegion(
+    regionFromKey || order?.provider_region_slug, order?.provider_region_name
+  ), 100)
   return {
     product_key: productKey,
     product: safeText(order?.provider_product_name || order?.offer_title, 500),

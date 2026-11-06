@@ -1,5 +1,7 @@
 'use strict'
 
+const { canonicalRechargeGamesRegion } = require('./rechargeGamesRegions')
+
 const API_BASE = 'https://api.rechargegame.games'
 const TIMEOUT_MS = 12_000
 const GLOBAL_LIMIT = 15 // Provider allows 20/min per outbound IP; leave headroom.
@@ -68,7 +70,8 @@ function normalizeRegionResult(payload) {
 async function checkPlayerRegion({ game, uid, region = '', clientId, fetchImpl = global.fetch, now = Date.now() }) {
   const normalizedGame = cleanInput(game, 'game', 60, { pattern: /^[a-zA-Z0-9_-]+$/ })
   const normalizedUid = cleanInput(uid, 'uid', 32)
-  const normalizedRegion = cleanInput(region, 'region', 60, { required: false })
+  const rawRegion = cleanInput(region, 'region', 100, { required: false })
+  const normalizedRegion = rawRegion ? canonicalRechargeGamesRegion(rawRegion) : ''
   enforceRateLimit(clientId, now)
 
   const url = new URL(`${API_BASE}/v1/region-check`)
