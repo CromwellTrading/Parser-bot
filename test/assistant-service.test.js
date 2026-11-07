@@ -62,11 +62,11 @@ test('private database states are converted into customer-safe wording', () => {
 test('Cloudflare Qwen response parser supports structured personality and legacy plain-text content', () => {
   assert.equal(extractAssistantText({ choices: [{ message: { content: '  Hola  ' } }] }), 'Hola')
   const withThink = extractAssistantPayload({ choices: [{ message: { content: '<think>Reasoning hidden</think>\n{\"reply\":\"¡Vaya!\",\"emotion\":\"amused\",\"gesture\":\"wink\"}' } }] })
-  assert.deepEqual(withThink, { reply: '¡Vaya!', emotion: 'amused', gesture: 'wink', mood_text: 'Divertida' })
+  assert.deepEqual(withThink, { reply: '¡Vaya!', emotion: 'amused', gesture: 'wink', mood_text: 'Divertida', actions: [], suggestions: [] })
   assert.equal(extractAssistantText({ choices: [{ message: { content: [{ text: 'Hola' }, { text: 'mundo' }] } }] }), 'Hola\nmundo')
   assert.equal(extractAssistantText({ choices: [{ message: { content: null } }] }), '')
   const output = extractAssistantPayload({ choices: [{ message: { content: JSON.stringify({ reply: 'Qué gusto verte.', emotion: 'playful', gesture: 'wink', mood_text: 'Pícara' }) } }] })
-  assert.deepEqual(output, { reply: 'Qué gusto verte.', emotion: 'playful', gesture: 'wink', mood_text: 'Pícara' })
+  assert.deepEqual(output, { reply: 'Qué gusto verte.', emotion: 'playful', gesture: 'wink', mood_text: 'Pícara', actions: [], suggestions: [] })
   const expressive = extractAssistantPayload({ choices: [{ message: { content: JSON.stringify({ reply: 'Vaya, eso sí que no lo esperaba.', emotion: 'surprised', gesture: 'shrug' }) } }] })
   assert.equal(expressive.emotion, 'surprised')
   assert.equal(expressive.gesture, 'shrug')

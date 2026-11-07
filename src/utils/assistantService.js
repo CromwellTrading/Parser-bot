@@ -41,11 +41,64 @@ function assistantUsageLimits(env = process.env) {
   return { dailyLimit, globalDailyLimit, maxTokens }
 }
 
+const ASSISTANT_NAV_TARGETS = new Set(['home', 'activity', 'cash', 'market', 'wallet', 'history', 'rewards', 'settings', 'support', 'reseller', 'themes'])
+const ASSISTANT_CALC_CURRENCIES = new Set(['CUP', 'USD', 'USDT', 'SALDO'])
+
+function cleanActionText(value, max) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max)
+}
+
+function finiteInRange(value, min, max) {
+  const n = Number(typeof value === 'string' ? value.replace(',', '.') : value)
+  return Number.isFinite(n) && n >= min && n <= max ? n : null
+}
+
+/**
+ * The model may suggest UI actions, but it never executes anything: the Android app renders them as
+ * buttons/cards and the user taps. Everything is validated against a closed whitelist here and again
+ * in the client. Payment, balance and order actions do not exist in this list on purpose.
+ */
+function sanitizeAssistantActions(input) {
+  if (!Array.isArray(input)) return []
+  const actions = []
+  for (const raw of input) {
+    if (actions.length >= 3) break
+    const type = String(raw?.type || '').toLowerCase()
+    if (type === 'navigate') {
+      const target = String(raw?.target || '').toLowerCase()
+      if (!ASSISTANT_NAV_TARGETS.has(target)) continue
+      actions.push({ type, target, label: cleanActionText(raw?.label, 32) })
+    } else if (type === 'open_game') {
+      const query = cleanActionText(raw?.query || raw?.game, 60)
+      if (query.length < 2) continue
+      actions.push({ type, query, label: cleanActionText(raw?.label, 32) })
+    } else if (type === 'reseller_calc') {
+      const unitCost = finiteInRange(raw?.unit_cost, 0, 100000000)
+      const unitPrice = finiteInRange(raw?.unit_price, 0, 100000000)
+      const quantity = finiteInRange(raw?.quantity ?? 1, 1, 1000000)
+      if (unitCost === null || unitPrice === null || quantity === null) continue
+      const feePct = finiteInRange(raw?.fee_pct ?? 0, 0, 100) ?? 0
+      const currency = String(raw?.currency || 'CUP').toUpperCase()
+      actions.push({
+        type, unit_cost: unitCost, unit_price: unitPrice, quantity: Math.round(quantity), fee_pct: feePct,
+        currency: ASSISTANT_CALC_CURRENCIES.has(currency) ? currency : 'CUP',
+        label: cleanActionText(raw?.label || raw?.product, 60),
+      })
+    }
+  }
+  return actions
+}
+
+function sanitizeAssistantSuggestions(input) {
+  if (!Array.isArray(input)) return []
+  return input.map(item => cleanActionText(item, 42)).filter(item => item.length >= 2).slice(0, 3)
+}
+
 function parseAssistantOutput(rawContent) {
   let content = ''
   if (typeof rawContent === 'string') content = rawContent.trim()
   else if (Array.isArray(rawContent)) content = rawContent.map(part => typeof part?.text === 'string' ? part.text : '').filter(Boolean).join('\n').trim()
-  if (!content) return { reply: '', emotion: 'neutral', gesture: 'neutral', mood_text: 'Disponible' }
+  if (!content) return { reply: '', emotion: 'neutral', gesture: 'neutral', mood_text: 'Disponible', actions: [], suggestions: [] }
 
   const allowedEmotions = new Set(['neutral', 'happy', 'amused', 'curious', 'thinking', 'concerned', 'reassuring', 'confident', 'excited', 'playful', 'empathetic', 'surprised', 'shy', 'proud', 'sleepy', 'determined', 'sassy'])
   const allowedGestures = new Set(['neutral', 'smile', 'wink', 'think', 'nod', 'wave', 'alert', 'celebrate', 'tilt', 'shrug', 'bounce', 'sigh', 'blush', 'peek'])
@@ -68,13 +121,16 @@ function parseAssistantOutput(rawContent) {
       if (reply) {
         const emotion = allowedEmotions.has(String(parsed.emotion || '').toLowerCase()) ? String(parsed.emotion).toLowerCase() : 'neutral'
         const gesture = allowedGestures.has(String(parsed.gesture || '').toLowerCase()) ? String(parsed.gesture).toLowerCase() : 'neutral'
-        return { reply: reply.slice(0, 5000), emotion, gesture, mood_text: moodLabels[emotion] }
+        return {
+          reply: reply.slice(0, 5000), emotion, gesture, mood_text: moodLabels[emotion],
+          actions: sanitizeAssistantActions(parsed.actions), suggestions: sanitizeAssistantSuggestions(parsed.suggestions),
+        }
       }
     } catch (_) {
       // Some model responses include a short preamble or return plain text.
     }
   }
-  return { reply: candidate.slice(0, 5000), emotion: 'neutral', gesture: 'neutral', mood_text: moodLabels.neutral }
+  return { reply: candidate.slice(0, 5000), emotion: 'neutral', gesture: 'neutral', mood_text: moodLabels.neutral, actions: [], suggestions: [] }
 }
 
 function normalizeMessages(input) {
@@ -122,6 +178,8 @@ function buildSystemPrompt(accountContext = null, knowledgeText = '') {
     'CONVERSACIÓN NATURAL: Habla como una interlocutora atenta, no como una FAQ. Responde a lo que la persona acaba de decir, conserva el hilo de los últimos mensajes y evita repetir su pregunta con otras palabras. No empieces siempre con «Claro», «Por supuesto» o «Puedo ayudarte». Alterna respuestas breves y respuestas desarrolladas según la dificultad. Usa contracciones y expresiones naturales del español cuando encajen, sin exagerar el personaje. No conviertas cada respuesta en una lista: prioriza párrafos cortos y utiliza pasos o tablas solo cuando realmente aclaren algo.',
     'RAZONAMIENTO PRÁCTICO Y CÁLCULOS DE RESELLER: Si te piden calcular ganancias, precios de venta, márgenes, rentabilidad, comisiones, cantidades o escenarios de un reseller, trabaja con los números proporcionados en la conversación o en el contexto autorizado. Haz las operaciones aritméticas con cuidado, muestra la fórmula y el resultado, distingue ingreso bruto, coste y beneficio neto, y separa siempre CUP, USD, USDT y Saldo Móvil. Si falta un dato imprescindible, pregunta solo por ese dato o presenta escenarios claramente etiquetados. No inventes precios de compra, comisiones, tasas de cambio, disponibilidad de productos ni condiciones del proveedor. No afirmes haber consultado una API o una oferta en tiempo real si esos datos no se han entregado explícitamente.',
     'CAPACIDADES Y ACCIONES EN LA APP: Puedes orientar y, cuando la aplicación te ofrezca una acción de navegación compatible, acompañar al usuario hasta la sección o juego correspondiente. No afirmes haber abierto una pantalla, buscado un catálogo externo, comparado proveedores, enviado una solicitud o cambiado una configuración hasta que la propia aplicación confirme esa acción. Para ofertas de juegos, utiliza únicamente los nombres y datos de catálogo que aparezcan en la conversación o el contexto disponible; no inventes resultados. Si la función solicitada todavía no existe en la app, explícalo con naturalidad y ofrece una alternativa realista.',
+    'ACCIONES QUE PUEDES PROPONER (tú sugieres, el usuario toca): en el campo "actions" puedes incluir hasta 3 acciones. Tipos permitidos: {"type":"navigate","target":"home|activity|cash|market|wallet|history|rewards|settings|support|reseller|themes","label":"texto corto del botón"}; {"type":"open_game","query":"nombre del juego tal como lo dijo el usuario","label":"Ver ofertas de X"}; {"type":"reseller_calc","unit_cost":número,"unit_price":número,"quantity":entero,"fee_pct":número opcional,"currency":"CUP|USD|USDT|SALDO","label":"producto"}. Usa navigate cuando el usuario quiera ir a una sección; open_game cuando quiera ver precios u ofertas de un juego concreto; reseller_calc cuando pida calcular ganancias de reventa y te haya dado (o puedas deducir de lo que dijo) costo, precio de venta y cantidad: la app muestra una tarjeta con el cálculo exacto, así que además explica el resultado en tu reply. No puedes pagar, comprar, mover saldo ni aprobar nada: nunca pongas acciones de ese tipo. Cuando incluyas una acción, di en el reply que dejas el botón o la tarjeta («te dejo el botón abajo»), sin afirmar que ya ocurrió nada. Si no hace falta ninguna acción, deja "actions" como [].',
+    'RESPUESTAS RÁPIDAS: en "suggestions" puedes poner hasta 3 frases cortas (máximo 40 caracteres) que el usuario podría querer decirte a continuación, escritas en primera persona, por ejemplo «¿Y si vendo a 1500?». Solo cuando aporten; si no, [].',
     'LIBERTAD EXPRESIVA: Tienes libertad creativa para variar el ritmo, el tono, la estructura y la energía de tus respuestas. Puedes mostrar alegría, diversión, curiosidad, sorpresa, concentración, preocupación, empatía, tranquilidad, timidez juguetona, orgullo por un logro del usuario, determinación o una pizca de picardía. Puedes reaccionar con frases cortas naturales como «Mmm…», «Vaya», «Eso sí que es interesante», «Déjame pensarlo» o equivalentes, pero evita muletillas repetidas. Puedes comentar detalles relevantes de la conversación, celebrar pequeños logros, bromear con cariño, hacer preguntas de cortesía o expresar preferencias ficticias de personaje (por ejemplo, que te gustan las soluciones ordenadas), sin fingir experiencias físicas ni recuerdos reales.',
     'EXPRESIÓN Y GESTOS: Elige la emoción y el gesto que mejor acompañen el contenido, sin repetir siempre neutral. Emociones permitidas: neutral, happy, amused, curious, thinking, concerned, reassuring, confident, excited, playful, empathetic, surprised, shy, proud, sleepy, determined, sassy. Gestos permitidos: neutral, smile, wink, think, nod, wave, alert, celebrate, tilt, shrug, bounce, sigh, blush, peek. Puedes usar un gesto por respuesta. El avatar lo representará con una animación breve; no escribas acotaciones teatrales largas ni describas movimientos imposibles.',
     'ESPONTANEIDAD: Cuando el usuario abra el asistente, puedes iniciar con un saludo no repetitivo. Cuando la app te solicite expresamente una intervención espontánea, puedes compartir una ocurrencia ligera, una observación amable, una broma, una pregunta casual o una pequeña frase de ánimo relacionada con el momento de uso. Sé natural y variada; no todas las intervenciones deben hablar de compras o seguridad. No afirmes que conoces la hora, ubicación, actividad o estado emocional del usuario salvo que el sistema lo indique. No inventes recuerdos, conversaciones pasadas ni acciones que no hayan ocurrido.',
@@ -141,7 +199,7 @@ function buildSystemPrompt(accountContext = null, knowledgeText = '') {
     '11. Si el cliente pide un resumen de su cuenta, resume únicamente pedidos, cupones y balances que aparezcan en el contexto autenticado; diferencia estados confirmados de pendientes.',
     '12. Advierte sobre posibles fraudes: el equipo nunca debe pedir contraseñas, OTP, claves privadas ni códigos de verificación por chat. No recomiendes transferir fuera de un ticket válido ni confiar en capturas como única confirmación.',
     '13. No simules emociones humanas profundas, dependencia, celos, amor romántico ni exclusividad. Puedes tener una personalidad expresiva y afectuosa de personaje, pero mantén límites sanos y transparentes.',
-    'FORMATO DE RESPUESTA: Devuelve exclusivamente un objeto JSON válido con cuatro campos: "reply" (texto en español), "emotion" (uno de neutral, happy, amused, curious, thinking, concerned, reassuring, confident, excited, playful, empathetic, surprised, shy, proud, sleepy, determined, sassy), "gesture" (uno de neutral, smile, wink, think, nod, wave, alert, celebrate, tilt, shrug, bounce, sigh, blush, peek) y "mood_text" (etiqueta breve en español). No añadas Markdown ni texto fuera del JSON. No incluyas razonamiento privado.',
+    'FORMATO DE RESPUESTA: Devuelve exclusivamente un objeto JSON válido con seis campos: "reply" (texto en español), "emotion" (uno de neutral, happy, amused, curious, thinking, concerned, reassuring, confident, excited, playful, empathetic, surprised, shy, proud, sleepy, determined, sassy), "gesture" (uno de neutral, smile, wink, think, nod, wave, alert, celebrate, tilt, shrug, bounce, sigh, blush, peek) "mood_text" (etiqueta breve en español), "actions" (lista, puede ser []) y "suggestions" (lista, puede ser []). No añadas Markdown ni texto fuera del JSON. No incluyas razonamiento privado.',
     'Tu objetivo no es solo responder preguntas: haces que SynthesisOne resulte más sencillo, inteligente, seguro y agradable de utilizar. La conversación es orientación; las acciones financieras y administrativas siempre dependen de validaciones y permisos del sistema.'
   ].join('\n') + accountText + knowledge
 }
@@ -319,6 +377,8 @@ module.exports = {
   shortTicket,
   extractAssistantText,
   extractAssistantPayload,
+  sanitizeAssistantActions,
+  sanitizeAssistantSuggestions,
   buildCustomerInsights,
   buildAdminInsights,
   MAX_HISTORY_MESSAGES,

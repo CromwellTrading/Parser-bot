@@ -447,6 +447,8 @@ router.post('/chat', requireClient, async (req, res) => {
       emotion: assistantOutput.emotion,
       gesture: assistantOutput.gesture,
       mood_text: assistantOutput.mood_text,
+      actions: assistantOutput.actions || [],
+      suggestions: assistantOutput.suggestions || [],
       provider: 'SynthesisOne AI',
       model: 'SO Assistant',
       spontaneous: spontaneousMode,
