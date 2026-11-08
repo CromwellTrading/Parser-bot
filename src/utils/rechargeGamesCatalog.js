@@ -15,6 +15,7 @@ let refreshInFlight = null
 const { cleanText, normalizeCatalog } = require('./rechargeGamesCatalogParser')
 const { lookupWikipediaThumbnail, mapWithConcurrency } = require('./gameThumbnailResolver')
 const { readAllRows } = require('./supabasePagination')
+const { verifyRechargeGamesCatalogIntegrity } = require('./rechargeGamesCatalogIntegrity')
 
 async function getPlatformStoreId() {
   const { data, error } = await supabase.from('game_market_stores')
@@ -64,6 +65,23 @@ async function saveCatalogSignature(signature) {
   if (error) console.warn('[RechargeGames] No se pudo guardar la firma del catálogo; se repetirá la sincronización completa en la próxima actualización.')
 }
 
+async function readPersistedCatalog(storeId) {
+  const [games, offers] = await Promise.all([
+    readAllRows(() => supabase.from('game_market_games')
+      .select('id,slug,is_active')
+      .eq('store_id', storeId), { pageSize: 500, maxRows: 10000 }),
+    readAllRows(() => supabase.from('game_market_offers')
+      .select('game_id,provider_product_key,published,available,provider_out_of_stock,base_cost_usd,price_cup,price_saldo')
+      .eq('store_id', storeId).eq('provider', PROVIDER), { pageSize: 1000, maxRows: 100000 }),
+  ])
+  return { games, offers }
+}
+
+async function verifyPersistedCatalog(storeId, catalog, pricing) {
+  const persisted = await readPersistedCatalog(storeId)
+  return verifyRechargeGamesCatalogIntegrity({ catalog, pricing, ...persisted })
+}
+
 async function refreshCatalog({ reason = 'scheduled' } = {}) {
   if (refreshInFlight) return refreshInFlight
   refreshInFlight = (async () => {
@@ -92,19 +110,30 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
       const now = new Date().toISOString()
       const availableProducts = catalog.products.filter(product => !product.out_of_stock).length
 
-      // The provider catalog is large (11k+ products). If neither its relevant
-      // fields nor the configured conversion/margin/rounding changed, only refresh
-      // the small status row instead of rewriting every offer to Supabase.
+      // A matching fingerprint is only a candidate for skipping writes. Verify
+      // the actual database rows first; the signature can outlive deleted,
+      // unpublished, partially written, or manually corrupted catalog records.
       if (previousSignature && previousSignature === signature) {
-        const state = {
-          id: 1, last_attempt_at: startedAt, last_success_at: now, last_error: null,
-          game_count: catalog.games.length, product_count: catalog.products.length,
-          available_product_count: availableProducts, updated_at: now,
+        let integrity = { ok: false, reason: 'integrity_check_not_completed' }
+        try {
+          integrity = await verifyPersistedCatalog(storeId, catalog, pricing)
+        } catch (integrityError) {
+          integrity = { ok: false, reason: 'database_integrity_read_failed', error: integrityError?.code || integrityError?.message || 'unknown' }
         }
-        const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
-        if (stateError) throw stateError
-        console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_UNCHANGED', reason, source_game_count: catalog.games.length, source_product_count: catalog.stats.source_product_count, product_count: catalog.products.length, provider_response_bytes: response.responseBytes || null, estimated_supabase_write_payload_bytes: 0, database_catalog_writes_skipped: true }))
-        return { ok: true, unchanged: true, games: catalog.games.length, source_products: catalog.stats.source_product_count, products: catalog.products.length, available_products: availableProducts, last_success_at: now }
+
+        if (integrity.ok) {
+          const state = {
+            id: 1, last_attempt_at: startedAt, last_success_at: now, last_error: null,
+            game_count: catalog.games.length, product_count: catalog.products.length,
+            available_product_count: availableProducts, updated_at: now,
+          }
+          const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
+          if (stateError) throw stateError
+          console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_UNCHANGED', reason, source_game_count: catalog.games.length, source_product_count: catalog.stats.source_product_count, product_count: catalog.products.length, provider_response_bytes: response.responseBytes || null, persisted_game_count: integrity.game_count, persisted_product_count: integrity.product_count, estimated_supabase_write_payload_bytes: 0, database_catalog_writes_skipped: true, database_integrity_verified: true }))
+          return { ok: true, unchanged: true, integrity_verified: true, games: catalog.games.length, source_products: catalog.stats.source_product_count, products: catalog.products.length, available_products: availableProducts, last_success_at: now }
+        }
+
+        console.warn(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_INTEGRITY_REPAIR_REQUIRED', reason, integrity_reason: integrity.reason, product_key: integrity.product_key || null }))
       }
 
       const gameIds = new Map()
@@ -143,13 +172,27 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
         const { data, error } = await supabase.from('game_market_games')
           .upsert(gameChunk, { onConflict: 'store_id,slug' }).select('id,slug')
         if (error) throw error
-        for (const row of data || []) gameIds.set(String(row.slug), row.id)
+        if (!Array.isArray(data) || data.length !== gameChunk.length) {
+          const incomplete = new Error('Supabase no devolvió todos los juegos después del upsert del catálogo')
+          incomplete.code = 'INCOMPLETE_GAME_UPSERT'
+          throw incomplete
+        }
+        for (const row of data) gameIds.set(String(row.slug), row.id)
+      }
+      if (gameIds.size !== catalog.games.length) {
+        const incomplete = new Error('No se pudieron recuperar los IDs de todos los juegos del catálogo')
+        incomplete.code = 'INCOMPLETE_GAME_ID_MAP'
+        throw incomplete
       }
 
       const offerRows = []
       for (const product of catalog.products) {
         const gameId = gameIds.get(product.game_slug)
-        if (!gameId) continue
+        if (!gameId) {
+          const incomplete = new Error(`No existe el ID local del juego ${product.game_slug}`)
+          incomplete.code = 'MISSING_CATALOG_GAME_ID'
+          throw incomplete
+        }
         const prices = calculateOfferPrices(product.price_usdt, pricing)
         const title = cleanText(`${product.product_name} · ${product.region_name}`, 120)
         const deliveryLabel = product.delivery === 'code' ? 'Entrega de código' : 'Recarga a ID de jugador'
@@ -199,6 +242,12 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
         })
       }
 
+      if (offerRows.length !== catalog.products.length) {
+        const incomplete = new Error('La cantidad de ofertas preparadas no coincide con el catálogo normalizado')
+        incomplete.code = 'INCOMPLETE_OFFER_BUILD'
+        throw incomplete
+      }
+
       for (let i = 0; i < offerRows.length; i += 500) {
         const chunk = offerRows.slice(i, i + 500)
         catalogWritePayloadBytes += Buffer.byteLength(JSON.stringify(chunk), 'utf8')
@@ -230,6 +279,14 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
         .eq('store_id', storeId).eq('provider', PROVIDER).eq('provider_last_seen_at', now).eq('provider_out_of_stock', false)
       if (availability.error) throw availability.error
 
+      const persistedIntegrity = await verifyPersistedCatalog(storeId, catalog, pricing)
+      if (!persistedIntegrity.ok) {
+        const incomplete = new Error(`La verificación posterior a la sincronización falló: ${persistedIntegrity.reason}`)
+        incomplete.code = 'CATALOG_POST_SYNC_INTEGRITY_FAILED'
+        incomplete.integrity = persistedIntegrity
+        throw incomplete
+      }
+
       const state = {
         id: 1,
         last_attempt_at: startedAt,
@@ -246,7 +303,7 @@ async function refreshCatalog({ reason = 'scheduled' } = {}) {
       // refresh performs a full sync again, not that a successfully synced catalog
       // should be hidden or treated as failed.
       await saveCatalogSignature(signature)
-      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, provider_response_bytes: response.responseBytes || null, estimated_supabase_write_payload_bytes: catalogWritePayloadBytes, offer_upsert_batch_size: 500, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
+      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, provider_response_bytes: response.responseBytes || null, estimated_supabase_write_payload_bytes: catalogWritePayloadBytes, offer_upsert_batch_size: 500, persisted_game_count: persistedIntegrity.game_count, persisted_product_count: persistedIntegrity.product_count, database_integrity_verified: true, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
       return { ok: true, games: catalog.games.length, source_groups: catalog.stats.source_group_count, source_products: catalog.stats.source_product_count, products: offerRows.length, available_products: availableProducts, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, last_success_at: now }
     } catch (error) {
       // If persistence began but the refresh did not commit, fail closed instead of leaving
