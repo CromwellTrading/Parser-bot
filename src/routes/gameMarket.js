@@ -9,8 +9,16 @@ const { canAccessGameMarket } = require('../utils/storeSessionAccess')
 const { bot, ADMINS } = require('../telegram')
 const { roundToStep, computePrices, normalizeMarketPricing } = require('../utils/gamePricing')
 const { readAllRows } = require('../utils/supabasePagination')
+const { createCatalogResponder } = require('../utils/catalogResponseCache')
+const { summarizeGameOffers, GAME_ID_PATTERN } = require('../utils/gameMarketCatalogSummary')
 
 const router = express.Router()
+const catalogResponder = createCatalogResponder({ ttlMs: 60_000 })
+// Any admin write (games, offers, pricing, images) invalidates the cached catalogue immediately.
+router.use((req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') res.on('finish', () => catalogResponder.invalidate())
+  next()
+})
 const AVATAR_BUCKET = 'so-profile-avatars'
 const GAME_BUCKET = 'so-game-thumbnails'
 const KYC_BUCKET = 'so-reseller-kyc'
@@ -133,8 +141,10 @@ async function resellerActive(clientId) {
   if (error) throw error
   return data?.status === 'active'
 }
-async function catalogPayload(tier, admin = false) {
-  const storeId = await platformStoreId()
+const OFFER_COLUMNS_FULL = 'id, game_id, title, description, category, package_data, provider, provider_product_key, provider_game_slug, provider_region_slug, provider_region_name, provider_delivery, provider_out_of_stock, price_cup, price_saldo, price_reseller_cup, price_reseller_saldo, base_cost_usd, auto_pricing, available, published, sort_order'
+const OFFER_COLUMNS_SUMMARY = 'id, game_id, provider, provider_product_key, provider_out_of_stock, price_cup, price_saldo, price_reseller_cup, price_reseller_saldo, base_cost_usd, auto_pricing, available, published, sort_order'
+
+async function loadGames(storeId, admin) {
   // Read every row in deterministic pages. PostgREST commonly caps a single
   // response at 1,000 rows; a one-shot query silently hid later games/offers,
   // including RechargeGames regions (the UI calls these server/region options).
@@ -143,59 +153,98 @@ async function catalogPayload(tier, admin = false) {
     .eq('store_id', storeId).order('sort_order').order('name').order('id'),
   { pageSize: 500, maxRows: 10_000 })
   // Keep all real games visible, but do not duplicate the live Soky/ETECSA catalog with a legacy empty Game Market placeholder.
-  const gameRows = admin ? (games || []) : (games || []).filter(g => g.is_active && !isLegacyEtecsaGame(g))
+  return admin ? (games || []) : (games || []).filter(g => g.is_active && !isLegacyEtecsaGame(g))
+}
+
+async function loadOffers(storeId, gameIds, admin, columns) {
+  if (!gameIds.length) return []
+  const data = await readAllRows(() => supabase.from('game_market_offers')
+    .select(columns)
+    .eq('store_id', storeId).in('game_id', gameIds).order('sort_order').order('title').order('id'),
+  { pageSize: 500, maxRows: 100_000 })
+  // Public catalog only exposes offers that the backend can actually order from a provider.
+  // Legacy/manual rows remain accessible to admins for cleanup, but never appear purchasable to clients.
+  return data.filter(o => admin || (o.published && isConnectedRechargeGamesOffer(o)))
+}
+
+function mapOffer(o, { tier, admin, normalRule, resellerRule }) {
+  let normalCup = Number(o.price_cup || 0)
+  let normalSaldo = Number(o.price_saldo || 0)
+  let resellerCup = o.price_reseller_cup == null ? null : Number(o.price_reseller_cup)
+  let resellerSaldo = o.price_reseller_saldo == null ? null : Number(o.price_reseller_saldo)
+  if (o.auto_pricing && o.base_cost_usd !== null && o.base_cost_usd !== undefined) {
+    // Auto-priced offers are derived from the active per-tier settings at read time.
+    // Never keep a stale previously calculated value after an admin changes a rate.
+    const np = computePrices(Number(o.base_cost_usd), normalRule)
+    const rp = computePrices(Number(o.base_cost_usd), resellerRule)
+    normalCup = np.price_cup; normalSaldo = np.price_saldo
+    resellerCup = rp.price_cup; resellerSaldo = rp.price_saldo
+  }
+  const out = {
+    id: o.id, game_id: o.game_id, title: o.title, description: o.description || '', category: o.category || 'Paquete',
+    package_data: packageDataForCatalog(o, { admin }),
+    provider_connected: isConnectedRechargeGamesOffer(o),
+    price_cup: tier === 'reseller' ? (resellerCup === null ? normalCup : resellerCup) : normalCup,
+    price_saldo: tier === 'reseller' ? (resellerSaldo === null ? normalSaldo : resellerSaldo) : normalSaldo,
+    available: !!o.available, published: !!o.published, sort_order: o.sort_order || 0,
+  }
+  if (admin) {
+    out.base_cost_usd = o.base_cost_usd === null ? null : Number(o.base_cost_usd)
+    out.auto_pricing = !!o.auto_pricing
+    out.price_reseller_cup = resellerCup
+    out.price_reseller_saldo = resellerSaldo
+    out.price_normal_cup = normalCup
+    out.price_normal_saldo = normalSaldo
+  }
+  return out
+}
+
+function mapGame(g, extra) {
+  return {
+    id: g.id, slug: g.slug, name: g.name, description: g.description || '', category: g.category || 'Juegos',
+    thumbnail_path: g.thumbnail_path || null, thumbnail_url: publicGameUrl(g.thumbnail_path), badge: g.badge || '',
+    is_active: !!g.is_active, sort_order: g.sort_order || 0,
+    ...extra,
+  }
+}
+
+async function catalogPayload(tier, admin = false, { summary = false } = {}) {
+  const storeId = await platformStoreId()
+  const gameRows = await loadGames(storeId, admin)
   const normalRule = await pricingFor('normal')
   const resellerRule = await pricingFor('reseller')
+  const ctx = { tier, admin, normalRule, resellerRule }
   const ids = gameRows.map(g => g.id)
-  let offers = []
-  if (ids.length) {
-    const data = await readAllRows(() => supabase.from('game_market_offers')
-      .select('id, game_id, title, description, category, package_data, provider, provider_product_key, provider_game_slug, provider_region_slug, provider_region_name, provider_delivery, provider_out_of_stock, price_cup, price_saldo, price_reseller_cup, price_reseller_saldo, base_cost_usd, auto_pricing, available, published, sort_order')
-      .eq('store_id', storeId).in('game_id', ids).order('sort_order').order('title').order('id'),
-    { pageSize: 500, maxRows: 100_000 })
-    // Public catalog only exposes offers that the backend can actually order from a provider.
-    // Legacy/manual rows remain accessible to admins for cleanup, but never appear purchasable to clients.
-    offers = data.filter(o => admin || (o.published && isConnectedRechargeGamesOffer(o)))
+  const offers = (await loadOffers(storeId, ids, admin, summary ? OFFER_COLUMNS_SUMMARY : OFFER_COLUMNS_FULL)).map(o => mapOffer(o, ctx))
+  const byGame = new Map()
+  for (const offer of offers) {
+    if (!byGame.has(offer.game_id)) byGame.set(offer.game_id, [])
+    byGame.get(offer.game_id).push(offer)
   }
-  const mappedOffers = offers.map(o => {
-    let normalCup = Number(o.price_cup || 0)
-    let normalSaldo = Number(o.price_saldo || 0)
-    let resellerCup = o.price_reseller_cup == null ? null : Number(o.price_reseller_cup)
-    let resellerSaldo = o.price_reseller_saldo == null ? null : Number(o.price_reseller_saldo)
-    if (o.auto_pricing && o.base_cost_usd !== null && o.base_cost_usd !== undefined) {
-      // Auto-priced offers are derived from the active per-tier settings at read time.
-      // Never keep a stale previously calculated value after an admin changes a rate.
-      const np = computePrices(Number(o.base_cost_usd), normalRule)
-      const rp = computePrices(Number(o.base_cost_usd), resellerRule)
-      normalCup = np.price_cup; normalSaldo = np.price_saldo
-      resellerCup = rp.price_cup; resellerSaldo = rp.price_saldo
-    }
-    const out = {
-      id: o.id, game_id: o.game_id, title: o.title, description: o.description || '', category: o.category || 'Paquete',
-      package_data: packageDataForCatalog(o, { admin }),
-      provider_connected: isConnectedRechargeGamesOffer(o),
-      price_cup: tier === 'reseller' ? (resellerCup === null ? normalCup : resellerCup) : normalCup,
-      price_saldo: tier === 'reseller' ? (resellerSaldo === null ? normalSaldo : resellerSaldo) : normalSaldo,
-      available: !!o.available, published: !!o.published, sort_order: o.sort_order || 0,
-    }
-    if (admin) {
-      out.base_cost_usd = o.base_cost_usd === null ? null : Number(o.base_cost_usd)
-      out.auto_pricing = !!o.auto_pricing
-      out.price_reseller_cup = resellerCup
-      out.price_reseller_saldo = resellerSaldo
-      out.price_normal_cup = normalCup
-      out.price_normal_saldo = normalSaldo
-    }
-    return out
-  })
   return {
     pricing_tier: tier,
-    games: gameRows.map(g => ({
-      id: g.id, slug: g.slug, name: g.name, description: g.description || '', category: g.category || 'Juegos',
-      thumbnail_path: g.thumbnail_path || null, thumbnail_url: publicGameUrl(g.thumbnail_path), badge: g.badge || '',
-      is_active: !!g.is_active, sort_order: g.sort_order || 0,
-      offers: mappedOffers.filter(o => o.game_id === g.id),
-    })),
+    view: summary ? 'summary' : 'full',
+    games: gameRows.map(g => summary
+      ? mapGame(g, { ...summarizeGameOffers(byGame.get(g.id) || []), offers_included: false })
+      : mapGame(g, { offers: byGame.get(g.id) || [] })),
+  }
+}
+
+/** Offers of one game, loaded on demand when a customer opens it. */
+async function gameOffersPayload(tier, gameId, admin = false) {
+  if (!GAME_ID_PATTERN.test(String(gameId || ''))) throw fail(400, 'Identificador de juego no válido')
+  const storeId = await platformStoreId()
+  const { data: game, error } = await supabase.from('game_market_games')
+    .select('id, name, slug, is_active').eq('store_id', storeId).eq('id', gameId).maybeSingle()
+  if (error) throw error
+  if (!game || (!admin && (!game.is_active || isLegacyEtecsaGame(game)))) throw fail(404, 'Juego no encontrado')
+  const normalRule = await pricingFor('normal')
+  const resellerRule = await pricingFor('reseller')
+  const rows = await loadOffers(storeId, [game.id], admin, OFFER_COLUMNS_FULL)
+  return {
+    pricing_tier: tier,
+    game_id: game.id,
+    offers: rows.map(o => mapOffer(o, { tier, admin, normalRule, resellerRule })),
   }
 }
 
@@ -204,9 +253,17 @@ router.get('/catalog', async (req, res) => {
   try {
     const client = await optionalClient(tokenFrom(req), req)
     const tier = client && await resellerActive(client.id) ? 'reseller' : 'normal'
-    const payload = await catalogPayload(tier, false)
-    return res.json(payload)
+    const summary = String(req.query?.view || '') === 'summary'
+    return await catalogResponder.send(req, res, `client:${tier}:${summary ? 'summary' : 'full'}`, () => catalogPayload(tier, false, { summary }))
   } catch (e) { return sendError(res, e, 'GET market catalog') }
+})
+router.get('/catalog/games/:id/offers', async (req, res) => {
+  try {
+    const client = await optionalClient(tokenFrom(req), req)
+    const tier = client && await resellerActive(client.id) ? 'reseller' : 'normal'
+    const id = String(req.params.id || '')
+    return await catalogResponder.send(req, res, `client:${tier}:offers:${id}`, () => gameOffersPayload(tier, id, false))
+  } catch (e) { return sendError(res, e, 'GET market game offers') }
 })
 router.get('/profile', requiredClient, async (req, res) => {
   try {
@@ -287,10 +344,19 @@ router.post('/profile/avatar', requiredClient, async (req, res) => {
 
 router.get('/admin/catalog', requiredClient, requiredAdmin, async (req, res) => {
   try {
-    const payload = await catalogPayload('normal', true)
-    payload.pricing = { normal: await pricingFor('normal'), reseller: await pricingFor('reseller') }
-    return res.json(payload)
+    const summary = String(req.query?.view || '') === 'summary'
+    return await catalogResponder.send(req, res, `admin:${summary ? 'summary' : 'full'}`, async () => {
+      const payload = await catalogPayload('normal', true, { summary })
+      payload.pricing = { normal: await pricingFor('normal'), reseller: await pricingFor('reseller') }
+      return payload
+    })
   } catch (e) { return sendError(res, e, 'GET admin catalog') }
+})
+router.get('/admin/catalog/games/:id/offers', requiredClient, requiredAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || '')
+    return await catalogResponder.send(req, res, `admin:offers:${id}`, () => gameOffersPayload('normal', id, true))
+  } catch (e) { return sendError(res, e, 'GET admin game offers') }
 })
 router.put('/admin/pricing', requiredClient, requiredAdmin, async (req, res) => {
   try {

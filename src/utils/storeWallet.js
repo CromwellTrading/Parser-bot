@@ -3,7 +3,8 @@
 const crypto = require('crypto')
 const supabase = require('../supabase')
 const { getLicenseConfig } = require('./onboarding')
-const { getPaymentConfig } = require('./paymentDestinations')
+const { getPaymentConfig, resolveSaldoReceiver } = require('./paymentDestinations')
+const { maskRetiredPayment } = require('./paymentReceiverGuard')
 const { safeCustomerText, safeAutomationMessage } = require('./customerMessages')
 const { getAutomationAvailability } = require('./systemSettings')
 const { normalizePhone, parseSms } = require('./parser')
@@ -74,7 +75,7 @@ function publicTopup(row) {
   const payment = currency === 'SALDO'
     ? { receiver_phone: row.confirmation_phone, method: 'CUBACEL' }
     : { card: row.destination_card, confirmation_phone: row.confirmation_phone, method: 'PAGOMOVIL' }
-  return {
+  return maskRetiredPayment({
     id: row.id,
     ticket: `WL-${String(row.id).replace(/-/g, '').slice(0, 8).toUpperCase()}`,
     type: 'WALLET_TOPUP', status: row.status, currency, amount,
@@ -89,7 +90,7 @@ function publicTopup(row) {
       row.status === 'EXPIRED' ? 'El plazo de pago terminó.' : 'Operación cancelada.',
     payment_review_required: Boolean(row.payment_review_at),
     ...(row.status === 'WAITING_PAYMENT' ? { payment } : {}),
-  }
+  }, row)
 }
 
 function samePhone(a, b) {
@@ -281,7 +282,8 @@ async function createTopup(client, body) {
   } else {
     // Deliberately separate from the Transfermóvil destination. The receiver
     // phone must be configured and have an SMS-relay client online in the backend.
-    confirmationPhone = normalizePayerPhone(process.env.STORE_WALLET_SALDO_RECEIVER_PHONE || '').replace(/\D/g, '')
+    try { confirmationPhone = (await resolveSaldoReceiver(body?.payment_destination_id)).phone }
+    catch (error) { throw fail(error.message || 'El depósito de Saldo Móvil no está disponible en este momento.', error.status || 503, error.code || 'SALDO_WALLET_RECEIVER_NOT_CONFIGURED') }
     if (!/^5\d{7}$/.test(confirmationPhone || '')) {
       throw fail('El depósito de Saldo Móvil no está disponible en este momento. Inténtalo más tarde.', 503, 'SALDO_WALLET_RECEIVER_NOT_CONFIGURED')
     }
@@ -759,6 +761,7 @@ async function getStoreStatusSnapshot(clientId) {
       paid_at: row.paid_at, payment_deadline_at: row.payment_deadline_at })
   }
   entries.sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || ''))
+  for (const entry of entries) maskRetiredPayment(entry, entry)
   return entries
 }
 
@@ -835,6 +838,7 @@ async function getStoreHistory(clientId) {
     entries.push({ id: row.id, ticket_id: row.reference_type === 'WALLET_TOPUP' ? row.reference_id : row.id, receipt_code: row.reference_type === 'WALLET_TOPUP' && row.reference_id ? `SO-WL-${String(row.reference_id).replace(/-/g, '').slice(0, 10).toUpperCase()}` : `SO-MV-${String(row.id).replace(/-/g, '').slice(0, 10).toUpperCase()}`, reference_type: row.reference_type, reference_id: row.reference_id, source: 'WALLET_MOVEMENT', title: row.description || (row.kind === 'CREDIT' ? 'Fondos añadidos' : row.kind === 'REFUND' ? 'Devolución a Wallet' : 'Movimiento de Wallet'), amount, ...(currency === 'SALDO' ? { amount_saldo: amount } : { amount_cup: amount }), currency, status: row.kind, message: row.kind === 'SPEND' ? 'Compra descontada del saldo.' : row.kind === 'REFUND' ? 'Importe devuelto al saldo.' : 'Saldo añadido a Wallet.', created_at: row.created_at, updated_at: row.created_at })
   }
   entries.sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || ''))
+  for (const entry of entries) maskRetiredPayment(entry, entry)
   return entries.slice(0, 120)
 }
 

@@ -5,7 +5,8 @@ const supabase = require('../supabase')
 const { readAllRows } = require('./supabasePagination')
 const { bot, ADMINS } = require('../telegram')
 const { getLicenseConfig, cardMatches } = require('./onboarding')
-const { getPaymentConfig, getPaymentDestinations } = require('./paymentDestinations')
+const { getPaymentConfig, getPaymentDestinations, resolveSaldoReceiver } = require('./paymentDestinations')
+const { maskRetiredPayment } = require('./paymentReceiverGuard')
 const { safeAutomationMessage } = require('./customerMessages')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
@@ -103,7 +104,7 @@ function publicOrder(order) {
       }
     }
   }
-  return result
+  return maskRetiredPayment(result, order)
 }
 
 async function notifyAdmins(message) {
@@ -169,7 +170,9 @@ async function assertNoOtherWaitingCheckout(clientId) {
 
 async function getCheckoutConfig() {
   const automation = await getAutomationAvailability()
-  const destinations = await getPaymentDestinations().catch(() => [])
+  // While automation is unavailable (global switch off, no active account, or an unreadable setting) no
+  // receiver may be shown: customers would send money that nobody is monitoring.
+  const destinations = automation.enabled ? await getPaymentDestinations().catch(() => []) : []
   const first = destinations[0] || null
   const configured = Boolean(first && first.card_number && first.confirmation_phone && getLicenseConfig().currency === 'CUP')
   return {
@@ -229,7 +232,8 @@ async function createPaymentOrder(client, body) {
   } else {
     // Direct Saldo Móvil purchases use the already monitored CUBACEL receiver
     // configured for Wallet Saldo deposits. This does not create Wallet funds.
-    confirmationPhone = normalizePayerPhone(process.env.STORE_WALLET_SALDO_RECEIVER_PHONE || '').replace(/\D/g, '')
+    try { confirmationPhone = (await resolveSaldoReceiver(body?.payment_destination_id)).phone }
+    catch (error) { throw errorWithStatus(error.message || 'El pago directo con Saldo Móvil no está disponible en este momento.', error.status || 503, error.code || 'SALDO_MOBILE_RECEIVER_NOT_CONFIGURED') }
     if (!/^5\d{7}$/.test(confirmationPhone || '')) {
       throw errorWithStatus('El pago directo con Saldo Móvil no está disponible en este momento. Inténtalo más tarde.', 503, 'SALDO_MOBILE_RECEIVER_NOT_CONFIGURED')
     }

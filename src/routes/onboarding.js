@@ -18,6 +18,7 @@ const { encryptActivationSecret } = require('../utils/activationSecretVault')
 const { expireDueLicenses } = require('../utils/licenseExpiry')
 const { getAutomationAvailability } = require('../utils/systemSettings')
 const { getPaymentDestinations, resolvePaymentDestination } = require('../utils/paymentDestinations')
+const { receiverState, RETIRED_MESSAGE } = require('../utils/paymentReceiverGuard')
 const { safeAutomationMessage } = require('../utils/customerMessages')
 
 const SESSION_TTL_HOURS = Number(process.env.ACTIVATION_SESSION_TTL_HOURS || 24)
@@ -71,6 +72,12 @@ function publicActivation(session, includeSecret = false) {
       confirmation_phone: session.confirmation_phone || null,
       destination_id: session.payment_destination_id || null,
     },
+  }
+  // A ticket that is still waiting for money must never keep showing a receiver whose owner switched it off.
+  if (session.status === 'WAITING_PAYMENT' && receiverState({ card: session.destination_card, phone: session.confirmation_phone }) === 'retired') {
+    result.payment = { ...result.payment, card: null, confirmation_phone: null, destination_id: null, unavailable: true }
+    result.payment_unavailable = true
+    result.payment_unavailable_message = RETIRED_MESSAGE
   }
   if (includeSecret) result.activation_secret = includeSecret === true ? session.activation_secret : undefined
   return result

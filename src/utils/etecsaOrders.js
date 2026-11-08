@@ -6,6 +6,7 @@ const { readAllRows } = require('./supabasePagination')
 const { bot, ADMINS } = require('../telegram')
 const { getLicenseConfig, cardMatches } = require('./onboarding')
 const { getPaymentConfig, getPaymentDestinations } = require('./paymentDestinations')
+const { maskRetiredPayment } = require('./paymentReceiverGuard')
 const { safeAutomationMessage } = require('./customerMessages')
 const { normalizePhone } = require('./parser')
 const { getAutomationAvailability } = require('./systemSettings')
@@ -75,7 +76,7 @@ function publicOrder(order) {
       confirmation_phone: order.confirmation_phone,
     }
   }
-  return result
+  return maskRetiredPayment(result, order)
 }
 
 async function notifyAdmins(text) {
@@ -135,7 +136,9 @@ async function findBlockingOrder(clientId) {
 
 async function getCheckoutConfig() {
   const automation = await getAutomationAvailability()
-  const destinations = await getPaymentDestinations().catch(() => [])
+  // While automation is unavailable (global switch off, no active account, or an unreadable setting) no
+  // receiver may be shown: customers would send money that nobody is monitoring.
+  const destinations = automation.enabled ? await getPaymentDestinations().catch(() => []) : []
   const first = destinations[0] || null
   const configured = Boolean(first && first.card_number && first.confirmation_phone && getLicenseConfig().currency === 'CUP')
   return {

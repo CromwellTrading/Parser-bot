@@ -7,6 +7,7 @@ const { submitRecipientDetails: submitEtecsaRecipientDetails } = require('./etec
 const { getCatalogResponse } = require('./etecsaCatalog')
 const { getLicenseConfig } = require('./onboarding')
 const { getPaymentConfig } = require('./paymentDestinations')
+const { maskRetiredPayment } = require('./paymentReceiverGuard')
 const { safeAutomationMessage } = require('./customerMessages')
 const { getAutomationAvailability } = require('./systemSettings')
 const { evaluateOfficialStorePayment, isConfiguredPaymentReceiver } = require('./walletPaymentMatching')
@@ -28,7 +29,7 @@ function ticket(id) { return `SC-${String(id || '').replace(/-/g, '').slice(0, 8
 
 function publicCart(row, items = []) {
   if (!row) return null
-  return {
+  return maskRetiredPayment({
     id: row.id, ticket: ticket(row.id), status: row.status,
     payment_source: row.payment_source, price_basis: row.price_basis,
     currency: row.price_basis, item_count: Number(row.item_count || items.length || 0),
@@ -47,7 +48,7 @@ function publicCart(row, items = []) {
       status: line.status, player_id: line.player_id || null, server_id: line.server_id || null,
       recipient: line.recipient || null, email: line.email || null,
     })),
-  }
+  }, row)
 }
 
 async function loadCart(clientId, cartId) {

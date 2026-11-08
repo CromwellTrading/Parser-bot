@@ -313,6 +313,15 @@ router.get('/config', requireClient, async (req, res) => {
   return res.set('Cache-Control', 'no-store').json({ ok: true, enabled, message, provider: 'SynthesisOne AI', persona: 'SO Assistant', avatar_enabled: true })
 })
 
+// The assistant must warn customers BEFORE they send money when no monitored account is receiving payments.
+function livePaymentStatusText(availability) {
+  if (!availability) {
+    return 'ESTADO EN VIVO DE PAGOS: no se pudo comprobar. Si el cliente va a transferir, dile que espere y que confirme con soporte antes de enviar dinero.'
+  }
+  if (availability.enabled) return ''
+  return 'ESTADO EN VIVO DE PAGOS: las transferencias NO están disponibles ahora mismo. Si el cliente menciona pagar, transferir o recargar, avísale con claridad y cariño que NO envíe dinero todavía, que ninguna cuenta está recibiendo pagos en este momento y que puede escribir a soporte por WhatsApp. Si ya transfirió, pídele que guarde el comprobante y contacte con soporte. Nunca des números de tarjeta ni de teléfono.'
+}
+
 router.post('/chat', requireClient, async (req, res) => {
   if (!assistantConfigured()) {
     return res.status(503).json({ ok: false, code: 'AI_ASSISTANT_NOT_CONFIGURED', error: 'El asistente todavía no está disponible. Contacta con soporte.' })
@@ -343,7 +352,9 @@ router.post('/chat', requireClient, async (req, res) => {
   try {
     const userMessage = normalized.messages[normalized.messages.length - 1].content
     const accountContext = needsAccountContext(userMessage) ? await buildAccountContext(req.assistantClient, userMessage) : null
-    const knowledgeText = loadRelevantKnowledge(userMessage)
+    const availability = await getAutomationAvailability().catch(() => null)
+    const liveStatus = livePaymentStatusText(availability)
+    const knowledgeText = [loadRelevantKnowledge(userMessage), liveStatus].filter(Boolean).join('\n\n')
     const messages = [
       { role: 'system', content: buildSystemPrompt(accountContext, knowledgeText) },
       ...normalized.messages,

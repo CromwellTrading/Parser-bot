@@ -173,7 +173,8 @@ router.get('/api/auth/check', (req, res) => {
 router.get('/api/system/automation', async (_req, res) => {
   const status = await getAutomationAvailability()
   res.set('Cache-Control', 'no-store')
-  res.json({ ok: true, ...status })
+  // The panel edits the global master switch; effective availability also needs an active account.
+  res.json({ ok: true, ...status, enabled: status.master_enabled, effective_enabled: status.enabled })
 })
 
 router.put('/api/system/automation', async (req, res) => {

@@ -61,14 +61,22 @@ async function readConfiguredRows() {
   return result.data || []
 }
 
+function isMissingTableError(error) {
+  const code = String(error?.code || '')
+  const message = String(error?.message || '').toLowerCase()
+  return code === '42P01' || code === 'PGRST205' || message.includes('does not exist') || message.includes('schema cache') || message.includes('could not find the table')
+}
+
 async function getPaymentDestinations({ includeDisabled = false } = {}) {
   let rows
   try {
     rows = await readConfiguredRows()
   } catch (error) {
-    // Compatibility during staged deployment: existing installations can keep using
-    // the already-configured environment pair until the migration is applied.
     console.warn(JSON.stringify({ event: 'PAYMENT_DESTINATIONS_TABLE_UNAVAILABLE', code: error.code || null }))
+    // The legacy .env receiver is only a compatibility path for installations where the destinations
+    // table has not been created yet. A transient database error must never resurrect it: that pair is
+    // usually the owner's own account, which may have been switched off on purpose.
+    if (!isMissingTableError(error)) return []
     const legacy = legacyDestination()
     return legacy ? [legacy] : []
   }
@@ -153,6 +161,55 @@ async function saveMyPaymentDestination(admin, input = {}) {
   return { id: String(data.id), label: data.label, card_number: data.card_number, confirmation_phone: data.confirmation_phone, enabled: data.enabled === true, updated_at: data.updated_at || null }
 }
 
+/** Number of receivers that customers can use right now, or null when it cannot be determined. */
+async function countActiveDestinations() {
+  try {
+    return (await getPaymentDestinations()).length
+  } catch (_) {
+    return null
+  }
+}
+
+/**
+ * Receiver for payments made with Saldo Móvil. It always belongs to an ACTIVE administrator account (the
+ * confirmation phone of an enabled destination, which is the monitored line of that administrator), so
+ * switching an account off also removes its saldo number. The old STORE_WALLET_SALDO_RECEIVER_PHONE
+ * variable is only used as a tie-breaker between active accounts, never as a receiver by itself.
+ */
+async function resolveSaldoReceiver(destinationId = '') {
+  const destinations = await getPaymentDestinations()
+  if (!destinations.length) {
+    const error = new Error('El pago con Saldo Móvil no está disponible en este momento. Inténtalo más tarde.')
+    error.status = 503; error.code = 'SALDO_RECEIVER_UNAVAILABLE'; throw error
+  }
+  const requested = String(destinationId || '').trim()
+  let chosen = requested ? destinations.find(item => item.id === requested) : null
+  if (!chosen) {
+    const preferred = normalizePaymentPhone(process.env.STORE_WALLET_SALDO_RECEIVER_PHONE || '')
+    chosen = destinations.find(item => item.confirmation_phone === preferred) || destinations[0]
+  }
+  return { phone: chosen.confirmation_phone, destination_id: chosen.id, label: chosen.label }
+}
+
+async function setMyPaymentDestinationEnabled(adminClientId, enabled) {
+  const current = await getMyPaymentDestination(adminClientId)
+  if (enabled && (!CARD_RE.test(current.card_number) || !PHONE_RE.test(current.confirmation_phone))) {
+    const error = new Error('Guarda primero tu tarjeta y su número de confirmación para poder activar tu cuenta.')
+    error.status = 409; error.code = 'PAYMENT_DESTINATION_REQUIRED'; throw error
+  }
+  if (!current.id) return current
+  const { data, error } = await supabase.from(TABLE)
+    .update({ enabled: Boolean(enabled), updated_at: new Date().toISOString() })
+    .eq('admin_client_id', String(adminClientId))
+    .select('id, label, card_number, confirmation_phone, enabled, updated_at').single()
+  if (error) {
+    const wrapped = new Error(error.message || 'No se pudo cambiar la disponibilidad de tu cuenta')
+    wrapped.code = error.code || 'PAYMENT_DESTINATIONS_SAVE_FAILED'
+    throw wrapped
+  }
+  return { id: String(data.id), label: data.label, card_number: data.card_number, confirmation_phone: data.confirmation_phone, enabled: data.enabled === true, updated_at: data.updated_at || null }
+}
+
 async function resolvePaymentDestination(destinationId = '') {
   const destinations = await getPaymentDestinations()
   const requested = String(destinationId || '').trim()
@@ -188,5 +245,6 @@ async function getPaymentConfig(baseConfig, destinationId = '') {
 module.exports = {
   TABLE, CARD_RE, PHONE_RE, getPaymentDestinations, getMyPaymentDestination,
   saveMyPaymentDestination, resolvePaymentDestination, getPaymentConfig,
-  normalizeCard, normalizePaymentPhone,
+  normalizeCard, normalizePaymentPhone, readConfiguredRows, countActiveDestinations,
+  resolveSaldoReceiver, setMyPaymentDestinationEnabled, isMissingTableError,
 }
