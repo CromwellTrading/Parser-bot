@@ -8,7 +8,7 @@ const { requireNonRevokedToken } = require('../utils/tokenState')
 const { canAccessGameMarket } = require('../utils/storeSessionAccess')
 const { bot, ADMINS } = require('../telegram')
 const { roundToStep, computePrices, normalizeMarketPricing } = require('../utils/gamePricing')
-const { readAllRows } = require('../utils/supabasePagination')
+const { readAllRows, readRowsInBatches } = require('../utils/supabasePagination')
 const { createCatalogResponder } = require('../utils/catalogResponseCache')
 const { summarizeGameOffers, GAME_ID_PATTERN } = require('../utils/gameMarketCatalogSummary')
 
@@ -162,10 +162,14 @@ async function loadGames(storeId, admin) {
 
 async function loadOffers(storeId, gameIds, admin, columns) {
   if (!gameIds.length) return []
-  const data = await readAllRows(() => supabase.from('game_market_offers')
+  // A single .in('game_id', gameIds) with all 399 platform games creates a
+  // ~16 KB PostgREST URL. Node/Undici rejects the response headers before the
+  // query can complete (UND_ERR_HEADERS_OVERFLOW). Keep each URL small and
+  // still page each result set so no offers are silently omitted.
+  const data = await readRowsInBatches(batchGameIds => supabase.from('game_market_offers')
     .select(columns)
-    .eq('store_id', storeId).in('game_id', gameIds).order('sort_order').order('title').order('id'),
-  { pageSize: 500, maxRows: 100_000 })
+    .eq('store_id', storeId).in('game_id', batchGameIds).order('sort_order').order('title').order('id'),
+  gameIds, { batchSize: 50, pageSize: 500, maxRows: 100_000 })
   // Public catalog only exposes offers that the backend can actually order from a provider.
   // Legacy/manual rows remain accessible to admins for cleanup, but never appear purchasable to clients.
   return data.filter(o => admin || (o.published && isConnectedRechargeGamesOffer(o)))
