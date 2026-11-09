@@ -1,0 +1,354 @@
+'use strict'
+
+const supabase = require('../supabase')
+const { rechargeGamesCatalogFingerprint } = require('./rechargeGamesCatalogFingerprint')
+const { rechargeGamesRequest, RechargeGamesApiError } = require('./rechargeGamesApi')
+const { normalizeMarketPricing, calculateOfferPrices } = require('./gamePricing')
+
+const PROVIDER = 'rechargegames'
+const CATALOG_SIGNATURE_SETTING_KEY = 'rechargegames_catalog_signature'
+const requestedRefreshInterval = Number(process.env.RECHARGEGAMES_CATALOG_REFRESH_MS || 3 * 60 * 60 * 1000)
+const CATALOG_REFRESH_MS = Math.max(5 * 60 * 1000, Number.isFinite(requestedRefreshInterval) && requestedRefreshInterval > 0 ? requestedRefreshInterval : 3 * 60 * 60 * 1000)
+let workerStarted = false
+let refreshInFlight = null
+
+const { cleanText, normalizeCatalog } = require('./rechargeGamesCatalogParser')
+const { lookupWikipediaThumbnail, mapWithConcurrency } = require('./gameThumbnailResolver')
+const { readAllRows } = require('./supabasePagination')
+const { invalidateCatalogResponses } = require('./catalogResponseCache')
+const { verifyRechargeGamesCatalogIntegrity } = require('./rechargeGamesCatalogIntegrity')
+
+async function getPlatformStoreId() {
+  const { data, error } = await supabase.from('game_market_stores')
+    .select('id').eq('is_platform_store', true).maybeSingle()
+  if (error) throw error
+  if (!data?.id) {
+    const e = new Error('Official Game Market store is missing')
+    e.code = 'PLATFORM_STORE_MISSING'
+    throw e
+  }
+  return data.id
+}
+
+async function getPricingSettings() {
+  const { data, error } = await supabase.from('synthesisone_settings')
+    .select('value').eq('key', 'game_market_pricing:normal').maybeSingle()
+  if (error) throw error
+  return normalizeMarketPricing(data?.value)
+}
+
+async function writeCatalogError(error) {
+  const message = String(error?.code || error?.message || 'CATALOG_REFRESH_FAILED').slice(0, 300)
+  await supabase.from('rechargegames_catalog_state').upsert({
+    id: 1,
+    last_attempt_at: new Date().toISOString(),
+    last_error: message,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'id' }).then(({ error: saveError }) => {
+    if (saveError) console.error('[RechargeGames] No se pudo guardar el estado del catálogo:', saveError.message)
+  })
+}
+
+async function readCatalogSignature() {
+  const { data, error } = await supabase.from('synthesisone_settings')
+    .select('value').eq('key', CATALOG_SIGNATURE_SETTING_KEY).maybeSingle()
+  if (error) throw error
+  const signature = data?.value && typeof data.value === 'object' ? data.value.sha256 : null
+  return typeof signature === 'string' ? signature : null
+}
+
+async function saveCatalogSignature(signature) {
+  const { error } = await supabase.from('synthesisone_settings').upsert({
+    key: CATALOG_SIGNATURE_SETTING_KEY,
+    value: { sha256: signature },
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'key' })
+  if (error) console.warn('[RechargeGames] No se pudo guardar la firma del catálogo; se repetirá la sincronización completa en la próxima actualización.')
+}
+
+async function readPersistedCatalog(storeId) {
+  const [games, offers] = await Promise.all([
+    readAllRows(() => supabase.from('game_market_games')
+      .select('id,slug,is_active')
+      .eq('store_id', storeId), { pageSize: 500, maxRows: 10000 }),
+    readAllRows(() => supabase.from('game_market_offers')
+      .select('game_id,provider_product_key,published,available,provider_out_of_stock,base_cost_usd,price_cup,price_saldo')
+      .eq('store_id', storeId).eq('provider', PROVIDER), { pageSize: 1000, maxRows: 100000 }),
+  ])
+  return { games, offers }
+}
+
+async function verifyPersistedCatalog(storeId, catalog, pricing) {
+  const persisted = await readPersistedCatalog(storeId)
+  return verifyRechargeGamesCatalogIntegrity({ catalog, pricing, ...persisted })
+}
+
+async function refreshCatalog({ reason = 'scheduled' } = {}) {
+  if (refreshInFlight) return refreshInFlight
+  refreshInFlight = (async () => {
+    const startedAt = new Date().toISOString()
+    let targetStoreId = null
+    let offerWriteStarted = false
+    let catalogWritePayloadBytes = 0
+    try {
+      const response = await rechargeGamesRequest('/v1/products', { query: { all: 'true' } })
+      const catalog = normalizeCatalog(response.data)
+      if (!catalog.products.length) {
+        throw new RechargeGamesApiError('RechargeGames catalog did not contain any priced products', { status: 502, code: 'empty_catalog' })
+      }
+      const pricing = await getPricingSettings()
+      const storeId = await getPlatformStoreId()
+      targetStoreId = storeId
+      const signature = rechargeGamesCatalogFingerprint(catalog, pricing)
+      let previousSignature = null
+      try {
+        previousSignature = await readCatalogSignature()
+      } catch (signatureError) {
+        // Signature metadata is an optimization only. If it cannot be read, continue
+        // with the conservative full sync rather than failing catalog availability.
+        console.warn('[RechargeGames] No se pudo leer la firma del catálogo; se hará sincronización completa.')
+      }
+      const now = new Date().toISOString()
+      const availableProducts = catalog.products.filter(product => !product.out_of_stock).length
+
+      // A matching fingerprint is only a candidate for skipping writes. Verify
+      // the actual database rows first; the signature can outlive deleted,
+      // unpublished, partially written, or manually corrupted catalog records.
+      if (previousSignature && previousSignature === signature) {
+        let integrity = { ok: false, reason: 'integrity_check_not_completed' }
+        try {
+          integrity = await verifyPersistedCatalog(storeId, catalog, pricing)
+        } catch (integrityError) {
+          integrity = { ok: false, reason: 'database_integrity_read_failed', error: integrityError?.code || integrityError?.message || 'unknown' }
+        }
+
+        if (integrity.ok) {
+          const state = {
+            id: 1, last_attempt_at: startedAt, last_success_at: now, last_error: null,
+            game_count: catalog.games.length, product_count: catalog.products.length,
+            available_product_count: availableProducts, updated_at: now,
+          }
+          const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
+          if (stateError) throw stateError
+          invalidateCatalogResponses()
+          console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_UNCHANGED', reason, source_game_count: catalog.games.length, source_product_count: catalog.stats.source_product_count, product_count: catalog.products.length, provider_response_bytes: response.responseBytes || null, persisted_game_count: integrity.game_count, persisted_product_count: integrity.product_count, estimated_supabase_write_payload_bytes: 0, database_catalog_writes_skipped: true, database_integrity_verified: true }))
+          return { ok: true, unchanged: true, integrity_verified: true, games: catalog.games.length, source_products: catalog.stats.source_product_count, products: catalog.products.length, available_products: availableProducts, last_success_at: now }
+        }
+
+        console.warn(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_INTEGRITY_REPAIR_REQUIRED', reason, integrity_reason: integrity.reason, product_key: integrity.product_key || null }))
+      }
+
+      const gameIds = new Map()
+      const existingGames = await readAllRows(() => supabase.from('game_market_games')
+        .select('id, slug, thumbnail_path, thumbnail_url')
+        .eq('store_id', storeId), { pageSize: 500, maxRows: 10000 })
+      const existingBySlug = new Map(existingGames.map(row => [String(row.slug), row]))
+      const thumbnailUrls = await mapWithConcurrency(catalog.games, 6, async game => {
+        const existing = existingBySlug.get(game.slug)
+        if (game.image_url) return game.image_url
+        if (existing?.thumbnail_path || existing?.thumbnail_url) return existing.thumbnail_url || null
+        return lookupWikipediaThumbnail(game.name)
+      })
+      const thumbnailBySlug = new Map(catalog.games.map((game, index) => [game.slug, thumbnailUrls[index]]))
+
+      // Bulk upsert all game rows together instead of one HTTP/database request per
+      // game. Keep manually uploaded images when the provider has no image for a game.
+      const gameRows = catalog.games.map(game => {
+        const isGiftcard = game.kind === 'giftcard'
+        return {
+          store_id: storeId,
+          slug: game.slug,
+          provider_game_slug: game.source_slug,
+          name: game.name,
+          thumbnail_url: thumbnailBySlug.get(game.slug) || existingBySlug.get(game.slug)?.thumbnail_url || null,
+          description: isGiftcard ? `Tarjetas regalo de ${game.name}.` : `Recargas automáticas para ${game.name}.`,
+          category: isGiftcard ? 'Tarjetas regalo' : 'Recargas automáticas',
+          badge: isGiftcard ? 'GIFT CARD' : 'AUTOMÁTICO',
+          is_active: true,
+          updated_at: now,
+        }
+      })
+      for (let i = 0; i < gameRows.length; i += 500) {
+        const gameChunk = gameRows.slice(i, i + 500)
+        catalogWritePayloadBytes += Buffer.byteLength(JSON.stringify(gameChunk), 'utf8')
+        const { data, error } = await supabase.from('game_market_games')
+          .upsert(gameChunk, { onConflict: 'store_id,slug' }).select('id,slug')
+        if (error) throw error
+        if (!Array.isArray(data) || data.length !== gameChunk.length) {
+          const incomplete = new Error('Supabase no devolvió todos los juegos después del upsert del catálogo')
+          incomplete.code = 'INCOMPLETE_GAME_UPSERT'
+          throw incomplete
+        }
+        for (const row of data) gameIds.set(String(row.slug), row.id)
+      }
+      if (gameIds.size !== catalog.games.length) {
+        const incomplete = new Error('No se pudieron recuperar los IDs de todos los juegos del catálogo')
+        incomplete.code = 'INCOMPLETE_GAME_ID_MAP'
+        throw incomplete
+      }
+
+      const offerRows = []
+      for (const product of catalog.products) {
+        const gameId = gameIds.get(product.game_slug)
+        if (!gameId) {
+          const incomplete = new Error(`No existe el ID local del juego ${product.game_slug}`)
+          incomplete.code = 'MISSING_CATALOG_GAME_ID'
+          throw incomplete
+        }
+        const prices = calculateOfferPrices(product.price_usdt, pricing)
+        const title = cleanText(`${product.product_name} · ${product.region_name}`, 120)
+        const deliveryLabel = product.delivery === 'code' ? 'Entrega de código' : 'Recarga a ID de jugador'
+        const packageData = {
+          rechargegames: {
+            provider: PROVIDER,
+            product_key: product.product_key,
+            provider_kind: product.kind,
+            game_slug: product.source_game_slug,
+            game_name: product.game_name,
+            region_slug: product.region_slug,
+            region_name: product.region_name,
+            product_name: product.product_name,
+            delivery: product.delivery,
+            delivery_label: deliveryLabel,
+            out_of_stock: product.out_of_stock,
+            currency: 'USDT',
+            provider_price_usdt: product.price_usdt,
+          },
+        }
+        offerRows.push({
+          store_id: storeId,
+          game_id: gameId,
+          provider: PROVIDER,
+          provider_product_key: product.product_key,
+          provider_product_name: product.product_name,
+          provider_game_slug: product.source_game_slug,
+          provider_region_slug: product.region_slug,
+          provider_region_name: product.region_name,
+          provider_delivery: product.delivery,
+          provider_out_of_stock: product.out_of_stock,
+          provider_last_seen_at: now,
+          title,
+          description: product.out_of_stock ? 'Paquete temporalmente agotado.' : deliveryLabel,
+          category: product.kind === 'giftcard' ? 'Tarjeta regalo' : 'Recarga automática',
+          package_data: packageData,
+          base_cost_usd: product.price_usdt,
+          auto_pricing: true,
+          price_cup: prices.price_cup,
+          price_saldo: prices.price_saldo,
+          // Stage all rows hidden/unavailable. A failed multi-chunk refresh must
+          // never publish a partial mix of old and new buyable prices.
+          available: false,
+          published: false,
+          sort_order: 0,
+          updated_at: now,
+        })
+      }
+
+      if (offerRows.length !== catalog.products.length) {
+        const incomplete = new Error('La cantidad de ofertas preparadas no coincide con el catálogo normalizado')
+        incomplete.code = 'INCOMPLETE_OFFER_BUILD'
+        throw incomplete
+      }
+
+      for (let i = 0; i < offerRows.length; i += 500) {
+        const chunk = offerRows.slice(i, i + 500)
+        catalogWritePayloadBytes += Buffer.byteLength(JSON.stringify(chunk), 'utf8')
+        offerWriteStarted = true
+        const { error } = await supabase.from('game_market_offers')
+          .upsert(chunk, { onConflict: 'store_id,provider,provider_product_key' })
+        if (error) throw error
+      }
+
+      // Offers removed by the provider remain in history but disappear from the buyable catalog.
+      const staleUpdate = await supabase.from('game_market_offers')
+        .update({ available: false, published: false, updated_at: now })
+        .eq('store_id', storeId).eq('provider', PROVIDER).lt('provider_last_seen_at', now)
+      if (staleUpdate.error) throw staleUpdate.error
+      const staleNullUpdate = await supabase.from('game_market_offers')
+        .update({ available: false, published: false, updated_at: now })
+        .eq('store_id', storeId).eq('provider', PROVIDER).is('provider_last_seen_at', null)
+      if (staleNullUpdate.error) throw staleNullUpdate.error
+
+      // Commit publication only after every catalog page was persisted and stale rows disabled.
+      // The first update keeps every new/current offer visible only as unavailable; a failure
+      // before the second update cannot create a purchasable partial catalog.
+      const publication = await supabase.from('game_market_offers')
+        .update({ published: true, available: false, updated_at: now })
+        .eq('store_id', storeId).eq('provider', PROVIDER).eq('provider_last_seen_at', now)
+      if (publication.error) throw publication.error
+      const availability = await supabase.from('game_market_offers')
+        .update({ available: true, updated_at: now })
+        .eq('store_id', storeId).eq('provider', PROVIDER).eq('provider_last_seen_at', now).eq('provider_out_of_stock', false)
+      if (availability.error) throw availability.error
+
+      const persistedIntegrity = await verifyPersistedCatalog(storeId, catalog, pricing)
+      if (!persistedIntegrity.ok) {
+        const incomplete = new Error(`La verificación posterior a la sincronización falló: ${persistedIntegrity.reason}`)
+        incomplete.code = 'CATALOG_POST_SYNC_INTEGRITY_FAILED'
+        incomplete.integrity = persistedIntegrity
+        throw incomplete
+      }
+
+      const state = {
+        id: 1,
+        last_attempt_at: startedAt,
+        last_success_at: now,
+        last_error: null,
+        game_count: catalog.games.length,
+        product_count: offerRows.length,
+        available_product_count: availableProducts,
+        updated_at: now,
+      }
+      const { error: stateError } = await supabase.from('rechargegames_catalog_state').upsert(state, { onConflict: 'id' })
+      if (stateError) throw stateError
+      // Signature write is intentionally best-effort: failure only means the next
+      // refresh performs a full sync again, not that a successfully synced catalog
+      // should be hidden or treated as failed.
+      await saveCatalogSignature(signature)
+      invalidateCatalogResponses()
+      console.log(JSON.stringify({ ts: now, event: 'RECHARGEGAMES_CATALOG_REFRESHED', reason, source_game_count: catalog.games.length, source_group_count: catalog.stats.source_group_count, source_product_count: catalog.stats.source_product_count, product_count: offerRows.length, available_product_count: availableProducts, provider_response_bytes: response.responseBytes || null, estimated_supabase_write_payload_bytes: catalogWritePayloadBytes, offer_upsert_batch_size: 500, persisted_game_count: persistedIntegrity.game_count, persisted_product_count: persistedIntegrity.product_count, database_integrity_verified: true, skipped_missing_name: catalog.stats.skipped_missing_name, skipped_missing_key: catalog.stats.skipped_missing_key, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, thumbnail_count: [...thumbnailBySlug.values()].filter(Boolean).length }))
+      return { ok: true, games: catalog.games.length, source_groups: catalog.stats.source_group_count, source_products: catalog.stats.source_product_count, products: offerRows.length, available_products: availableProducts, skipped_invalid_key_length: catalog.stats.skipped_invalid_key_length, skipped_invalid_price: catalog.stats.skipped_invalid_price, skipped_unsupported_delivery: catalog.stats.skipped_unsupported_delivery, last_success_at: now }
+    } catch (error) {
+      // If persistence began but the refresh did not commit, fail closed instead of leaving
+      // a mixed partial catalog that might expose obsolete prices to customer checkout.
+      if (offerWriteStarted && targetStoreId) {
+        try {
+          const { error: disableError } = await supabase.from('game_market_offers')
+            .update({ available: false, published: false, updated_at: new Date().toISOString() })
+            .eq('store_id', targetStoreId).eq('provider', PROVIDER)
+          if (disableError) console.error('[RechargeGames] No se pudo cerrar el catálogo parcial:', String(disableError.message || 'unknown').slice(0, 160))
+        } catch (disableError) {
+          console.error('[RechargeGames] No se pudo cerrar el catálogo parcial:', String(disableError?.message || 'unknown').slice(0, 160))
+        }
+      }
+      await writeCatalogError(error)
+      console.error('[RechargeGames] No se pudo actualizar el catálogo:', JSON.stringify({ code: error?.code || 'catalog_error', http_status: error?.status || null }))
+      throw error
+    } finally {
+      refreshInFlight = null
+    }
+  })()
+  return refreshInFlight
+}
+
+async function getCatalogStatus() {
+  const { data, error } = await supabase.from('rechargegames_catalog_state').select('*').eq('id', 1).maybeSingle()
+  if (error) throw error
+  return data || { last_success_at: null, last_attempt_at: null, last_error: null, game_count: 0, product_count: 0, available_product_count: 0 }
+}
+
+function startRechargeGamesCatalogWorker() {
+  if (workerStarted) return
+  workerStarted = true
+  if (!String(process.env.RECHARGEGAMES_API_KEY || '').trim()) {
+    console.log('[RechargeGames] Catálogo automático en espera: falta configurar RECHARGEGAMES_API_KEY.')
+  } else {
+    setTimeout(() => refreshCatalog({ reason: 'startup' }).catch(() => {}), 8_000)
+  }
+  setInterval(() => {
+    if (!String(process.env.RECHARGEGAMES_API_KEY || '').trim()) return
+    refreshCatalog({ reason: 'scheduled' }).catch(() => {})
+  }, CATALOG_REFRESH_MS)
+}
+
+module.exports = { PROVIDER, normalizeCatalog, refreshCatalog, getCatalogStatus, startRechargeGamesCatalogWorker, getPlatformStoreId }
