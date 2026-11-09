@@ -8,7 +8,7 @@ const { requireNonRevokedToken } = require('../utils/tokenState')
 const { canAccessGameMarket } = require('../utils/storeSessionAccess')
 const { bot, ADMINS } = require('../telegram')
 const { roundToStep, computePrices, normalizeMarketPricing } = require('../utils/gamePricing')
-const { readAllRows } = require('../utils/supabasePagination')
+const { readAllRows, readRowsInBatches } = require('../utils/supabasePagination')
 const { createCatalogResponder } = require('../utils/catalogResponseCache')
 const { summarizeGameOffers, GAME_ID_PATTERN } = require('../utils/gameMarketCatalogSummary')
 
@@ -131,7 +131,11 @@ async function pricingFor(tier) {
   return normalizeMarketPricing(data?.value)
 }
 async function platformStoreId() {
-  const { data, error } = await supabase.from('game_market_stores').select('id').eq('slug', 'synthesisone').maybeSingle()
+  // The RechargeGames importer resolves the official store by this flag. Use the
+  // exact same identity here; looking it up by slug could read a different row if
+  // an older store with slug=synthesisone was created before the platform flag.
+  const { data, error } = await supabase.from('game_market_stores')
+    .select('id').eq('is_platform_store', true).maybeSingle()
   if (error) throw error
   if (!data) throw fail(503, 'El catálogo no está inicializado; el administrador debe aplicar la migración SQL 009')
   return data.id
@@ -158,10 +162,14 @@ async function loadGames(storeId, admin) {
 
 async function loadOffers(storeId, gameIds, admin, columns) {
   if (!gameIds.length) return []
-  const data = await readAllRows(() => supabase.from('game_market_offers')
+  // A single .in('game_id', gameIds) with all 399 platform games creates a
+  // ~16 KB PostgREST URL. Node/Undici rejects the response headers before the
+  // query can complete (UND_ERR_HEADERS_OVERFLOW). Keep each URL small and
+  // still page each result set so no offers are silently omitted.
+  const data = await readRowsInBatches(batchGameIds => supabase.from('game_market_offers')
     .select(columns)
-    .eq('store_id', storeId).in('game_id', gameIds).order('sort_order').order('title').order('id'),
-  { pageSize: 500, maxRows: 100_000 })
+    .eq('store_id', storeId).in('game_id', batchGameIds).order('sort_order').order('title').order('id'),
+  gameIds, { batchSize: 50, pageSize: 500, maxRows: 100_000 })
   // Public catalog only exposes offers that the backend can actually order from a provider.
   // Legacy/manual rows remain accessible to admins for cleanup, but never appear purchasable to clients.
   return data.filter(o => admin || (o.published && isConnectedRechargeGamesOffer(o)))
@@ -220,6 +228,21 @@ async function catalogPayload(tier, admin = false, { summary = false } = {}) {
   for (const offer of offers) {
     if (!byGame.has(offer.game_id)) byGame.set(offer.game_id, [])
     byGame.get(offer.game_id).push(offer)
+  }
+  if (summary) {
+    const availableOfferCount = offers.filter(offer =>
+      offer.published && offer.available && offer.package_data?.rechargegames?.out_of_stock !== true
+    ).length
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      event: 'GAME_MARKET_CATALOG_RESPONSE_BUILT',
+      store_id: storeId,
+      pricing_tier: tier,
+      admin,
+      game_count: gameRows.length,
+      offer_count: offers.length,
+      available_offer_count: availableOfferCount,
+    }))
   }
   return {
     pricing_tier: tier,

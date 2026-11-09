@@ -27,7 +27,7 @@ test('Game Market API paginates games and offers so regions/server markets are n
   const route = read('src/routes/gameMarket.js')
   assert.match(route, /require\(['"]\.\.\/utils\/supabasePagination['"]\)/)
   assert.match(route, /const games = await readAllRows\([\s\S]*?maxRows: 10_000/)
-  assert.match(route, /const data = await readAllRows\([\s\S]*?maxRows: 100_000/)
+  assert.match(route, /const data = await readRowsInBatches\([\s\S]*?batchSize: 50[\s\S]*?maxRows: 100_000/)
   assert.match(route, /\.order\('title'\)\.order\('id'\)/)
 })
 
